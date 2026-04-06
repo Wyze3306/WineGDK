@@ -246,6 +246,74 @@ HRESULT WINAPI UninitializeApiImpl( void )
     return E_NOTIMPL;
 }
 
+/* COM class factory for XSAPI Xbox Live context {834366da-2d43-4fe3-8dcd-42ff2274bd0d} */
+
+static HRESULT WINAPI xsapi_cf_QueryInterface( IClassFactory *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IClassFactory ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI xsapi_cf_AddRef( IClassFactory *iface ) { return 2; }
+static ULONG WINAPI xsapi_cf_Release( IClassFactory *iface ) { return 1; }
+
+static HRESULT WINAPI xsapi_cf_CreateInstance( IClassFactory *iface, IUnknown *outer, REFIID iid, void **out )
+{
+    FIXME( "CreateInstance iid %s - XSAPI context requested\n", debugstr_guid( iid ) );
+    /* The game creates an XSAPI Xbox Live context through COM.
+     * Return our service broker which handles all GDK sub-interfaces. */
+    if (out)
+    {
+        extern void *x_service_broker_get(void);
+        *out = x_service_broker_get();
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+static HRESULT WINAPI xsapi_cf_LockServer( IClassFactory *iface, BOOL lock ) { return S_OK; }
+
+static const IClassFactoryVtbl xsapi_cf_vtbl = {
+    xsapi_cf_QueryInterface,
+    xsapi_cf_AddRef,
+    xsapi_cf_Release,
+    xsapi_cf_CreateInstance,
+    xsapi_cf_LockServer,
+};
+
+static IClassFactory xsapi_class_factory = { &xsapi_cf_vtbl };
+
+HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID iid, void **out )
+{
+    static const GUID CLSID_XsapiContext = {0x834366da, 0x2d43, 0x4fe3, {0x8d,0xcd, 0x42,0xff,0x22,0x74,0xbd,0x0d}};
+
+    TRACE( "clsid %s, iid %s, out %p\n", debugstr_guid( clsid ), debugstr_guid( iid ), out );
+
+    if (IsEqualGUID( clsid, &CLSID_XsapiContext ))
+    {
+        return IClassFactory_QueryInterface( &xsapi_class_factory, iid, out );
+    }
+
+    FIXME( "clsid %s not handled\n", debugstr_guid( clsid ) );
+    return CLASS_E_CLASSNOTAVAILABLE;
+}
+
+HRESULT WINAPI XGameRuntimeInitialize( void )
+{
+    ERR("XGameRuntimeInitialize called!\n");
+    return S_OK;
+}
+
+VOID WINAPI XGameRuntimeUninitialize( void )
+{
+    TRACE("uninitializing game runtime\n");
+}
+
 HRESULT WINAPI XErrorReport( HRESULT status, LPCSTR message )
 {
     TRACE("stub!\n");
