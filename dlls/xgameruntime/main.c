@@ -215,14 +215,7 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
         return IXUserImpl_QueryInterface( x_user_impl, interfaceId, out );
     }
 
-    /* {0dd112ac} composite service */
-    if ( runtimeClassId->Data1 == 0x0dd112ac )
-    {
-        TRACE( "MATCHED composite CLSID by Data1, returning XUser impl\n" );
-        *out = x_user_impl;
-        IXUserImpl_AddRef( x_user_impl );
-        return S_OK;
-    }
+    /* {0dd112ac} composite service - not implemented yet */
 
     FIXME( "%s (iid %s) not implemented, returning E_NOINTERFACE.\n", debugstr_guid( runtimeClassId ), debugstr_guid( interfaceId ) );
     if (out) *out = NULL;

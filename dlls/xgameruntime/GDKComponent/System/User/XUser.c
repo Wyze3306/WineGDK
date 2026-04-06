@@ -176,7 +176,19 @@ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
 static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl *iface, XUserHandle user, XUserHandle *duplicated )
 {
     TRACE( "iface %p, user %p, duplicated %p\n", iface, user, duplicated );
-    if (!user || !duplicated) return E_POINTER;
+    if (!duplicated) return E_POINTER;
+    if (!user)
+    {
+        /* Game may pass NULL when getting user from composite interface */
+        if (g_signed_in_user)
+        {
+            TRACE( "NULL user, returning g_signed_in_user %p\n", g_signed_in_user );
+            IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
+            *duplicated = (XUserHandle)g_signed_in_user;
+            return S_OK;
+        }
+        return E_POINTER;
+    }
     IXUserImpl_AddRef( &((struct x_user*)user)->IXUserImpl_iface );
     *duplicated = user;
     return S_OK;
