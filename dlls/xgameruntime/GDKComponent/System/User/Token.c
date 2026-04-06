@@ -539,3 +539,67 @@ HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUse
 
     return hr;
 }
+
+HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_party, HSTRING *token )
+{
+    LPCWSTR accept[] = {L"application/json", NULL};
+    UINT32 token_str_len;
+    IJsonObject *object;
+    LPSTR token_str;
+    LPSTR buffer;
+    SIZE_T size;
+    HRESULT hr;
+    LPSTR data;
+    SIZE_T data_len;
+
+    TRACE( "requesting XSTS token for RP: %s\n", relying_party );
+
+    if (FAILED( hr = HSTRINGToMultiByte( user_token, &token_str, &token_str_len ) ))
+        return hr;
+
+    data_len = strlen( "{\"RelyingParty\":\"" ) + strlen( relying_party ) +
+               strlen( "\",\"TokenType\":\"JWT\",\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"" ) +
+               token_str_len + strlen( "\"]}}" ) + 1;
+
+    if (!(data = calloc( 1, data_len )))
+    {
+        free( token_str );
+        return E_OUTOFMEMORY;
+    }
+
+    strcpy( data, "{\"RelyingParty\":\"" );
+    strcat( data, relying_party );
+    strcat( data, "\",\"TokenType\":\"JWT\",\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"" );
+    strncat( data, token_str, token_str_len );
+    free( token_str );
+    strcat( data, "\"]}}" );
+
+    hr = HttpRequest(
+        L"POST",
+        L"xsts.auth.xboxlive.com",
+        L"/xsts/authorize",
+        data,
+        L"content-type: application/json",
+        accept,
+        &buffer,
+        &size
+    );
+
+    free( data );
+    if (FAILED( hr ))
+    {
+        WARN( "XSTS request for RP %s failed: 0x%08lx\n", relying_party, hr );
+        return hr;
+    }
+
+    TRACE( "XSTS response for RP %s: size=%llu\n", relying_party, (unsigned long long)size );
+
+    hr = ParseJsonObject( buffer, size, &object );
+    free( buffer );
+    if (FAILED( hr )) return hr;
+
+    hr = GetJsonStringValue( object, L"Token", token );
+    IJsonObject_Release( object );
+
+    return hr;
+}

@@ -433,21 +433,40 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
         case DoWork:
         {
             struct x_user *user_impl = (struct x_user *)context->user;
+            HSTRING xsts_token = NULL;
             UINT32 xsts_len;
             LPSTR xsts_str;
             HRESULT dowork_hr;
+            LPCSTR url = context->utf16 ? NULL : context->url;
+            LPCSTR rp = "http://xboxlive.com";
 
-            if (!user_impl || !user_impl->xsts_token)
+            if (!user_impl || !user_impl->user_token)
             {
-                WARN( "no xsts token available\n" );
+                WARN( "no user token available\n" );
                 impl->lpVtbl->XAsyncComplete( impl, providerData->async, E_FAIL, 0 );
                 break;
             }
 
-            dowork_hr = HSTRINGToMultiByte( user_impl->xsts_token, &xsts_str, &xsts_len );
+            /* Determine relying party from URL */
+            if (url && strstr( url, "playfab" ))
+                rp = "rp://playfab.com/";
+            else if (url && strstr( url, "minecraft" ))
+                rp = "rp://playfab.com/";
+
+            TRACE( "requesting token for url=%s, rp=%s\n", url ? url : "(utf16)", rp );
+
+            dowork_hr = RequestXstsTokenForRelyingParty( user_impl->user_token, rp, &xsts_token );
             if (FAILED( dowork_hr ))
             {
-                WARN( "failed to convert xsts token\n" );
+                WARN( "XSTS token request for RP %s failed: 0x%08lx\n", rp, dowork_hr );
+                impl->lpVtbl->XAsyncComplete( impl, providerData->async, dowork_hr, 0 );
+                break;
+            }
+
+            dowork_hr = HSTRINGToMultiByte( xsts_token, &xsts_str, &xsts_len );
+            WindowsDeleteString( xsts_token );
+            if (FAILED( dowork_hr ))
+            {
                 impl->lpVtbl->XAsyncComplete( impl, providerData->async, dowork_hr, 0 );
                 break;
             }
@@ -466,7 +485,7 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
                 (unsigned long long)user_impl->local_id.value, (int)xsts_len, xsts_str );
             free( xsts_str );
 
-            TRACE( "token: %.40s...\n", context->result_token );
+            TRACE( "token for %s: %.40s...\n", rp, context->result_token );
 
             context->result_size = sizeof(XUserGetTokenAndSignatureData) + context->result_token_len + 2;
             impl->lpVtbl->XAsyncComplete( impl, providerData->async, S_OK, context->result_size );

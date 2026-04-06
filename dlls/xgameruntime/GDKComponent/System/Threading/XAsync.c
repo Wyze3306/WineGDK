@@ -22,7 +22,7 @@
 #include "XAsync.h"
 #include "XTaskQueue.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(xtaskqueue);
+WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
 static inline struct x_async_block_guard *impl_from_IXAsyncBlockInternalGuard( IXAsyncBlockInternalGuard *iface )
 {
