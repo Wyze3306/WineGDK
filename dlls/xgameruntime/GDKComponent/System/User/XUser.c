@@ -293,7 +293,7 @@ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl *iface, XUserAddOptions o
     }
 
     context->options = options;
-    context->client_id = "0000000048183522"; /* MSAAppId from MicrosoftGame.Config */
+    context->client_id = "0000000048183522"; /* MSAAppId matching ProxyPass refresh token */
     hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserAddAsync, "XUserAddAsync", XUserAddProvider );
     impl->lpVtbl->Release( impl );
     return hr;

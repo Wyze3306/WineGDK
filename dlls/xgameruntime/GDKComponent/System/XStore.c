@@ -47,8 +47,17 @@ static HRESULT store_license_provider( XAsyncOp op, const XAsyncProviderData *da
             break;
         case GetResult:
         {
+            /* XStoreGameLicense: skuStoreId[64], isActive, isTrialOwned, isDiscLicense, isTrial,
+               trialTimeRemaining(4), trialUniqueId[64], expirationDate(8) */
             char *p = (char *)data->buffer;
-            p[64] = 1; /* isActive = true */
+            memcpy( p, "9NBLGGH2JHXJ", 13 );  /* skuStoreId */
+            p[64] = 1;  /* isActive = true */
+            p[65] = 0;  /* isTrialOwnedByThisUser = false */
+            p[66] = 0;  /* isDiscLicense = false */
+            p[67] = 0;  /* isTrial = false */
+            /* trialTimeRemainingInSeconds at offset 68 = 0 */
+            /* trialUniqueId at offset 72 = empty */
+            /* expirationDate at offset 136 = 0 (no expiry) */
             break;
         }
         case Cleanup:
