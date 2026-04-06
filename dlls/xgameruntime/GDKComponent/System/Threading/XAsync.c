@@ -205,6 +205,7 @@ static BOOLEAN WINAPI x_async_block_guard_TrySetTerminalStatus( IXAsyncBlockInte
 
     TRACE( "iface %p.\n", iface );
 
+    TRACE( "locked=%d, internal->status=0x%08lx, setting to 0x%08lx\n", impl->locked, impl->internal->status, status );
     if ( impl->locked && impl->internal->status == E_PENDING )
     {
         impl->userInternal->status = status;
@@ -214,6 +215,7 @@ static BOOLEAN WINAPI x_async_block_guard_TrySetTerminalStatus( IXAsyncBlockInte
     }
     else
     {
+        WARN( "TrySetTerminalStatus failed! locked=%d status=0x%08lx\n", impl->locked, impl->internal->status );
         return FALSE;
     }
 }
@@ -509,6 +511,7 @@ static void CALLBACK CompletionCallback( void* context, BOOL canceled )
     // callback, but we don't trust it -- we check
     // the callback field on our internal copy.
     asyncBlock = stateImpl->userAsyncBlock;
+    TRACE( "CompletionCallback: asyncBlock=%p, callback=%p, identityName=%s\n", asyncBlock, stateImpl->providerAsyncBlock.callback, stateImpl->identityName );
     if ( stateImpl->providerAsyncBlock.callback != NULL )
     {
         stateImpl->providerAsyncBlock.callback(asyncBlock);
