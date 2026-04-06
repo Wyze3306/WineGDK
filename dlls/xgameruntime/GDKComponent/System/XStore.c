@@ -68,16 +68,32 @@ STORE_STUB(20) STORE_STUB(21)
 /* 22 = return_true */
 STORE_STUB(23) STORE_STUB(24) STORE_STUB(25) STORE_STUB(26)
 STORE_STUB(27)
-/* vtable[28]: XStoreQueryGameLicenseAsync - complete immediately with "licensed" */
+static DWORD WINAPI store_deferred_cb( void *param )
+{
+    struct { void *ab; void (*cb)(void*); } *ctx = param;
+    Sleep( 100 );
+    if (ctx && ctx->cb) ctx->cb( ctx->ab );
+    free( ctx );
+    return 0;
+}
+
+/* vtable[28]: XStoreQueryGameLicenseAsync */
 static HRESULT WINAPI store_QueryGameLicenseAsync( void *iface, void *context, void *asyncBlock )
 {
-    TRACE( "iface %p, context %p, asyncBlock %p - returning S_OK (licensed)\n", iface, context, asyncBlock );
-    /* Complete the async op immediately via callback if present */
+    typedef struct { void *queue; void *ctx; void (*cb)(void*); } AB;
+    TRACE( "iface %p, context %p, asyncBlock %p\n", iface, context, asyncBlock );
+    /* Defer callback to avoid blocking the caller's thread */
     if (asyncBlock)
     {
-        typedef struct { void *queue; void *ctx; void (*cb)(void*); unsigned char internal[32]; } AB;
         AB *ab = (AB *)asyncBlock;
-        if (ab->cb) ab->cb(asyncBlock);
+        if (ab->cb)
+        {
+            /* Call on a worker thread after a short delay */
+            struct { void *ab; void (*cb)(void*); } *ctx = calloc(1, sizeof(*ctx));
+            if (ctx) { ctx->ab = asyncBlock; ctx->cb = ab->cb; }
+            HANDLE h = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)store_deferred_cb, ctx, 0, NULL);
+            if (h) CloseHandle(h);
+        }
     }
     return S_OK;
 }
