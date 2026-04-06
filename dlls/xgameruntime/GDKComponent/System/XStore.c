@@ -168,7 +168,7 @@ static const void *store_vtable[98] = {
     store_QueryInterface, store_AddRef, store_Release,           /* 0-2 */
     store_CreateContext,                                          /* 3 */
     S(4), store_QueryAssociatedProductsAsync, store_QueryAssociatedProductsResult, S(7),  /* 4-7 */
-    S(8),  S(9),  S(10), S(11), S(12), S(13), S(14), S(15),     /* 8-15 */
+    store_QueryAssociatedProductsResult, S(9), S(10), S(11), S(12), S(13), S(14), S(15),  /* 8-15, [8]=result alias */
     S(16), S(17), S(18), S(19), S(20), S(21),                    /* 16-21 */
     store_return_true,                                            /* 22: LicenseIsValid */
     S(23), S(24), S(25), S(26), S(27),                           /* 23-27 */

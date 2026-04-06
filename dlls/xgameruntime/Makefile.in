@@ -21,5 +21,6 @@ SOURCES = \
 	GDKComponent/System/User/Token.c \
 	GDKComponent/System/User/XUser.c \
 	GDKComponent/System/User/DeviceAuth.c \
-	GDKComponent/System/XStore.c
+	GDKComponent/System/XStore.c \
+	GDKComponent/System/XServiceBroker.c
 

@@ -235,6 +235,14 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
         if (store) { *out = store; return S_OK; }
     }
 
+    /* {af406016} composite service broker */
+    if ( runtimeClassId->Data1 == 0xaf406016 )
+    {
+        extern void *x_service_broker_get(void);
+        void *broker = x_service_broker_get();
+        if (broker) { *out = broker; return S_OK; }
+    }
+
     FIXME( "%s (iid %s) not implemented, returning E_NOINTERFACE.\n", debugstr_guid( runtimeClassId ), debugstr_guid( interfaceId ) );
     if (out) *out = NULL;
     return E_NOTIMPL;
