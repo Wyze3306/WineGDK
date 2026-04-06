@@ -449,9 +449,9 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
 
             /* Determine relying party from URL */
             if (url && strstr( url, "playfab" ))
-                rp = "rp://playfab.com/";
-            else if (url && strstr( url, "minecraft" ))
-                rp = "rp://playfab.com/";
+                rp = "https://b980a380.minecraft.playfabapi.com/";
+            else if (url && strstr( url, "multiplayer.minecraft" ))
+                rp = "https://multiplayer.minecraft.net/";
 
             TRACE( "requesting token for url=%s, rp=%s\n", url ? url : "(utf16)", rp );
 
