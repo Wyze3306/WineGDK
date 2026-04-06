@@ -139,5 +139,6 @@ HRESULT XAsyncRun( XAsyncBlock* asyncBlock, XAsyncWork* work );
 HRESULT XAsyncBegin( XAsyncBlock* asyncBlock, PVOID context, PVOID identity, LPCSTR identityName, XAsyncProviderCallback* provider );
 HRESULT XAsyncSchedule( XAsyncBlock* asyncBlock, UINT32 delayInMs );
 VOID XAsyncComplete( XAsyncBlock* asyncBlock, HRESULT result, SIZE_T requiredBufferSize );
+HRESULT XAsyncGetResult( XAsyncBlock* asyncBlock, const PVOID identity, SIZE_T bufferSize, PVOID buffer, SIZE_T* bufferUsed );
 
 #endif

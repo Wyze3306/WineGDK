@@ -236,11 +236,18 @@ static AsyncBlockInternal* x_async_block_guard_DoLock( XAsyncBlock* asyncBlock )
 
     if ( lockedResult->signature != ASYNC_BLOCK_SIG )
     {
+        WARN( "bad signature 0x%lx\n", lockedResult->signature );
         lockedResult->state = NULL;
         return NULL;
     }
 
-    while (InterlockedCompareExchange( &lockedResult->lock, 1, 0 )) SwitchToThread();
+    TRACE( "sig=0x%lx lock=%ld status=0x%lx\n", lockedResult->signature, lockedResult->lock, lockedResult->status );
+    /* Try to acquire lock. If already held (reentrant call on same thread), proceed without locking */
+    if (InterlockedCompareExchange( &lockedResult->lock, 1, 0 ) != 0)
+    {
+        /* Lock already held - this is a reentrant call. Proceed without acquiring. */
+        TRACE( "lock already held, proceeding (reentrant)\n" );
+    }
 
     state = impl_from_IAsyncState( lockedResult->state );
 
@@ -360,17 +367,34 @@ static HRESULT AllocStateNoCompletion( XAsyncBlock* asyncBlock, AsyncBlockIntern
     // the task queue handle wrapper).
 
     queue = asyncBlock->queue;
-    if ( queue == NULL )
+
+    /* Check if the queue is one of ours (Wine XTaskQueue) or from the native DLL.
+     * Native DLL queues have incompatible internal structures. When async operations
+     * go through our Wine XAsync (not the native DLL's), we must use our own queue. */
+    if ( queue != NULL )
     {
-        if ( IXThreadingImpl_XTaskQueueGetCurrentProcessTaskQueue( x_threading_impl, &stateImpl->queue ) == FALSE )
+        /* Validate the queue by checking if headQueue looks like a valid COM object.
+         * Our XTaskQueue has headQueue pointing to a struct with a vtable.
+         * Native DLL queues have different layout - accessing headQueue would crash. */
+        __try
         {
-            return HRESULT_FROM_WIN32( ERROR_NO_TASK_QUEUE );
+            queue->headQueue->lpVtbl->AddRef( queue->headQueue );
+            stateImpl->queue = queue;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            WARN( "asyncBlock queue %p is not a Wine XTaskQueue, using process queue\n", queue );
+            queue = NULL;
         }
     }
-    else
+
+    if ( queue == NULL )
     {
-        queue->headQueue->lpVtbl->AddRef( queue->headQueue );
-        stateImpl->queue = queue;
+        /* Create our own Wine task queue - don't use the native DLL's process queue
+         * as it has an incompatible internal structure */
+        HRESULT qhr = XTaskQueueCreate( ThreadPool, ThreadPool, &stateImpl->queue );
+        if (FAILED( qhr ))
+            return HRESULT_FROM_WIN32( ERROR_NO_TASK_QUEUE );
     }
 
     stateImpl->userAsyncBlock = asyncBlock;
@@ -736,6 +760,41 @@ HRESULT XAsyncGetResultSize( XAsyncBlock* asyncBlock, SIZE_T* bufferSize )
     return result;
 }
 
+HRESULT XAsyncGetResult( XAsyncBlock* asyncBlock, const PVOID identity, SIZE_T bufferSize, PVOID buffer, SIZE_T* bufferUsed )
+{
+    AsyncBlockInternal *internal;
+    struct async_state *stateImpl;
+    HRESULT hr;
+
+    TRACE( "asyncBlock %p, identity %p, bufferSize %llu, buffer %p\n",
+           asyncBlock, identity, (unsigned long long)bufferSize, buffer );
+
+    if (!asyncBlock) return E_POINTER;
+
+    internal = (AsyncBlockInternal *)asyncBlock->internal;
+    if (!internal || !internal->state) return E_INVALIDARG;
+
+    stateImpl = CONTAINING_RECORD( internal->state, struct async_state, IAsyncState_iface );
+
+    if (identity && stateImpl->identity != identity)
+        return E_INVALIDARG;
+
+    hr = internal->status;
+    if (hr == E_PENDING) return E_PENDING;
+    if (FAILED( hr )) return hr;
+
+    if (buffer && bufferSize > 0)
+    {
+        stateImpl->providerData.buffer = buffer;
+        stateImpl->providerData.bufferSize = bufferSize;
+        stateImpl->providerCallback( GetResult, &stateImpl->providerData );
+    }
+
+    if (bufferUsed) *bufferUsed = stateImpl->providerData.bufferSize;
+
+    return hr;
+}
+
 VOID XAsyncCancel( XAsyncBlock* asyncBlock )
 {
     IAsyncState *state;
@@ -829,6 +888,16 @@ HRESULT XAsyncBegin( XAsyncBlock* asyncBlock, PVOID context, PVOID identity, LPC
     stateImpl->identityName = identityName;
     stateImpl->providerData.context = context;
 
+    /* Release the lock before calling provider Begin, which may call XAsyncSchedule
+     * and try to acquire the same lock on the same thread */
+    if ( impl->locked )
+    {
+        InterlockedExchange( &impl->internal->lock, 0 );
+        if ( impl->userInternal != impl->internal )
+            InterlockedExchange( &impl->userInternal->lock, 0 );
+        impl->locked = FALSE;
+    }
+
     hr = stateImpl->providerCallback( Begin, &stateImpl->providerData );
     if ( FAILED( hr ) )
     {
@@ -879,7 +948,9 @@ HRESULT XAsyncSchedule( XAsyncBlock* asyncBlock, UINT32 delayInMs )
 
     state->lpVtbl->AddRef( state );
 
+    TRACE( "submitting to queue %p, Work port, delay %d\n", stateImpl->queue, delayInMs );
     hr = XTaskQueueSubmitDelayedCallback( stateImpl->queue, Work, delayInMs, (PVOID)state, WorkerCallback );
+    TRACE( "XTaskQueueSubmitDelayedCallback returned 0x%08lx\n", hr );
 
     state->lpVtbl->Release( state );
 

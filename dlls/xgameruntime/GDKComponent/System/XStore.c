@@ -1,10 +1,11 @@
 /*
- * Minimal XStore composite stub for {0dd112ac-7c24-448c-b92b-3960fb5bd30c}
- * 98-entry vtable: IUnknown(3) + XStore methods(81) + infrastructure(14)
+ * XStore composite stub for {0dd112ac-7c24-448c-b92b-3960fb5bd30c}
  * Uses proper XAsync pattern via the native threading DLL.
  */
 
 #include "../../private.h"
+#include "Threading/XAsync.h"
+#include "Threading/XTaskQueue.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -30,91 +31,85 @@ static HRESULT WINAPI store_CreateContext( void *iface, void *user, void **conte
     return S_OK;
 }
 
-/* --- Store async callback context --- */
-struct store_async_ctx {
-    void *asyncBlock;
-    void (*cb)(void *);
-};
+/* --- XStore license async provider (proper XAsync pattern) --- */
 
-static void CALLBACK store_async_worker( void *param, BOOL canceled )
+static HRESULT store_license_provider( XAsyncOp op, const XAsyncProviderData *data )
 {
-    struct store_async_ctx *ctx = param;
-    if (!canceled && ctx && ctx->cb)
+    if (!data) return E_POINTER;
+
+    switch (op)
     {
-        TRACE( "dispatching store callback for asyncBlock %p\n", ctx->asyncBlock );
-        ctx->cb( ctx->asyncBlock );
-    }
-    free( ctx );
-}
-
-static DWORD WINAPI store_thread_wrapper( void *p ) { store_async_worker(p, FALSE); return 0; }
-
-static HRESULT store_schedule_callback( void *asyncBlock )
-{
-    typedef struct { void *queue; void *ctx; void (*cb)(void*); } AB;
-    AB *ab = (AB *)asyncBlock;
-    IXThreadingImpl *impl;
-    struct store_async_ctx *ctx;
-
-    if (!ab || !ab->cb) return S_OK;
-
-    ctx = calloc( 1, sizeof(*ctx) );
-    if (!ctx) return E_OUTOFMEMORY;
-    ctx->asyncBlock = asyncBlock;
-    ctx->cb = ab->cb;
-
-    if (ab->queue && SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) ))
-    {
-        HRESULT hr = impl->lpVtbl->XTaskQueueSubmitDelayedCallback( impl, ab->queue, Completion, 0, ctx, (XTaskQueueCallback*)store_async_worker );
-        impl->lpVtbl->Release( impl );
-        if (SUCCEEDED( hr ))
+        case Begin:
+            return XAsyncSchedule( data->async, 0 );
+        case DoWork:
+            TRACE( "license DoWork\n" );
+            XAsyncComplete( data->async, S_OK, 144 );
+            break;
+        case GetResult:
         {
-            TRACE( "scheduled callback via XTaskQueueSubmitDelayedCallback\n" );
-            return S_OK;
+            char *p = (char *)data->buffer;
+            p[64] = 1; /* isActive = true */
+            break;
         }
-        WARN( "XTaskQueueSubmitDelayedCallback failed: 0x%08lx, falling back to thread\n", hr );
-    }
-
-    /* Fallback: create thread */
-    {
-        HANDLE h = CreateThread( NULL, 0, store_thread_wrapper, ctx, 0, NULL );
-        if (h) CloseHandle( h );
+        case Cleanup:
+        case Cancel:
+            break;
     }
     return S_OK;
 }
 
-/* vtable[28]: XStoreQueryGameLicenseAsync */
 static HRESULT WINAPI store_QueryGameLicenseAsync( void *iface, void *context, void *asyncBlock )
 {
+    HRESULT hr;
     TRACE( "iface %p, context %p, asyncBlock %p\n", iface, context, asyncBlock );
-    return store_schedule_callback( asyncBlock );
+    hr = XAsyncBegin( asyncBlock, NULL, store_QueryGameLicenseAsync, "XStoreQueryGameLicenseAsync", store_license_provider );
+    TRACE( "XAsyncBegin returned 0x%08lx\n", hr );
+    return hr;
 }
 
-/* vtable[29]: XStoreQueryGameLicenseResult */
 static HRESULT WINAPI store_QueryGameLicenseResult( void *iface, void *asyncBlock, void *license )
 {
     TRACE( "iface %p, asyncBlock %p, license %p\n", iface, asyncBlock, license );
-    if (license)
+    return XAsyncGetResult( asyncBlock, store_QueryGameLicenseAsync, 144, license, NULL );
+}
+
+/* --- XStore associated products async provider --- */
+
+static HRESULT store_products_provider( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (!data) return E_POINTER;
+
+    switch (op)
     {
-        char *p = (char *)license;
-        p[64] = 1; /* isActive = true */
+        case Begin:
+            return XAsyncSchedule( data->async, 0 );
+        case DoWork:
+            TRACE( "products DoWork\n" );
+            XAsyncComplete( data->async, S_OK, sizeof(void*) );
+            break;
+        case GetResult:
+            memset( data->buffer, 0, data->bufferSize );
+            break;
+        case Cleanup:
+        case Cancel:
+            break;
     }
     return S_OK;
 }
 
-/* vtable[5]: XStoreQueryAssociatedProductsAsync */
 static HRESULT WINAPI store_QueryAssociatedProductsAsync( void *a, void *b, void *c, void *d, void *e, void *asyncBlock )
 {
+    HRESULT hr;
     TRACE( "asyncBlock %p\n", asyncBlock );
-    return store_schedule_callback( asyncBlock );
+    hr = XAsyncBegin( asyncBlock, NULL, store_QueryAssociatedProductsAsync, "XStoreQueryAssociatedProductsAsync", store_products_provider );
+    TRACE( "XAsyncBegin returned 0x%08lx\n", hr );
+    return hr;
 }
 
-/* vtable[6]: XStoreQueryAssociatedProductsResult */
 static HRESULT WINAPI store_QueryAssociatedProductsResult( void *iface, void *asyncBlock, void **result )
 {
     TRACE( "asyncBlock %p\n", asyncBlock );
-    if (result) *result = NULL;
-    return S_OK;
+    return XAsyncGetResult( asyncBlock, store_QueryAssociatedProductsAsync, sizeof(void*), result, NULL );
 }
 
 /* --- Per-slot stubs --- */
@@ -140,10 +135,9 @@ STORE_STUB(55) STORE_STUB(56) STORE_STUB(57) STORE_STUB(58)
 STORE_STUB(59) STORE_STUB(60) STORE_STUB(61) STORE_STUB(62)
 STORE_STUB(63) STORE_STUB(64) STORE_STUB(65)
 
-/* vtable[66]: XStoreGetPackageInstallProgress */
 static HRESULT WINAPI store_stub_66_real( void *iface, void *monitor, void *progress )
 {
-    TRACE( "iface %p - returning installed\n", iface );
+    TRACE( "returning installed\n" );
     if (progress) memset( progress, 0, 32 );
     return S_OK;
 }

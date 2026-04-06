@@ -125,12 +125,24 @@ typedef HRESULT (WINAPI *InitializeApiImplEx2_ext)( ULONG gdkVer, ULONG gsVer, C
 
 HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITIALIZE_OPTIONS *options )
 {
-    //  Initialization can be done however we want on our side.
-    // You can choose to return `S_OK` once the full SDK is implemented.
-    //
-    //  There's no documented information about what `INITIALIZE_OPTIONS` is,
-    // and xgameruntime.lib never utilizes this argument anyway.
-    TRACE("gdkVer %ld, gsVer %ld, mode %d, options %p stub!\n", gdkVer, gsVer, mode, options);
+    HRESULT hr;
+
+    TRACE("gdkVer %ld, gsVer %ld, mode %d, options %p\n", gdkVer, gsVer, mode, options);
+
+    /* Forward to the native threading DLL to initialize its XAsync/XTaskQueue system */
+    TRACE("xgameruntime_threading = %p\n", xgameruntime_threading);
+    if (xgameruntime_threading)
+    {
+        InitializeApiImplEx2_ext native_init = (InitializeApiImplEx2_ext)GetProcAddress( xgameruntime_threading, "InitializeApiImplEx2" );
+        if (native_init)
+        {
+            hr = native_init( gdkVer, gsVer, mode, options );
+            TRACE("native InitializeApiImplEx2 returned 0x%08lx\n", hr);
+            /* Ignore failures from native init - it may fail without Gaming Services
+               but the XAsync/XTaskQueue subsystem should still be usable */
+        }
+    }
+
     return GDKC_InitAPI( gdkVer, gsVer, mode, options );
 }
 
