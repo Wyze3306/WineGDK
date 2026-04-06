@@ -215,7 +215,13 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
         return IXUserImpl_QueryInterface( x_user_impl, interfaceId, out );
     }
 
-    /* {0dd112ac} composite service - not implemented yet */
+    /* {0dd112ac} composite XStore service */
+    if ( runtimeClassId->Data1 == 0x0dd112ac )
+    {
+        extern void *x_store_composite_get(void);
+        void *store = x_store_composite_get();
+        if (store) { *out = store; return S_OK; }
+    }
 
     FIXME( "%s (iid %s) not implemented, returning E_NOINTERFACE.\n", debugstr_guid( runtimeClassId ), debugstr_guid( interfaceId ) );
     if (out) *out = NULL;
