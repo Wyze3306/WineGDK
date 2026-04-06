@@ -268,12 +268,15 @@ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl *iface, XUserAddOptions o
 static HRESULT WINAPI x_user_XUserAddResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, XUserHandle *user )
 {
     IXThreadingImpl *impl;
+    HRESULT hr;
 
     TRACE( "iface %p, asyncBlock %p, user %p\n", iface, asyncBlock, user );
 
     if (!asyncBlock || !user) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_NOTIMPL;
-    return impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserAddAsync, sizeof( XUserHandle ), user, NULL );
+    hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserAddAsync, sizeof( XUserHandle ), user, NULL );
+    TRACE( "XUserAddResult returning hr=0x%08lx, user=%p\n", hr, user ? *user : NULL );
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetLocalId( IXUserImpl *iface, XUserHandle user, XUserLocalId *localId )
@@ -295,6 +298,7 @@ static HRESULT WINAPI x_user_XUserGetId( IXUserImpl *iface, XUserHandle user, UI
     TRACE( "iface %p, user %p, userId %p\n", iface, user, userId );
     if (!user || !userId) return E_POINTER;
     *userId = ((struct x_user*)user)->xuid;
+    TRACE( "returning xuid=%llu, gamertag=%s\n", (unsigned long long)*userId, ((struct x_user*)user)->gamertag );
     return S_OK;
 }
 

@@ -238,7 +238,7 @@ static AsyncBlockInternal* x_async_block_guard_DoLock( XAsyncBlock* asyncBlock )
         return NULL;
     }
 
-    EnterCriticalSection( &lockedResult->lock );
+    while (InterlockedCompareExchange( &lockedResult->lock, 1, 0 )) SwitchToThread();
 
     state = impl_from_IAsyncState( lockedResult->state );
 
@@ -247,22 +247,22 @@ static AsyncBlockInternal* x_async_block_guard_DoLock( XAsyncBlock* asyncBlock )
 
     lockedResult->state->lpVtbl->AddRef( lockedResult->state );
 
-    LeaveCriticalSection( &lockedResult->lock );
+    InterlockedExchange( &lockedResult->lock, 0 );
 
     stateAsyncBlockInternal = (AsyncBlockInternal *)state->providerAsyncBlock.internal;
     if ( stateAsyncBlockInternal == NULL )
     {
-        EnterCriticalSection( &lockedResult->lock );
+        while (InterlockedCompareExchange( &lockedResult->lock, 1, 0 )) SwitchToThread();
         lockedResult->state->lpVtbl->Release( lockedResult->state );
         return lockedResult;
     }
 
-    EnterCriticalSection( &stateAsyncBlockInternal->lock );
+    while (InterlockedCompareExchange( &stateAsyncBlockInternal->lock, 1, 0 )) SwitchToThread();
 
     if ( stateAsyncBlockInternal->state == NULL )
     {
-        LeaveCriticalSection( &stateAsyncBlockInternal->lock );
-        EnterCriticalSection( &lockedResult->lock );
+        InterlockedExchange( &stateAsyncBlockInternal->lock, 0 );
+        while (InterlockedCompareExchange( &lockedResult->lock, 1, 0 )) SwitchToThread();
         lockedResult->state->lpVtbl->Release( lockedResult->state );
         return lockedResult;
     }
@@ -322,7 +322,7 @@ static VOID InitInternalGuardFromBlock( IXAsyncBlockInternalGuard *iface, XAsync
     if ( impl->userInternal != impl->internal )
     {
         TRACE("got here!\n");
-        EnterCriticalSection( &impl->userInternal->lock );
+        while (InterlockedCompareExchange( &impl->userInternal->lock, 1, 0 )) SwitchToThread();
     }*/
 
     return;
@@ -420,8 +420,9 @@ static HRESULT AllocState( XAsyncBlock* asyncBlock, SIZE_T contextSize )
     // XAsyncBlock in 2 calls at the same time)
 
     internal->signature = ASYNC_BLOCK_SIG;
-    InitializeCriticalSection( &internal->lock );
-    
+    internal->status = E_PENDING;
+    internal->lock = 0;
+
     hr = AllocStateNoCompletion( asyncBlock, internal, contextSize );
 
     if ( FAILED( hr ) )
@@ -597,10 +598,10 @@ static void CALLBACK WorkerCallback( PVOID context, BOOL canceled )
 
         if ( impl->locked )
         {
-            LeaveCriticalSection( &impl->internal->lock );
+            InterlockedExchange( &impl->internal->lock, 0 );
             if ( impl->userInternal != impl->internal )
             {
-                LeaveCriticalSection( &impl->userInternal->lock );
+                InterlockedExchange( &impl->userInternal->lock, 0 );
             }
         }
 
@@ -679,10 +680,10 @@ HRESULT XAsyncGetStatus( XAsyncBlock* asyncBlock, BOOLEAN wait )
 
     if ( impl->locked )
     {
-        LeaveCriticalSection( &impl->internal->lock );
+        InterlockedExchange( &impl->internal->lock, 0 );
         if ( impl->userInternal != impl->internal )
         {
-            LeaveCriticalSection( &impl->userInternal->lock );
+            InterlockedExchange( &impl->userInternal->lock, 0 );
         }
     }
 
@@ -720,10 +721,10 @@ HRESULT XAsyncGetResultSize( XAsyncBlock* asyncBlock, SIZE_T* bufferSize )
     //destructor
     if ( impl->locked )
     {
-        LeaveCriticalSection( &impl->internal->lock );
+        InterlockedExchange( &impl->internal->lock, 0 );
         if ( impl->userInternal != impl->internal )
         {
-            LeaveCriticalSection( &impl->userInternal->lock );
+            InterlockedExchange( &impl->userInternal->lock, 0 );
         }
     }
 
@@ -774,10 +775,10 @@ VOID XAsyncCancel( XAsyncBlock* asyncBlock )
 
     if ( impl->locked )
     {
-        LeaveCriticalSection( &impl->internal->lock );
+        InterlockedExchange( &impl->internal->lock, 0 );
         if ( impl->userInternal != impl->internal )
         {
-            LeaveCriticalSection( &impl->userInternal->lock );
+            InterlockedExchange( &impl->userInternal->lock, 0 );
         }
     }
 

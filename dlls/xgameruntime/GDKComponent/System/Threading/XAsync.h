@@ -44,7 +44,7 @@ typedef struct AsyncBlockInternal
     IAsyncState* state;
     HRESULT status;
     DWORD signature;
-    CRITICAL_SECTION lock;
+    LONG lock;
 } AsyncBlockInternal;
 
 typedef struct IXAsyncBlockInternalGuardVtbl {

@@ -174,7 +174,7 @@ static HRESULT ParseJsonObject( LPCSTR str, UINT32 str_size, IJsonObject **objec
     if (!(wstr_size = MultiByteToWideChar( CP_UTF8, 0, str, str_size, NULL, 0 )))
         return HRESULT_FROM_WIN32( GetLastError() );
 
-    if (!(wstr = calloc( wstr_size, sizeof( WCHAR ) )))
+    if (!(wstr = calloc( wstr_size + 1, sizeof( WCHAR ) )))
         return E_OUTOFMEMORY;
 
     if (!(wstr_size = MultiByteToWideChar( CP_UTF8, 0, str, str_size, wstr, wstr_size )))

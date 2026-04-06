@@ -140,6 +140,7 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl* iface, XAsyn
     }
 
     hr = internal->status;
+    TRACE( "internal->status = 0x%08lx, identity match: %d\n", hr, stateImpl->identity == identity );
     if (hr == E_PENDING) return E_PENDING;
     if (FAILED( hr )) return hr;
 
