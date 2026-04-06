@@ -97,10 +97,11 @@ static HRESULT store_products_provider( XAsyncOp op, const XAsyncProviderData *d
     return S_OK;
 }
 
-static HRESULT WINAPI store_QueryAssociatedProductsAsync( void *a, void *b, void *c, void *d, void *e, void *asyncBlock )
+/* XStoreQueryAssociatedProductsAsync(this, storeContext, productKinds, maxItems, asyncBlock) */
+static HRESULT WINAPI store_QueryAssociatedProductsAsync( void *iface, void *context, UINT32 kinds, UINT32 maxItems, void *asyncBlock )
 {
     HRESULT hr;
-    TRACE( "asyncBlock %p\n", asyncBlock );
+    TRACE( "iface %p, context %p, kinds %u, maxItems %u, asyncBlock %p\n", iface, context, kinds, maxItems, asyncBlock );
     hr = XAsyncBegin( asyncBlock, NULL, store_QueryAssociatedProductsAsync, "XStoreQueryAssociatedProductsAsync", store_products_provider );
     TRACE( "XAsyncBegin returned 0x%08lx\n", hr );
     return hr;

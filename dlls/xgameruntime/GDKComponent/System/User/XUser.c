@@ -767,14 +767,20 @@ static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl *iface, XTa
     g_change_queue = queue;
     if (token) token->token = 1;
 
-    /* Fire the change event via the task queue to notify the game of sign-in */
-    if (g_signed_in_user && queue)
+    /* Fire the change event to notify the game of sign-in */
+    if (g_signed_in_user)
     {
-        if (SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) ))
+        if (queue && SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) ))
         {
             TRACE( "submitting change event to task queue %p\n", queue );
             impl->lpVtbl->XTaskQueueSubmitCallback( impl, queue, Completion, NULL, (XTaskQueueCallback*)change_event_taskqueue_cb );
             impl->lpVtbl->Release( impl );
+        }
+        else
+        {
+            /* No queue - fire directly on a worker thread */
+            TRACE( "firing change event directly (no queue)\n" );
+            change_event_taskqueue_cb( NULL, FALSE );
         }
     }
 
