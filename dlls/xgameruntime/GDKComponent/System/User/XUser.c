@@ -29,6 +29,14 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 static const struct IXUserImplVtbl x_user_vtbl;
 static const struct IXUserGamertagVtbl x_user_gt_vtbl;
 
+/* Change event callback storage */
+static XUserChangeEventCallback g_change_callback;
+static PVOID g_change_context;
+static XTaskQueueHandle g_change_queue;
+
+/* Track last signed-in user for FindUserByLocalId/ById */
+static struct x_user *g_signed_in_user;
+
 static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
 {
     struct x_user *impl;
@@ -248,7 +256,7 @@ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl *iface, XUserAddOptions o
     IXThreadingImpl *impl;
     HRESULT hr;
 
-    TRACE( "iface %p, options %d, asyncBlock %p\n", iface, options, asyncBlock );
+    TRACE( "iface %p, options %d, asyncBlock %p, callback %p\n", iface, options, asyncBlock, asyncBlock ? asyncBlock->callback : NULL );
 
     if (!asyncBlock) return E_POINTER;
     if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
@@ -276,6 +284,18 @@ static HRESULT WINAPI x_user_XUserAddResult( IXUserImpl *iface, XAsyncBlock *asy
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_NOTIMPL;
     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserAddAsync, sizeof( XUserHandle ), user, NULL );
     TRACE( "XUserAddResult returning hr=0x%08lx, user=%p\n", hr, user ? *user : NULL );
+
+    /* Track the signed-in user */
+    if (SUCCEEDED( hr ) && *user)
+    {
+        struct x_user *u = (struct x_user *)*user;
+        if (!g_signed_in_user)
+        {
+            g_signed_in_user = u;
+            IXUserImpl_AddRef( &u->IXUserImpl_iface );
+        }
+    }
+
     return hr;
 }
 
@@ -289,8 +309,15 @@ static HRESULT WINAPI x_user_XUserGetLocalId( IXUserImpl *iface, XUserHandle use
 
 static HRESULT WINAPI x_user_XUserFindUserByLocalId( IXUserImpl *iface, XUserLocalId localId, XUserHandle *user )
 {
-    FIXME( "iface %p, localId %p, user %p stub!\n", iface, &localId, user );
-    return E_NOTIMPL;
+    TRACE( "iface %p, localId %llu, user %p\n", iface, (unsigned long long)localId.value, user );
+    if (!user) return E_POINTER;
+    if (g_signed_in_user && g_signed_in_user->local_id.value == localId.value)
+    {
+        IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
+        *user = (XUserHandle)g_signed_in_user;
+        return S_OK;
+    }
+    return E_GAMEUSER_NO_DEFAULT_USER;
 }
 
 static HRESULT WINAPI x_user_XUserGetId( IXUserImpl *iface, XUserHandle user, UINT64 *userId )
@@ -304,8 +331,15 @@ static HRESULT WINAPI x_user_XUserGetId( IXUserImpl *iface, XUserHandle user, UI
 
 static HRESULT WINAPI x_user_XUserFindUserById( IXUserImpl *iface, UINT64 userId, XUserHandle *user )
 {
-    FIXME( "iface %p, userId %llu, user %p stub!\n", iface, userId, user );
-    return E_NOTIMPL;
+    TRACE( "iface %p, userId %llu, user %p\n", iface, (unsigned long long)userId, user );
+    if (!user) return E_POINTER;
+    if (g_signed_in_user && g_signed_in_user->xuid == userId)
+    {
+        IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
+        *user = (XUserHandle)g_signed_in_user;
+        return S_OK;
+    }
+    return E_GAMEUSER_NO_DEFAULT_USER;
 }
 
 static HRESULT WINAPI x_user_XUserGetIsGuest( IXUserImpl *iface, XUserHandle user, BOOLEAN *isGuest )
@@ -653,10 +687,37 @@ static HRESULT WINAPI x_user_XUserResolveIssueWithUiUtf16Result( IXUserImpl *ifa
     return E_NOTIMPL;
 }
 
+static void CALLBACK change_event_taskqueue_cb( void *context, BOOL canceled )
+{
+    if (canceled || !g_signed_in_user || !g_change_callback) return;
+
+    TRACE( "firing XUserChangeEvent_SignedInAgain via task queue for local_id=%llu\n",
+           (unsigned long long)g_signed_in_user->local_id.value );
+    g_change_callback( g_change_context, g_signed_in_user->local_id, XUserChangeEvent_SignedInAgain );
+    TRACE( "change event callback returned\n" );
+}
+
 static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl *iface, XTaskQueueHandle queue, PVOID context, XUserChangeEventCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, context %p, callback %p, token %p semi-stub!\n", iface, context, callback, token );
+    IXThreadingImpl *impl;
+
+    TRACE( "iface %p, queue %p, context %p, callback %p, token %p\n", iface, queue, context, callback, token );
+    g_change_callback = (XUserChangeEventCallback)(void*)callback;
+    g_change_context = context;
+    g_change_queue = queue;
     if (token) token->token = 1;
+
+    /* Fire the change event via the task queue to notify the game of sign-in */
+    if (g_signed_in_user && queue)
+    {
+        if (SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) ))
+        {
+            TRACE( "submitting change event to task queue %p\n", queue );
+            impl->lpVtbl->XTaskQueueSubmitCallback( impl, queue, Completion, NULL, (XTaskQueueCallback*)change_event_taskqueue_cb );
+            impl->lpVtbl->Release( impl );
+        }
+    }
+
     return S_OK;
 }
 
