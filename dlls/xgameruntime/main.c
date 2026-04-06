@@ -235,6 +235,27 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
         if (broker) { *out = broker; return S_OK; }
     }
 
+    /* Return the service broker for all remaining GDK CLSIDs.
+     * These are sub-interfaces that the game queries during XSAPI initialization.
+     * Without them, the Xbox Live social manager can't initialize and the RTA
+     * websocket to rta.xboxlive.com never connects. */
+    if ( runtimeClassId->Data1 == 0x95fd18d2 ||  /* Core Runtime Query Forwarder */
+         runtimeClassId->Data1 == 0x8ca467f7 ||  /* XError */
+         runtimeClassId->Data1 == 0x0651aae2 ||  /* XGameSave/XGameInvite */
+         runtimeClassId->Data1 == 0x973a344e ||  /* XGame/XLauncher */
+         runtimeClassId->Data1 == 0x3e241977 ||  /* XPackage */
+         runtimeClassId->Data1 == 0x7d824997 )   /* XGameSave/UserDeviceAssociations */
+    {
+        extern void *x_service_broker_get(void);
+        void *broker = x_service_broker_get();
+        if (broker)
+        {
+            TRACE( "returning service broker for %s\n", debugstr_guid( runtimeClassId ) );
+            *out = broker;
+            return S_OK;
+        }
+    }
+
     FIXME( "%s (iid %s) not implemented, returning E_NOINTERFACE.\n", debugstr_guid( runtimeClassId ), debugstr_guid( interfaceId ) );
     if (out) *out = NULL;
     return E_NOTIMPL;
