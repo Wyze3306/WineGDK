@@ -100,9 +100,28 @@ static HRESULT WINAPI x_system_XSystemGetXboxLiveSandboxId( IXSystemImpl *iface,
 }
 
 static HRESULT WINAPI x_system_XSystemGetAppSpecificDeviceId( IXSystemImpl *iface, INT32 appSpecificDeviceIdSize, LPSTR appSpecificDeviceId, SIZE_T *appSpecificDeviceIdUsed )
-{    
-    FIXME( "iface %p, appSpecificDeviceIdSize %d, appSpecificDeviceId %p, appSpecificDeviceIdUsed %p stub!\n", iface, appSpecificDeviceIdSize, appSpecificDeviceId, appSpecificDeviceIdUsed );
-    return E_NOTIMPL;
+{
+    static char device_id[45] = {0};
+
+    TRACE( "iface %p, size %d, out %p, used %p\n", iface, appSpecificDeviceIdSize, appSpecificDeviceId, appSpecificDeviceIdUsed );
+
+    if (!device_id[0])
+    {
+        GUID guid;
+        CoCreateGuid( &guid );
+        sprintf( device_id, "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                 guid.Data1, guid.Data2, guid.Data3,
+                 guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
+                 guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7] );
+    }
+
+    if (appSpecificDeviceIdUsed)
+        *appSpecificDeviceIdUsed = strlen( device_id ) + 1;
+
+    if (appSpecificDeviceId && appSpecificDeviceIdSize > 0)
+        lstrcpynA( appSpecificDeviceId, device_id, appSpecificDeviceIdSize );
+
+    return S_OK;
 }
 
 static HRESULT WINAPI x_system_XSystemHandleTrack( IXSystemImpl *iface )
