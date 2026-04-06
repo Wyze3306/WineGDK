@@ -204,19 +204,11 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
     }
     else if ( IsEqualGUID( runtimeClassId, &CLSID_XThreadingImpl ) )
     {
-        /**
-         * For IXThreading, It's much better to use the native library instead.
-         */
-        if ( !func )
-        {
-            LoadOtherRuntime( &asked );
-            if ( !asked )
-            {
-                MessageBoxA( NULL, "The game has requested XThreading\nIt's recommended that you use Microsoft's native binary for this instead.\nTo do so, copy xgameruntime.dll from a Windows machine and place it under the name \"xgameruntime.dll.threading\" within either the game's binaries or within your prefix's system32 folder.\nYou won't be asked this again.", "Attention Required!", MB_ICONEXCLAMATION );
-            }
-            return IXThreadingImpl_QueryInterface( x_threading_impl, interfaceId, out );
-        }
-        return func( runtimeClassId, interfaceId, out );
+        /* Use native threading DLL for XAsync/XTaskQueue - it has proper
+         * thread pool dispatch that the game relies on for its main loop. */
+        if ( func )
+            return func( runtimeClassId, interfaceId, out );
+        return IXThreadingImpl_QueryInterface( x_threading_impl, interfaceId, out );
     }
     else if ( IsEqualGUID( runtimeClassId, &CLSID_XNetworkingImpl ) )
     {
