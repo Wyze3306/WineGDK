@@ -170,10 +170,7 @@ enum XUserPlatformSpopOperationResult
     XUserPlatformSpopOperationResult_Canceled       = 3
 };
 
-struct APP_LOCAL_DEVICE_ID
-{
-    BYTE value[32];
-};
+/* APP_LOCAL_DEVICE_ID defined in gameinput.idl */
 
 struct XUserLocalId {
     UINT64 value;

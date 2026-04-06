@@ -42,6 +42,7 @@ struct x_user
     HSTRING oauth_token;
     HSTRING user_token;
     HSTRING xsts_token;
+    CHAR gamertag[128];
 };
 
 #endif

@@ -18,6 +18,8 @@
 
 #include "Token.h"
 
+WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+
 #define GetJsonValue( obj_type, ret_type )                                                          \
 static inline HRESULT GetJson##obj_type##Value( IJsonObject *object, LPCWSTR key, ret_type value )  \
 {                                                                                                   \
@@ -376,7 +378,7 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
     return hr;
 }
 
-HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUserAgeGroup *age_group )
+HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUserAgeGroup *age_group, LPSTR gamertag, SIZE_T gamertag_size )
 {
     LPCSTR template = "{\"RelyingParty\":\"http://xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"";
     LPCWSTR accept[] = {L"application/json", NULL};
@@ -395,9 +397,15 @@ HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUse
     HSTRING xid;
     HRESULT hr;
     LPSTR data;
+    HSTRING gtg;
+
+    TRACE( "RequestXstsToken starting\n" );
 
     if (FAILED( hr = HSTRINGToMultiByte( user_token, &token_str, &token_str_len ) ))
+    {
+        WARN( "failed to convert user_token to multibyte: 0x%08lx\n", hr );
         return hr;
+    }
 
     if (!(data = calloc( strlen( template ) + token_str_len + strlen( "\"]}}" ) + 1, sizeof( CHAR ) )))
     {
@@ -410,6 +418,7 @@ HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUse
     free( token_str );
     strcat( data, "\"]}}" );
 
+    TRACE( "sending XSTS request\n" );
     hr = HttpRequest(
         L"POST",
         L"xsts.auth.xboxlive.com",
@@ -422,10 +431,21 @@ HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUse
     );
 
     free( data );
-    if (FAILED( hr )) return hr;
+    if (FAILED( hr ))
+    {
+        WARN( "XSTS HttpRequest failed: 0x%08lx\n", hr );
+        return hr;
+    }
+
+    TRACE( "XSTS response size=%llu, first 200 chars: %.200s\n", (unsigned long long)size, buffer );
+
     hr = ParseJsonObject( buffer, size, &object );
     free( buffer );
-    if (FAILED( hr )) return hr;
+    if (FAILED( hr ))
+    {
+        WARN( "XSTS JSON parse failed: 0x%08lx\n", hr );
+        return hr;
+    }
 
     if (FAILED( hr = GetJsonStringValue( object, L"Token", token ) ))
     {
@@ -469,6 +489,28 @@ HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUse
     else if (agg_len >= 4 && wcsncmp( agg_str, L"Teen", 4 )) *age_group = XUserAgeGroup_Teen;
     else if (agg_len >= 5 && wcsncmp( agg_str, L"Adult", 5 )) *age_group = XUserAgeGroup_Adult;
     else *age_group = XUserAgeGroup_Unknown;
+
+    /* Extract gamertag if available */
+    if (gamertag && gamertag_size > 0)
+    {
+        if (SUCCEEDED( GetJsonStringValue( object, L"gtg", &gtg ) ))
+        {
+            UINT32 gtg_len;
+            LPSTR gtg_str;
+            if (SUCCEEDED( HSTRINGToMultiByte( gtg, &gtg_str, &gtg_len ) ))
+            {
+                SIZE_T copy_len = gtg_len < gamertag_size - 1 ? gtg_len : gamertag_size - 1;
+                memcpy( gamertag, gtg_str, copy_len );
+                gamertag[copy_len] = '\0';
+                free( gtg_str );
+            }
+            WindowsDeleteString( gtg );
+        }
+        else
+        {
+            gamertag[0] = '\0';
+        }
+    }
 
     hr = GetJsonStringValue( object, L"xid", &xid );
     IJsonObject_Release( object );

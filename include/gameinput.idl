@@ -45,6 +45,8 @@ typedef int int32_t;
 typedef unsigned short uint16_t;
 typedef unsigned char uint8_t;
 typedef boolean bool;
+cpp_quote("#ifndef __APP_LOCAL_DEVICE_ID_DEFINED__")
+cpp_quote("#define __APP_LOCAL_DEVICE_ID_DEFINED__")
 typedef struct APP_LOCAL_DEVICE_ID
 {
     BYTE value[32];

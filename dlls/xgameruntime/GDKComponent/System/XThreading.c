@@ -119,8 +119,40 @@ static VOID WINAPI x_threading_XAsyncComplete( IXThreadingImpl* iface, XAsyncBlo
 
 static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl* iface, XAsyncBlock* asyncBlock, const PVOID identity, SIZE_T bufferSize, PVOID buffer, SIZE_T* bufferUsed )
 {
-    FIXME( "iface %p stub!\n", iface );
-    return E_NOTIMPL;
+    AsyncBlockInternal *internal;
+    struct async_state *stateImpl;
+    HRESULT hr;
+
+    TRACE( "iface %p, asyncBlock %p, identity %p, bufferSize %llu, buffer %p, bufferUsed %p\n",
+           iface, asyncBlock, identity, (unsigned long long)bufferSize, buffer, bufferUsed );
+
+    if (!asyncBlock) return E_POINTER;
+
+    internal = (AsyncBlockInternal *)asyncBlock->internal;
+    if (!internal || !internal->state) return E_INVALIDARG;
+
+    stateImpl = CONTAINING_RECORD( internal->state, struct async_state, IAsyncState_iface );
+
+    if (identity && stateImpl->identity != identity)
+    {
+        WARN( "identity mismatch: expected %p, got %p (%s)\n", identity, stateImpl->identity, stateImpl->identityName );
+        return E_INVALIDARG;
+    }
+
+    hr = internal->status;
+    if (hr == E_PENDING) return E_PENDING;
+    if (FAILED( hr )) return hr;
+
+    if (buffer && bufferSize > 0)
+    {
+        stateImpl->providerData.buffer = buffer;
+        stateImpl->providerData.bufferSize = bufferSize;
+        stateImpl->providerCallback( GetResult, &stateImpl->providerData );
+    }
+
+    if (bufferUsed) *bufferUsed = stateImpl->providerData.bufferSize;
+
+    return hr;
 }
 
 
