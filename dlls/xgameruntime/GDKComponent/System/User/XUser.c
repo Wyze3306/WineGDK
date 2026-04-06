@@ -778,7 +778,6 @@ static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl *iface, XTa
         }
         else
         {
-            /* No queue - fire directly on a worker thread */
             TRACE( "firing change event directly (no queue)\n" );
             change_event_taskqueue_cb( NULL, FALSE );
         }
