@@ -37,5 +37,8 @@ HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *loc
 HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUserAgeGroup *age_group, LPSTR gamertag, SIZE_T gamertag_size );
 HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_party, HSTRING *token );
 HRESULT HSTRINGToMultiByte( HSTRING hstr, LPSTR *str, UINT32 *str_len );
+HRESULT HttpRequest( LPCWSTR method, LPCWSTR host, LPCWSTR path, LPSTR data,
+                     LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *size );
+HRESULT ParseJsonObject( LPCSTR str, UINT32 str_size, IJsonObject **object );
 
 #endif

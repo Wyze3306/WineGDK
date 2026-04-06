@@ -61,7 +61,7 @@ HRESULT HSTRINGToMultiByte( HSTRING hstr, LPSTR *str, UINT32 *str_len )
     return S_OK;
 }
 
-static HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data, LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *bufferSize )
+HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data, LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *bufferSize )
 {
     HINTERNET connection = NULL;
     DWORD size = sizeof( DWORD );
@@ -158,7 +158,7 @@ static HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPST
     return hr;
 }
 
-static HRESULT ParseJsonObject( LPCSTR str, UINT32 str_size, IJsonObject **object )
+HRESULT ParseJsonObject( LPCSTR str, UINT32 str_size, IJsonObject **object )
 {
     LPCWSTR class_str = RuntimeClass_Windows_Data_Json_JsonValue;
     IJsonValueStatics *statics;

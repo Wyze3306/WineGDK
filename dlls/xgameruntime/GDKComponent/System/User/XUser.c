@@ -22,6 +22,7 @@
  */
 
 #include "XUser.h"
+#include "DeviceAuth.h"
 #include "winhttp.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
@@ -90,6 +91,19 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
         TRACE( "failed to get oauth token\n" );
         IXUserImpl_Release( &impl->IXUserImpl_iface );
         return hr;
+    }
+
+    /* Initialize device auth (generates EC key pair, gets device token) */
+    {
+        UINT32 oauth_len;
+        LPSTR oauth_str;
+        if (SUCCEEDED( HSTRINGToMultiByte( impl->oauth_token, &oauth_str, &oauth_len ) ))
+        {
+            HRESULT da_hr = DeviceAuth_Initialize( oauth_str );
+            free( oauth_str );
+            if (FAILED( da_hr ))
+                WARN( "DeviceAuth_Initialize failed: 0x%08lx (continuing without device auth)\n", da_hr );
+        }
     }
 
     if (FAILED( hr = RequestUserToken( impl->oauth_token, &impl->user_token, &impl->local_id ) ))
@@ -440,6 +454,8 @@ struct XUserGetTokenAndSignatureContext
     const void *buffer;
     LPSTR result_token;
     SIZE_T result_token_len;
+    LPSTR result_signature;
+    SIZE_T result_signature_len;
     SIZE_T result_size;
 };
 
@@ -467,11 +483,23 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
             {
                 memcpy( strings, context->result_token, context->result_token_len );
                 strings[context->result_token_len] = '\0';
-                strings[context->result_token_len + 1] = '\0';
                 data->token = strings;
                 data->tokenSize = context->result_token_len;
-                data->signature = strings + context->result_token_len + 1;
-                data->signatureSize = 0;
+
+                if (context->result_signature && context->result_signature_len > 0)
+                {
+                    LPSTR sig_pos = strings + context->result_token_len + 1;
+                    memcpy( sig_pos, context->result_signature, context->result_signature_len );
+                    sig_pos[context->result_signature_len] = '\0';
+                    data->signature = sig_pos;
+                    data->signatureSize = context->result_signature_len;
+                }
+                else
+                {
+                    strings[context->result_token_len + 1] = '\0';
+                    data->signature = strings + context->result_token_len + 1;
+                    data->signatureSize = 0;
+                }
             }
             break;
         }
@@ -533,13 +561,33 @@ static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsy
 
             TRACE( "token for %s: %.40s...\n", rp, context->result_token );
 
-            context->result_size = sizeof(XUserGetTokenAndSignatureData) + context->result_token_len + 2;
+            /* Compute request signature if device auth is available */
+            if (DeviceAuth_IsInitialized())
+            {
+                LPCSTR method_str = context->utf16 ? "GET" : context->method;
+                /* Extract path from URL */
+                LPCSTR path = url ? strstr( url, "://" ) : NULL;
+                if (path) path = strchr( path + 3, '/' );
+                if (!path) path = "/";
+
+                if (SUCCEEDED( DeviceAuth_SignRequest( method_str, path,
+                    context->result_token, NULL, 0, &context->result_signature ) ))
+                {
+                    context->result_signature_len = strlen( context->result_signature );
+                    TRACE( "signature: %.20s...\n", context->result_signature );
+                }
+            }
+
+            context->result_size = sizeof(XUserGetTokenAndSignatureData)
+                + context->result_token_len + 1
+                + (context->result_signature_len ? context->result_signature_len + 1 : 1);
             impl->lpVtbl->XAsyncComplete( impl, providerData->async, S_OK, context->result_size );
             break;
         }
 
         case Cleanup:
             if (context->result_token) free( context->result_token );
+            if (context->result_signature) free( context->result_signature );
             if (context->count)
             {
                 if (context->utf16) free( context->headers_utf16 );
