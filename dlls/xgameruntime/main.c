@@ -20,6 +20,7 @@
 
 #include "initguid.h"
 #include "private.h"
+#include "psapi.h"
 
 #include "GDKComponent/InitInternalGDKC.h"
 
@@ -120,22 +121,6 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
              * The function at RVA 0x1433680 checks user->isConnected(XboxLive)
              * which is never set because XSAPI social manager doesn't initialize
              * on Win32/Wine. Patching to 'mov eax,1; ret' bypasses this. */
-            game = GetModuleHandleA( NULL );
-            if (game)
-            {
-                BYTE *addr = (BYTE *)game + 0x1433680;
-                if (VirtualProtect( addr, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
-                {
-                    addr[0] = 0xB8; /* mov eax, 1 */
-                    addr[1] = 0x01;
-                    addr[2] = 0x00;
-                    addr[3] = 0x00;
-                    addr[4] = 0x00;
-                    addr[5] = 0xC3; /* ret */
-                    VirtualProtect( addr, 6, oldprot, &oldprot );
-                    TRACE( "patched isSignedIn checker at %p\n", addr );
-                }
-            }
             break;
         }
         case DLL_PROCESS_DETACH:
@@ -209,6 +194,87 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                     ERR( "native DLL already has process queue %p\n", processQueue );
                 }
                 threading->lpVtbl->Release( threading );
+            }
+        }
+    }
+
+    /* Patch the game's isSignedIn checker to always return TRUE.
+     * Scans for the function's unique byte pattern so it works across versions.
+     * Called here (not DLL_PROCESS_ATTACH) to ensure the game binary is loaded.
+     * Retries on each InitializeApiImplEx2 call until successful. */
+    {
+        static BOOLEAN patched = FALSE;
+        if (!patched)
+        {
+            HMODULE game = GetModuleHandleA( NULL );
+            if (game)
+            {
+                MODULEINFO modinfo;
+                if (GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
+                {
+                    BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
+                    SIZE_T size = modinfo.SizeOfImage;
+                    BYTE *addr = NULL;
+                    SIZE_T i;
+                    DWORD oldprot;
+
+                    /* Function prologue pattern:
+                     *   48 89 5C 24 10   mov [rsp+10h], rbx
+                     *   48 89 74 24 18   mov [rsp+18h], rsi
+                     *   57               push rdi
+                     *   48 83 EC 30      sub rsp, 30h
+                     * Then within ~20 bytes: 48 8B 49 50 (mov rcx,[rcx+50h]) = mUserManager
+                     * Then within ~80 bytes: BA 01 00 00 00 (mov edx,1) = NetworkType::XboxLive */
+                    static const BYTE prologue[] = {
+                        0x48, 0x89, 0x5C, 0x24, 0x10,
+                        0x48, 0x89, 0x74, 0x24, 0x18,
+                        0x57,
+                        0x48, 0x83, 0xEC, 0x30
+                    };
+
+                    for (i = 0; i + sizeof(prologue) + 80 < size; i++)
+                    {
+                        SIZE_T j;
+                        BOOLEAN found_usermgr = FALSE, found_xboxlive = FALSE;
+
+                        if (memcmp( base + i, prologue, sizeof(prologue) ) != 0)
+                            continue;
+
+                        /* Verify: mov rcx,[rcx+50h] within next 20 bytes */
+                        for (j = i + sizeof(prologue); j < i + sizeof(prologue) + 20 && j + 4 < size; j++)
+                            if (base[j]==0x48 && base[j+1]==0x8B && base[j+2]==0x49 && base[j+3]==0x50)
+                                { found_usermgr = TRUE; break; }
+
+                        if (!found_usermgr) continue;
+
+                        /* Verify: mov edx,1 within next 80 bytes */
+                        for (j = i + sizeof(prologue); j < i + sizeof(prologue) + 80 && j + 5 < size; j++)
+                            if (base[j]==0xBA && base[j+1]==0x01 && base[j+2]==0x00 && base[j+3]==0x00 && base[j+4]==0x00)
+                                { found_xboxlive = TRUE; break; }
+
+                        if (!found_xboxlive) continue;
+
+                        addr = base + i;
+                        break;
+                    }
+
+                    if (addr && VirtualProtect( addr, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
+                    {
+                        addr[0] = 0xB8; /* mov eax, 1 */
+                        addr[1] = 0x01;
+                        addr[2] = 0x00;
+                        addr[3] = 0x00;
+                        addr[4] = 0x00;
+                        addr[5] = 0xC3; /* ret */
+                        VirtualProtect( addr, 6, oldprot, &oldprot );
+                        ERR( "patched isSignedIn at %p (RVA 0x%lx)\n", addr, (ULONG_PTR)(addr - base) );
+                        patched = TRUE;
+                    }
+                    else if (!addr)
+                    {
+                        ERR( "isSignedIn pattern not found in %zu bytes\n", size );
+                    }
+                }
             }
         }
     }
