@@ -279,6 +279,54 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
         }
     }
 
+    /* Patch 2: NOP the credential check gate that blocks XblInitialize.
+     * The game's XboxLiveServices::signIn checks a credential provider
+     * which returns E_FAIL without Gaming Services. This JL skips XblInitialize.
+     * Pattern: cmp [rbp-0x18], 0; JL (83 7D E8 00 0F 8C)
+     * followed by xorps xmm0,xmm0; xor eax,eax (0F 57 C0 33 C0) */
+    {
+        static BOOLEAN patched2 = FALSE;
+        if (!patched2)
+        {
+            HMODULE game2 = GetModuleHandleA( NULL );
+            if (game2)
+            {
+                MODULEINFO mi2;
+                if (GetModuleInformation( GetCurrentProcess(), game2, &mi2, sizeof(mi2) ))
+                {
+                    BYTE *base = (BYTE *)mi2.lpBaseOfDll;
+                    SIZE_T size = mi2.SizeOfImage;
+                    static const BYTE pat2[] = { 0x83, 0x7D, 0xE8, 0x00, 0x0F, 0x8C };
+                    static const BYTE verify[] = { 0x0F, 0x57, 0xC0, 0x33, 0xC0 };
+                    SIZE_T i;
+                    DWORD op;
+
+                    for (i = 0; i + sizeof(pat2) + 10 < size; i++)
+                    {
+                        if (memcmp( base + i, pat2, sizeof(pat2) ) != 0) continue;
+                        /* Verify: after the 6-byte JL (at +4), check for xorps pattern */
+                        if (i + 10 + sizeof(verify) < size &&
+                            memcmp( base + i + 10, verify, sizeof(verify) ) == 0)
+                        {
+                            /* NOP the JL: 0F 8C xx xx xx xx → 66 0F 1F 44 00 00 */
+                            if (VirtualProtect( base + i + 4, 6, PAGE_EXECUTE_READWRITE, &op ))
+                            {
+                                base[i+4] = 0x66; base[i+5] = 0x0F; base[i+6] = 0x1F;
+                                base[i+7] = 0x44; base[i+8] = 0x00; base[i+9] = 0x00;
+                                VirtualProtect( base + i + 4, 6, op, &op );
+                                ERR( "patched XblInitialize gate at %p (RVA 0x%lx)\n", base + i + 4, (ULONG_PTR)(i + 4) );
+                                patched2 = TRUE;
+                            }
+                            break;
+                        }
+                    }
+                    if (!patched2)
+                        ERR( "XblInitialize gate pattern not found\n" );
+                }
+            }
+        }
+    }
+
     return GDKC_InitAPI( gdkVer, gsVer, mode, options );
 }
 
@@ -358,6 +406,37 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
                         ti->lpVtbl->XTaskQueueSetCurrentProcessTaskQueue( ti, pq );
                 }
             }
+
+            /* Patch the native DLL's vtable[11] (offset 0x58) - the "user sign-in slot".
+             * XSAPI's XblInitialize gate calls this to check for a signed-in user.
+             * The native DLL returns E_FAIL without Gaming Services. Patching the
+             * vtable function pointer to our stub makes it return S_OK, allowing
+             * XblInitialize to proceed and the social manager to initialize. */
+            if (SUCCEEDED( thr ) && *out)
+            {
+                static BOOLEAN vtable_patched = FALSE;
+                if (!vtable_patched)
+                {
+                    void **vtable = *(void ***)(*out);
+                    DWORD op;
+                    /* Allocate executable stub: mov eax, 0; ret = xor eax,eax; ret */
+                    static BYTE signin_stub[] = { 0x31, 0xC0, 0xC3 }; /* xor eax,eax; ret = S_OK */
+                    void *stub_mem = VirtualAlloc( NULL, sizeof(signin_stub), MEM_COMMIT, PAGE_EXECUTE_READWRITE );
+                    if (stub_mem)
+                    {
+                        memcpy( stub_mem, signin_stub, sizeof(signin_stub) );
+                        /* vtable[11] = offset 0x58 bytes = 11th pointer */
+                        if (VirtualProtect( &vtable[11], sizeof(void*), PAGE_READWRITE, &op ))
+                        {
+                            ERR( "patching native XThreading vtable[11] from %p to %p (S_OK stub)\n", vtable[11], stub_mem );
+                            vtable[11] = stub_mem;
+                            VirtualProtect( &vtable[11], sizeof(void*), op, &op );
+                            vtable_patched = TRUE;
+                        }
+                    }
+                }
+            }
+
             return thr;
         }
         return IXThreadingImpl_QueryInterface( x_threading_impl, interfaceId, out );
