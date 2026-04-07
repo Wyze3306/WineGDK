@@ -20,7 +20,6 @@
 
 #include "initguid.h"
 #include "private.h"
-#include "psapi.h"
 
 #include "GDKComponent/InitInternalGDKC.h"
 
@@ -110,9 +109,35 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
     switch (reason)
     {
         case DLL_PROCESS_ATTACH:
+        {
+            HMODULE game;
+            DWORD oldprot;
+
             DisableThreadLibraryCalls(hinst);
             xgameruntime_threading = LoadLibraryA("xgameruntime.dll.threading");
+
+            /* Patch the game's isSignedIn checker to always return TRUE.
+             * The function at RVA 0x1433680 checks user->isConnected(XboxLive)
+             * which is never set because XSAPI social manager doesn't initialize
+             * on Win32/Wine. Patching to 'mov eax,1; ret' bypasses this. */
+            game = GetModuleHandleA( NULL );
+            if (game)
+            {
+                BYTE *addr = (BYTE *)game + 0x1433680;
+                if (VirtualProtect( addr, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
+                {
+                    addr[0] = 0xB8; /* mov eax, 1 */
+                    addr[1] = 0x01;
+                    addr[2] = 0x00;
+                    addr[3] = 0x00;
+                    addr[4] = 0x00;
+                    addr[5] = 0xC3; /* ret */
+                    VirtualProtect( addr, 6, oldprot, &oldprot );
+                    TRACE( "patched isSignedIn checker at %p\n", addr );
+                }
+            }
             break;
+        }
         case DLL_PROCESS_DETACH:
             if (reserved) break;
             if (xgameruntime) FreeLibrary(xgameruntime);
@@ -184,65 +209,6 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                     ERR( "native DLL already has process queue %p\n", processQueue );
                 }
                 threading->lpVtbl->Release( threading );
-            }
-        }
-    }
-
-    /* Patch the game's isSignedIn checker to always return TRUE.
-     * Done here (not in DLL_PROCESS_ATTACH) because the game's code must be
-     * fully loaded before we can scan and patch it. */
-    {
-        static BOOLEAN patched = FALSE;
-        if (!patched)
-        {
-            HMODULE game = GetModuleHandleA( NULL );
-            DWORD oldprot;
-            if (game)
-            {
-                static const BYTE pattern[] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30 };
-                MODULEINFO modinfo;
-                if (GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
-                {
-                    BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
-                    SIZE_T size = modinfo.SizeOfImage;
-                    BYTE *addr = NULL;
-                    SIZE_T i;
-
-                    for (i = 0; i + sizeof(pattern) + 80 < size; i++)
-                    {
-                        if (memcmp( base + i, pattern, sizeof(pattern) ) != 0) continue;
-
-                        /* Verify: mov rcx,[rcx+50h] within 20 bytes */
-                        { BOOLEAN ok = FALSE; SIZE_T j;
-                          for (j = i+15; j < i+35 && j+4 < size; j++)
-                              if (base[j]==0x48 && base[j+1]==0x8B && base[j+2]==0x49 && base[j+3]==0x50) { ok=TRUE; break; }
-                          if (!ok) continue; }
-
-                        /* Verify: mov edx,1 within 80 bytes */
-                        { BOOLEAN ok = FALSE; SIZE_T j;
-                          for (j = i+20; j < i+80 && j+5 < size; j++)
-                              if (base[j]==0xBA && base[j+1]==0x01 && base[j+2]==0x00 && base[j+3]==0x00 && base[j+4]==0x00) { ok=TRUE; break; }
-                          if (!ok) continue; }
-
-                        addr = base + i;
-                        break;
-                    }
-
-                    if (!addr)
-                    {
-                        WARN( "isSignedIn pattern not found, using hardcoded RVA\n" );
-                        addr = (BYTE *)game + 0x1433680;
-                    }
-
-                    if (VirtualProtect( addr, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
-                    {
-                        addr[0] = 0xB8; addr[1] = 0x01; addr[2] = 0x00;
-                        addr[3] = 0x00; addr[4] = 0x00; addr[5] = 0xC3;
-                        VirtualProtect( addr, 6, oldprot, &oldprot );
-                        ERR( "patched isSignedIn at %p\n", addr );
-                        patched = TRUE;
-                    }
-                }
             }
         }
     }
