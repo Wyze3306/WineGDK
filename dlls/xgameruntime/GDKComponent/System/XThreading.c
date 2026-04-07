@@ -242,6 +242,16 @@ static BOOLEAN WINAPI x_threading_XTaskQueueGetCurrentProcessTaskQueue( IXThread
 {
     struct x_threading *impl = impl_from_IXThreadingImpl( iface );
     TRACE( "iface %p, queue %p.\n", iface, queue );
+
+    /* Create a default process task queue if none exists.
+     * XSAPI's XblInitialize checks this and bails with 0x800701AB
+     * if it returns FALSE and the XblInitArgs->queue is NULL. */
+    if ( !impl->currentProcessTaskQueue )
+    {
+        TRACE( "creating default process task queue\n" );
+        XTaskQueueCreate( ThreadPool, ThreadPool, &impl->currentProcessTaskQueue );
+    }
+
     if ( impl->currentProcessTaskQueue )
     {
         *queue = impl->currentProcessTaskQueue;

@@ -141,6 +141,40 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
             /* Ignore failures from native init - it may fail without Gaming Services
                but the XAsync/XTaskQueue subsystem should still be usable */
         }
+
+        /* Set a default process task queue on the native DLL's XThreadingImpl.
+         * XSAPI's XblInitialize calls QueryApiImpl({XThreadingImpl}) then checks
+         * vtable[25] (XTaskQueueGetCurrentProcessTaskQueue). If it returns FALSE
+         * and XblInitArgs->queue is NULL, XblInitialize bails with 0x800701AB
+         * and the entire XSAPI/social manager never initializes. */
+        {
+            HRESULT (WINAPI *qapi)( const GUID *, REFIID, void ** ) = (void*)GetProcAddress( xgameruntime_threading, "QueryApiImpl" );
+            IXThreadingImpl *threading = NULL;
+            HRESULT qhr = qapi ? qapi( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&threading ) : E_FAIL;
+            ERR( "native QueryApiImpl for XThreading returned 0x%08lx, threading=%p\n", qhr, threading );
+            if (SUCCEEDED( qhr ) && threading)
+            {
+                XTaskQueueHandle processQueue = NULL;
+                if (!threading->lpVtbl->XTaskQueueGetCurrentProcessTaskQueue( threading, &processQueue ))
+                {
+                    ERR( "native DLL has no process task queue, creating one\n" );
+                    if (SUCCEEDED( threading->lpVtbl->XTaskQueueCreate( threading, ThreadPool, ThreadPool, &processQueue ) ))
+                    {
+                        threading->lpVtbl->XTaskQueueSetCurrentProcessTaskQueue( threading, processQueue );
+                        ERR( "set process task queue %p on native DLL\n", processQueue );
+                    }
+                    else
+                    {
+                        ERR( "XTaskQueueCreate failed!\n" );
+                    }
+                }
+                else
+                {
+                    ERR( "native DLL already has process queue %p\n", processQueue );
+                }
+                threading->lpVtbl->Release( threading );
+            }
+        }
     }
 
     return GDKC_InitAPI( gdkVer, gsVer, mode, options );
@@ -204,10 +238,26 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
     }
     else if ( IsEqualGUID( runtimeClassId, &CLSID_XThreadingImpl ) )
     {
-        /* Use native threading DLL for XAsync/XTaskQueue - it has proper
-         * thread pool dispatch that the game relies on for its main loop. */
+        /* Use native threading DLL for XAsync/XTaskQueue. But ensure the
+         * process task queue is set - XSAPI's XblInitialize checks vtable[25]
+         * (GetCurrentProcessTaskQueue) and bails if it returns FALSE. */
         if ( func )
-            return func( runtimeClassId, interfaceId, out );
+        {
+            HRESULT thr = func( runtimeClassId, interfaceId, out );
+            if (SUCCEEDED( thr ) && *out)
+            {
+                /* Ensure process task queue exists on the native impl */
+                IXThreadingImpl *ti = (IXThreadingImpl *)*out;
+                XTaskQueueHandle pq = NULL;
+                if (!ti->lpVtbl->XTaskQueueGetCurrentProcessTaskQueue( ti, &pq ))
+                {
+                    /* Create and set a default process task queue */
+                    if (SUCCEEDED( ti->lpVtbl->XTaskQueueCreate( ti, ThreadPool, ThreadPool, &pq ) ))
+                        ti->lpVtbl->XTaskQueueSetCurrentProcessTaskQueue( ti, pq );
+                }
+            }
+            return thr;
+        }
         return IXThreadingImpl_QueryInterface( x_threading_impl, interfaceId, out );
     }
     else if ( IsEqualGUID( runtimeClassId, &CLSID_XNetworkingImpl ) )
