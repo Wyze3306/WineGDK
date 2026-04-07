@@ -109,9 +109,35 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
     switch (reason)
     {
         case DLL_PROCESS_ATTACH:
+        {
+            HMODULE game;
+            DWORD oldprot;
+
             DisableThreadLibraryCalls(hinst);
             xgameruntime_threading = LoadLibraryA("xgameruntime.dll.threading");
+
+            /* Patch the game's isSignedIn checker to always return TRUE.
+             * The function at RVA 0x1433680 checks user->isConnected(XboxLive)
+             * which is never set because XSAPI social manager doesn't initialize
+             * on Win32/Wine. Patching to 'mov eax,1; ret' bypasses this. */
+            game = GetModuleHandleA( NULL );
+            if (game)
+            {
+                BYTE *addr = (BYTE *)game + 0x1433680;
+                if (VirtualProtect( addr, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
+                {
+                    addr[0] = 0xB8; /* mov eax, 1 */
+                    addr[1] = 0x01;
+                    addr[2] = 0x00;
+                    addr[3] = 0x00;
+                    addr[4] = 0x00;
+                    addr[5] = 0xC3; /* ret */
+                    VirtualProtect( addr, 6, oldprot, &oldprot );
+                    TRACE( "patched isSignedIn checker at %p\n", addr );
+                }
+            }
             break;
+        }
         case DLL_PROCESS_DETACH:
             if (reserved) break;
             if (xgameruntime) FreeLibrary(xgameruntime);
