@@ -126,8 +126,18 @@ typedef HRESULT (WINAPI *InitializeApiImplEx2_ext)( ULONG gdkVer, ULONG gsVer, C
 HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITIALIZE_OPTIONS *options )
 {
     HRESULT hr;
+    static BOOLEAN com_initialized = FALSE;
 
     TRACE("gdkVer %ld, gsVer %ld, mode %d, options %p\n", gdkVer, gsVer, mode, options);
+
+    /* Initialize COM for the GDK runtime - needed for DllGetClassObject / CoCreateInstance.
+     * Without this, XSAPI's internal COM calls fail with "apartment not initialised". */
+    if (!com_initialized)
+    {
+        hr = CoInitializeEx( NULL, COINIT_MULTITHREADED );
+        if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE)
+            com_initialized = TRUE;
+    }
 
     /* Forward to the native threading DLL to initialize its XAsync/XTaskQueue system */
     TRACE("xgameruntime_threading = %p\n", xgameruntime_threading);
@@ -359,7 +369,11 @@ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID iid, void **out )
 
 HRESULT WINAPI XGameRuntimeInitialize( void )
 {
-    ERR("XGameRuntimeInitialize called!\n");
+    HRESULT hr;
+    ERR("XGameRuntimeInitialize called - initializing COM\n");
+    hr = CoInitializeEx( NULL, COINIT_MULTITHREADED );
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
+        WARN("CoInitializeEx failed: 0x%08lx\n", hr);
     return S_OK;
 }
 
