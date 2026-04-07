@@ -279,49 +279,6 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
         }
     }
 
-    /* Patch 2: NOP the XSAPI guard in processXboxLiveSignInResponse.
-     * The game checks if XSAPI's connectAsync returned a valid result object.
-     * Without XSAPI, this is always NULL, so _onPrimaryUserConnectComplete(Connected)
-     * is skipped. NOPing the JE makes the callback fire regardless.
-     * Pattern: JE +0x46 followed by xor r9d,r9d; xor r8d,r8d; xor edx,edx
-     *          (setting up Connected=0 args for _onPrimaryUserConnectComplete) */
-    {
-        static BOOLEAN patched2 = FALSE;
-        HMODULE game2 = GetModuleHandleA( NULL );
-        if (!patched2 && game2)
-        {
-            MODULEINFO mi2;
-            if (GetModuleInformation( GetCurrentProcess(), game2, &mi2, sizeof(mi2) ))
-            {
-                BYTE *base = (BYTE *)mi2.lpBaseOfDll;
-                SIZE_T size = mi2.SizeOfImage;
-                /* Pattern: 74 46 45 33 C9 45 33 C0 33 D2 48 8B 0E E8
-                 * = je +0x46; xor r9d,r9d; xor r8d,r8d; xor edx,edx; mov rcx,[rsi]; call ... */
-                static const BYTE pat2[] = { 0x74, 0x46, 0x45, 0x33, 0xC9, 0x45, 0x33, 0xC0, 0x33, 0xD2, 0x48, 0x8B, 0x0E, 0xE8 };
-                SIZE_T i;
-                DWORD op;
-
-                for (i = 0; i + sizeof(pat2) < size; i++)
-                {
-                    if (memcmp( base + i, pat2, sizeof(pat2) ) == 0)
-                    {
-                        if (VirtualProtect( base + i, 2, PAGE_EXECUTE_READWRITE, &op ))
-                        {
-                            base[i] = 0x90;     /* NOP */
-                            base[i+1] = 0x90;   /* NOP */
-                            VirtualProtect( base + i, 2, op, &op );
-                            ERR( "patched XSAPI guard at %p (RVA 0x%lx) - Connected callback enabled\n", base + i, (ULONG_PTR)i );
-                            patched2 = TRUE;
-                        }
-                        break;
-                    }
-                }
-                if (!patched2)
-                    WARN( "XSAPI guard pattern not found\n" );
-            }
-        }
-    }
-
     return GDKC_InitAPI( gdkVer, gsVer, mode, options );
 }
 
