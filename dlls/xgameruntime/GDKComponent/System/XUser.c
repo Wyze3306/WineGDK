@@ -36,6 +36,28 @@ static const WCHAR CT_JSON[] = L"Content-Type: application/json";
 static const WCHAR CT_FORM_URLENCODED[] = L"Content-Type: application/x-www-form-urlencoded";
 static const SIZE_T PROOF_KEY_SIZE = strlen( "{\"alg\":\"ES256\",\"kty\":\"EC\",\"use\":\"sig\",\"crv\":\"P-256\",\"x\":\"\",\"y\":\"\"}" ) + 86;
 
+static HRESULT MultiByteToHSTRING( const char *str, UINT32 str_size, HSTRING *hstr )
+{
+    UINT32 wstr_size;
+    WCHAR *wstr;
+    HRESULT hr;
+
+    if (!(wstr_size = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, str, str_size, NULL, 0 )))
+        return HRESULT_FROM_WIN32( GetLastError() );
+
+    if (!(wstr = calloc( wstr_size, sizeof(WCHAR) ))) return E_OUTOFMEMORY;
+
+    if (!(wstr_size = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, str, str_size, wstr, wstr_size )))
+    {
+        free( wstr );
+        return HRESULT_FROM_WIN32( GetLastError() );
+    }
+
+    hr = WindowsCreateString( wstr, wstr_size, hstr );
+    free( wstr );
+    return hr;
+}
+
 static HRESULT parse_json( const char *json, SIZE_T jsonLen, IJsonObject **object )
 {
     static const WCHAR *name = RuntimeClass_Windows_Data_Json_JsonValue;
@@ -700,7 +722,12 @@ static const struct IUserVtbl user_vtbl =
 
 static HRESULT LoadDefaultUser( XUserHandle *user )
 {
+    char *buffer = NULL;
     XUserHandle impl;
+    LSTATUS status;
+    IUser *iface;
+    HRESULT hr;
+    DWORD size;
 
     TRACE( "user %p.\n", user );
 
@@ -708,8 +735,32 @@ static HRESULT LoadDefaultUser( XUserHandle *user )
     impl->IUser_iface.lpVtbl = &user_vtbl;
     impl->ref = 1;
 
-    *user = impl;
-    return S_OK;
+    iface = &impl->IUser_iface;
+
+    status = RegGetValueA( HKEY_LOCAL_MACHINE, "Software\\Wine\\WineGDK", "RefreshToken", RRF_RT_REG_SZ, NULL, NULL, &size );
+    if (status != ERROR_SUCCESS) goto error;
+    if (!(buffer = calloc( 1, size )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto cleanup;
+    }
+
+    status = RegGetValueA( HKEY_LOCAL_MACHINE, "Software\\Wine\\WineGDK", "RefreshToken", RRF_RT_REG_SZ, NULL, buffer, &size );
+    if (status != ERROR_SUCCESS) goto error;
+    if (FAILED(hr = MultiByteToHSTRING( buffer, size, &impl->refreshToken ))) goto cleanup;
+    if (FAILED(hr = IUser_RefreshOAuthToken( iface ))) goto cleanup;
+    if (FAILED(hr = IUser_RefreshUserToken( iface ))) goto cleanup;
+    if (FAILED(hr = IUser_GenerateKeyPair( iface ))) goto cleanup;
+    hr = IUser_RefreshXstsToken( iface );
+    goto cleanup;
+
+error:
+    hr = HRESULT_FROM_WIN32( status );
+cleanup:
+    if (buffer) free( buffer );
+    if (SUCCEEDED(hr)) *user = impl;
+    else IUser_Release( iface );
+    return hr;
 }
 
 struct x_user
