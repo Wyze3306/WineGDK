@@ -22,6 +22,7 @@
 #include "../../private.h"
 #include "../../userprovider.h"
 #include "../../util.h"
+#include <errno.h>
 #include <ntdef.h>
 #include <time.h>
 #include <wincrypt.h>
@@ -76,12 +77,16 @@ struct XUser
     IUser IUser_iface;
     LONG ref;
 
+    UINT64 xuid;
+    HSTRING userHash;
+
     DOUBLE interval;
     time_t oauth_expiry;
     HSTRING deviceCode;
     HSTRING accessToken;
     HSTRING refreshToken;
     HSTRING userToken;
+    HSTRING xstsToken;
 
     BCRYPT_KEY_HANDLE key;
 };
@@ -106,10 +111,12 @@ static ULONG WINAPI user_Release( IUser *iface )
     TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
     if (!ref)
     {
+        if (impl->userHash) WindowsDeleteString( impl->userHash );
         if (impl->deviceCode) WindowsDeleteString( impl->deviceCode );
         if (impl->accessToken) WindowsDeleteString( impl->accessToken );
         if (impl->refreshToken) WindowsDeleteString( impl->refreshToken );
         if (impl->userToken) WindowsDeleteString( impl->userToken );
+        if (impl->xstsToken) WindowsDeleteString( impl->xstsToken );
         if (impl->key) BCryptDestroyKey( impl->key );
         free( impl );
     }
@@ -314,8 +321,71 @@ cleanup:
 
 static HRESULT WINAPI user_RefreshXstsToken( IUser *iface )
 {
-    FIXME( "iface %p stub!\n", iface );
-    return E_NOTIMPL;
+    const char *template = "{\"TokenType\":\"JWT\",\"RelyingParty\":\"http://xboxlive.com\",\"Properties\":{\"SandboxId\":\"RETAIL\",\"ProofKey\":{\"alg\":\"ES256\",\"kty\":\"EC\",\"use\":\"sig\",\"crv\":\"P-256\",\"x\":\"";
+    IJsonObject *child = NULL, *claims = NULL, *object = NULL;
+    UCHAR blob[sizeof(BCRYPT_ECCKEY_BLOB) + 64], *buf = NULL;
+    struct XUser *impl = impl_from_IUser( iface );
+    char *body = NULL, *token, *x, *y;
+    UINT32 tokenLen, wTokenLen;
+    IJsonArray *array = NULL;
+    HSTRING xuid = NULL;
+    const WCHAR *wToken;
+    NTSTATUS status;
+    SIZE_T bufSize;
+    ULONG dummy;
+    HRESULT hr;
+
+    TRACE( "iface %p.\n", iface );
+
+    wToken = WindowsGetStringRawBuffer( impl->userToken, &wTokenLen );
+    if (!(tokenLen = WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, wToken, wTokenLen, NULL, 0, NULL, NULL ))) goto error_win32;
+    if (!(body = calloc( strlen( template ) + strlen( "\",\"y\":\"\"},\"UserTokens\":[\"\"]}}" ) + tokenLen + 87, sizeof(char) )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto cleanup;
+    }
+
+    /* 32 bytes -> 43 base64url chars without padding */
+    x = body + strlen( template );
+    y = x + 43 + strlen( "\",\"y\":\"" );
+    token = y + 43 + strlen( "\"},\"UserTokens\":[\"" );
+
+    /* construct request body */
+    strcpy( body, template );
+    if (!NT_SUCCESS(status = BCryptExportKey( impl->key, NULL, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &dummy, 0 ))) goto error_nt;
+    if (FAILED(hr = encode_base64_url( 32, blob + sizeof(BCRYPT_ECCKEY_BLOB), 43, x, FALSE ))) goto cleanup;
+    strcat( body, "\",\"y\":\"" );
+    if (FAILED(hr = encode_base64_url( 32, blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 43, y, FALSE ))) goto cleanup;
+    strcat( body, "\"},\"UserTokens\":[\"" );
+    if (!WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, wToken, wTokenLen, token, tokenLen, NULL, NULL )) goto error_win32;
+    strcat( body, "\"]}}" );
+
+    if (FAILED(hr = http_request( L"POST", L"xsts.auth.xboxlive.com", L"/xsts/authorize", body, CT_JSON, ACCEPT_JSON, &buf, &bufSize ))) goto cleanup;
+    if (FAILED(hr = parse_json( (char *)buf, bufSize, &object ))) goto cleanup;
+    if (FAILED(hr = get_json_string( object, L"Token", &impl->xstsToken ))) goto cleanup;
+    if (FAILED(hr = get_json_object( object, L"DisplayClaims", &claims ))) goto cleanup;
+    if (FAILED(hr = get_json_array( claims, L"xui", &array ))) goto cleanup;
+    if (FAILED(hr = IJsonArray_GetObjectAt( array, 0, &child ))) goto cleanup;
+    if (FAILED(hr = get_json_string( child, L"uhs", &impl->userHash ))) goto cleanup;
+    if (FAILED(hr = get_json_string( child, L"xid", &xuid ))) goto cleanup;
+    impl->xuid = wcstoull( WindowsGetStringRawBuffer( xuid, NULL ), NULL, 10 );
+    if (errno == ERANGE) hr = E_UNEXPECTED;
+    goto cleanup;
+
+error_nt:
+    hr = HRESULT_FROM_NT( status );
+    goto cleanup;
+error_win32:
+    hr = HRESULT_FROM_WIN32( GetLastError() );
+cleanup:
+    if (buf) free( buf );
+    if (body) free( body );
+    if (xuid) WindowsDeleteString( xuid );
+    if (array) IJsonArray_Release( array );
+    if (child) IJsonObject_Release( child );
+    if (claims) IJsonObject_Release( claims );
+    if (object) IJsonObject_Release( object );
+    return hr;
 }
 
 static HRESULT WINAPI user_FetchProfileSettings( IUser *iface, const WCHAR *settings, IJsonObject **result )
@@ -612,8 +682,9 @@ static HRESULT WINAPI x_user_XUserFindUserByLocalId( IXUserImpl6 *iface, XUserLo
 
 static HRESULT WINAPI x_user_XUserGetId( IXUserImpl6 *iface, XUserHandle user, UINT64 *userId )
 {
-    FIXME( "iface %p, user %p, userId %p stub!\n", iface, user, userId );
-    return E_NOTIMPL;
+    TRACE( "iface %p, user %p, userId %p.\n", iface, user, userId );
+    *userId = user->xuid;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_user_XUserFindUserById( IXUserImpl6 *iface, UINT64 userId, XUserHandle *handle )
