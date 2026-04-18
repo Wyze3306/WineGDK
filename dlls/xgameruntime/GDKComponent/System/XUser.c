@@ -53,9 +53,9 @@ static ULONG WINAPI user_Release( IUser *iface )
     return ref;
 }
 
-static HRESULT WINAPI user_RequestOAuthCode( IUser *iface, HSTRING *userCode, HSTRING *verificationUri )
+static HRESULT WINAPI user_RequestOAuthCode( IUser *iface, HSTRING *user, HSTRING *uri )
 {
-    FIXME( "iface %p, userCode %p, verificationUri %p stub!\n", iface, userCode, verificationUri );
+    FIXME( "iface %p, user %p, uri %p stub!\n", iface, user, uri );
     return E_NOTIMPL;
 }
 
@@ -83,7 +83,7 @@ static HRESULT WINAPI user_RefreshXstsToken( IUser *iface )
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI user_FetchProfileSettings( IUser *iface, const WCHAR *settings, IUnknown **result )
+static HRESULT WINAPI user_FetchProfileSettings( IUser *iface, const WCHAR *settings, IJsonObject **result )
 {
     FIXME( "iface %p, settings %s, result %p stub!\n", iface, debugstr_w( settings ), result );
     return E_NOTIMPL;
@@ -101,6 +101,18 @@ static HRESULT WINAPI user_SignData( IUser *iface, ULONG dataSize, UCHAR *data, 
     return E_NOTIMPL;
 }
 
+static HRESULT WINAPI user_CacheEndpoints( IUser *iface )
+{
+    TRACE( "iface %p.\n", iface );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI user_GetProofKey( IUser *iface, SIZE_T bufferSize, char *buffer )
+{
+    FIXME( "iface %p, bufferSize %Iu, buffer %p stub!\n", iface, bufferSize, buffer );
+    return E_NOTIMPL;
+}
+
 static const struct IUserVtbl user_vtbl =
 {
     NULL,
@@ -115,12 +127,22 @@ static const struct IUserVtbl user_vtbl =
     user_FetchProfileSettings,
     user_GenerateKeyPair,
     user_SignData,
+    user_CacheEndpoints,
+    user_GetProofKey,
 };
 
 static HRESULT LoadDefaultUser( XUserHandle *user )
 {
-    FIXME( "user %p stub!\n", user );
-    return E_NOTIMPL;
+    XUserHandle impl;
+
+    TRACE( "user %p.\n", user );
+
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->IUser_iface.lpVtbl = &user_vtbl;
+    impl->ref = 1;
+
+    *user = impl;
+    return S_OK;
 }
 
 struct x_user
@@ -182,13 +204,18 @@ static ULONG WINAPI x_user_Release( IXUserImpl6 *iface )
 
 static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl6 *iface, XUserHandle handle, XUserHandle *duplicatedHandle )
 {
-    FIXME( "iface %p, handle %p, duplicatedHandle %p stub!\n", iface, handle, duplicatedHandle );
-    return E_NOTIMPL;
+    TRACE( "iface %p, handle %p, duplicatedHandle %p.\n", iface, handle, duplicatedHandle );
+    if (!handle || !duplicatedHandle) return E_POINTER;
+    IUser_AddRef( &handle->IUser_iface );
+    *duplicatedHandle = handle;
+    return S_OK;
 }
 
 static void WINAPI x_user_XUserCloseHandle( IXUserImpl6 *iface, XUserHandle user )
 {
-    FIXME( "iface %p, user %p stub!\n", iface, user );
+    TRACE( "iface %p, user %p.\n", iface, user );
+    if (!user) return;
+    IUser_Release( &user->IUser_iface );
 }
 
 static INT32 WINAPI x_user_XUserCompare( IXUserImpl6 *iface, XUserHandle user1, XUserHandle user2 )

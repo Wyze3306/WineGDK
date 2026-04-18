@@ -18,8 +18,11 @@
 
 #pragma makedep header
 
-import "unknwn.idl";
-import "hstring.idl";
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "windows.data.json.idl";
 
 [
     local,
@@ -27,12 +30,14 @@ import "hstring.idl";
 ]
 interface IUser : IUnknown
 {
-    HRESULT RequestOAuthCode( [out] HSTRING *userCode, [out] HSTRING *verificationUri );
+    HRESULT RequestOAuthCode( [out] HSTRING *user, [out] HSTRING *uri );
     HRESULT RequestOAuthToken();
     HRESULT RefreshOAuthToken();
     HRESULT RefreshUserToken();
     HRESULT RefreshXstsToken();
-    HRESULT FetchProfileSettings( [in, string] const WCHAR *settings, IUnknown **result );
+    HRESULT FetchProfileSettings( [in, string] const WCHAR *settings, Windows.Data.Json.JsonObject **result );
     HRESULT GenerateKeyPair();
     HRESULT SignData( [in] ULONG dataSize, [in, size_is(dataSize)] UCHAR *data, [in] ULONG signatureSize, [out, size_is(signatureSize)] UCHAR *signature );
+    HRESULT CacheEndpoints();
+    HRESULT GetProofKey( [in] SIZE_T bufferSize, [out, size_is(bufferSize)] char *buffer );
 }

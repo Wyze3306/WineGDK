@@ -60,12 +60,12 @@
 #define WIDL_using_Windows_Foundation
 #define WIDL_using_Windows_Foundation_Collections
 #include "windows.foundation.h"
+#define WIDL_using_Windows_Data_Json
+#include "windows.data.json.h"
 #define WIDL_using_Windows_Globalization
 #include "windows.globalization.h"
 #define WIDL_using_Windows_System_Profile
 #include "windows.system.profile.h"
-#define WIDL_using_Windows_Data_Json
-#include "windows.data.json.h"
 #define WIDL_using_Xodus
 #include "xodusprovider.h"
 
