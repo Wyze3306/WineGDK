@@ -1,4 +1,4 @@
-IMPORTS   = user32 advapi32 bcrypt crypt32 combase winhttp $(CXXABI_PE_LIBS) $(CXX_PE_LIBS) vcruntime140
+IMPORTS   = user32 advapi32 bcrypt crypt32 combase winhttp wininet $(CXXABI_PE_LIBS) $(CXX_PE_LIBS) vcruntime140
 MODULE    = xgameruntime.dll
 
 SOURCES = \
