@@ -215,6 +215,10 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
     {
         return IXUserDeviceImpl_QueryInterface( x_user_device_impl, interfaceId, out );
     }
+    else if ( IsEqualGUID( runtimeClassId, &CLSID_XLauncherImpl ) )
+    {
+        return IXLauncherImpl_QueryInterface( x_launcher_impl, interfaceId, out );
+    }
 
     FIXME( "%s not implemented, returning ERROR_NOT_SUPPORTED.\n", debugstr_guid( runtimeClassId ) );
     return HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );

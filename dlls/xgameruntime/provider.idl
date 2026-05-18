@@ -34,6 +34,8 @@ import "xgameruntime.h";
 
 // --- xgameruntime --- //
 
+typedef struct XDisplayTimeoutDeferral *XDisplayTimeoutDeferralHandle;
+
 interface IWineAsyncWorkImpl;
 interface IXSystemImpl;
 interface IXSystemAnalyticsImpl;
@@ -46,6 +48,7 @@ interface IXUserImpl5;
 interface IXUserImpl6;
 interface IXUserGamertagImpl;
 interface IXUserDeviceImpl;
+interface IXLauncherImpl;
 interface IUser;
 
 coclass XSystemImpl;
@@ -53,6 +56,7 @@ coclass XSystemAnalyticsImpl;
 coclass XGameRuntimeFeatureImpl;
 coclass XUserImpl;
 coclass XUserDeviceImpl;
+coclass XLauncherImpl;
 
 [
     object,
@@ -284,4 +288,24 @@ coclass XUserImpl
 coclass XUserDeviceImpl
 {
     [default] interface IXUserDeviceImpl;
+}
+
+[
+    local,
+    object,
+    uuid(1b339674-328d-4283-a200-3171f18d3639)
+]
+interface IXLauncherImpl : IUnknown
+{
+    HRESULT XLaunchUri( [in, optional] XUserHandle user, [in, string] const char *uri );
+    HRESULT XDisplayAcquireTimeoutDeferral( [out] XDisplayTimeoutDeferralHandle *handle );
+    void    XDisplayCloseTimeoutDeferralHandle( [in] XDisplayTimeoutDeferralHandle handle );
+}
+
+[
+    uuid(1b339674-328d-4283-a200-3171f18d3639)
+]
+coclass XLauncherImpl
+{
+    [default] interface IXLauncherImpl;
 }
