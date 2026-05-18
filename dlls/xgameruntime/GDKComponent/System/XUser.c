@@ -1134,14 +1134,20 @@ static HRESULT WINAPI x_user_XUserFindUserById( IXUserImpl6 *iface, UINT64 userI
 
 static HRESULT WINAPI x_user_XUserGetIsGuest( IXUserImpl6 *iface, XUserHandle user, BOOLEAN *isGuest )
 {
-    FIXME( "iface %p, user %p, isGuest %p stub!\n", iface, user, isGuest );
-    return E_NOTIMPL;
+    TRACE( "iface %p, user %p, isGuest %p.\n", iface, user, isGuest );
+    if (!user || !isGuest) return E_POINTER;
+    *isGuest = FALSE;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_user_XUserGetState( IXUserImpl6 *iface, XUserHandle user, XUserState *state )
 {
-    FIXME( "iface %p, user %p, state %p stub!\n", iface, user, state );
-    return E_NOTIMPL;
+    TRACE( "iface %p, user %p, state %p.\n", iface, user, state );
+    if (!user || !state) return E_POINTER;
+    /* A handle with a user token completed OAuth->RPS->user-token, i.e.
+     * it is signed in. The game polls this to drive its sign-in UI. */
+    *state = user->user_token ? XUserState_SignedIn : XUserState_SignedOut;
+    return S_OK;
 }
 
 static HRESULT WINAPI __PADDING__( IXUserImpl6 *iface )
@@ -1300,14 +1306,21 @@ static HRESULT WINAPI x_user_XUserGetGamerPictureResult( IXUserImpl6 *iface, XAs
 
 static HRESULT WINAPI x_user_XUserGetAgeGroup( IXUserImpl6 *iface, XUserHandle user, XUserAgeGroup *ageGroup )
 {
-    FIXME( "iface %p, user %p, ageGroup %p stub!\n", iface, user, ageGroup );
-    return E_NOTIMPL;
+    TRACE( "iface %p, user %p, ageGroup %p.\n", iface, user, ageGroup );
+    if (!user || !ageGroup) return E_POINTER;
+    *ageGroup = XUserAgeGroup_Adult;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_user_XUserCheckPrivilege( IXUserImpl6 *iface, XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege, BOOLEAN *hasPrivilege, XUserPrivilegeDenyReason *reason )
 {
-    FIXME( "iface %p, user %p, options %d, privilege %d, hasPrivilege %p, reason %p stub!\n", iface, user, options, privilege, hasPrivilege, reason );
-    return E_NOTIMPL;
+    TRACE( "iface %p, user %p, options %d, privilege %d, hasPrivilege %p, reason %p.\n", iface, user, options, privilege, hasPrivilege, reason );
+    if (!user || !hasPrivilege) return E_POINTER;
+    /* Grant the privileges the game gates online/multiplayer on; the real
+     * enforcement still happens server-side via the XSTS token. */
+    *hasPrivilege = TRUE;
+    if (reason) *reason = XUserPrivilegeDenyReason_None;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiAsync( IXUserImpl6 *iface, XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege, XAsyncBlock *async )
