@@ -24,6 +24,8 @@
 #include <errno.h>
 #include <time.h>
 #include <winhttp.h>
+#include <bcrypt.h>
+#include <wincrypt.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -211,11 +213,211 @@ struct XUser
 
     char *classic_gamertag;
     UINT32 classic_gamertag_size;
+
+    /* Xbox request-signing proof key (ECDSA P-256). The public key is sent
+     * as "ProofKey" when the user token is minted, binding the token to
+     * this key; every signed Xbox request is then signed with it. */
+    BCRYPT_KEY_HANDLE proof_key;
+    BYTE proof_x[32];
+    BYTE proof_y[32];
 };
 
 static inline struct XUser *impl_from_IUser( IUser *iface )
 {
     return CONTAINING_RECORD( iface, struct XUser, IUser_iface );
+}
+
+/* ------------------------------------------------------------------ *
+ *  Xbox Live request signing
+ *
+ *  Xbox services require a "Signature" header on token requests and on
+ *  service calls. The signature is ECDSA P-256 over a fixed byte layout
+ *  (policy 0001 | FILETIME | method | path | Authorization | body), and
+ *  the signing key must be bound to the user token by sending its public
+ *  key as "ProofKey" in the user/authenticate request. Without this the
+ *  token is unsigned and signed Xbox endpoints reject it. Layout matches
+ *  the documented community scheme (gophertunnel minecraft/auth sign()).
+ * ------------------------------------------------------------------ */
+
+/* standard base64 of in[n], NUL-terminated, malloc'd (caller frees) */
+static char *xbl_b64( const BYTE *in, DWORD n )
+{
+    DWORD len = 0;
+    char *out;
+
+    if (!CryptBinaryToStringA( in, n, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &len )) return NULL;
+    if (!(out = calloc( 1, len + 1 ))) return NULL;
+    if (!CryptBinaryToStringA( in, n, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, out, &len ))
+    {
+        free( out );
+        return NULL;
+    }
+    return out;
+}
+
+/* base64url (no padding) of in[n], malloc'd */
+static char *xbl_b64url( const BYTE *in, DWORD n )
+{
+    char *s = xbl_b64( in, n ), *p;
+
+    if (!s) return NULL;
+    for (p = s; *p; p++)
+    {
+        if (*p == '+') *p = '-';
+        else if (*p == '/') *p = '_';
+        else if (*p == '=') { *p = 0; break; }
+    }
+    return s;
+}
+
+/* Generate (once) the ECDSA P-256 proof key and cache its public X/Y. */
+static HRESULT xbl_ensure_key( struct XUser *impl )
+{
+    BYTE blob[sizeof(BCRYPT_ECCKEY_BLOB) + 96];
+    BCRYPT_ALG_HANDLE alg;
+    NTSTATUS st;
+    ULONG cb;
+
+    if (impl->proof_key) return S_OK;
+
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider( &alg, BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0 )))
+        return E_FAIL;
+    st = BCryptGenerateKeyPair( alg, &impl->proof_key, 256, 0 );
+    if (BCRYPT_SUCCESS(st)) st = BCryptFinalizeKeyPair( impl->proof_key, 0 );
+    if (BCRYPT_SUCCESS(st)) st = BCryptExportKey( impl->proof_key, NULL, BCRYPT_ECCPUBLIC_BLOB,
+                                                  blob, sizeof(blob), &cb, 0 );
+    BCryptCloseAlgorithmProvider( alg, 0 );
+    if (!BCRYPT_SUCCESS(st))
+    {
+        if (impl->proof_key) { BCryptDestroyKey( impl->proof_key ); impl->proof_key = NULL; }
+        return E_FAIL;
+    }
+
+    /* BCRYPT_ECCKEY_BLOB header is followed by X then Y, cbKey bytes each
+     * (32 for P-256), big-endian. */
+    memcpy( impl->proof_x, blob + sizeof(BCRYPT_ECCKEY_BLOB), 32 );
+    memcpy( impl->proof_y, blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 32 );
+    return S_OK;
+}
+
+/* "ProofKey":{...} JSON fragment (no leading comma), malloc'd. */
+static char *xbl_proofkey_json( struct XUser *impl )
+{
+    char *x, *y, *out;
+    const char *a = "\"ProofKey\":{\"crv\":\"P-256\",\"alg\":\"ES256\",\"use\":\"sig\",\"kty\":\"EC\",\"x\":\"";
+
+    if (FAILED(xbl_ensure_key( impl ))) return NULL;
+    if (!(x = xbl_b64url( impl->proof_x, 32 ))) return NULL;
+    if (!(y = xbl_b64url( impl->proof_y, 32 ))) { free( x ); return NULL; }
+    if ((out = calloc( 1, strlen( a ) + strlen( x ) + strlen( "\",\"y\":\"" ) + strlen( y ) + strlen( "\"}" ) + 1 )))
+    {
+        strcpy( out, a );
+        strcat( out, x );
+        strcat( out, "\",\"y\":\"" );
+        strcat( out, y );
+        strcat( out, "\"}" );
+    }
+    free( x );
+    free( y );
+    return out;
+}
+
+/* UTF-8 "/path?query" of a wide URL, malloc'd. */
+static char *xbl_url_path( const WCHAR *url )
+{
+    URL_COMPONENTS uc = { .dwStructSize = sizeof(uc), .dwUrlPathLength = -1, .dwExtraInfoLength = -1 };
+    int n;
+    char *out;
+    WCHAR *w;
+
+    if (!WinHttpCrackUrl( url, wcslen( url ), 0, &uc )) return NULL;
+    if (!(w = calloc( uc.dwUrlPathLength + uc.dwExtraInfoLength + 1, sizeof(WCHAR) ))) return NULL;
+    memcpy( w, uc.lpszUrlPath, uc.dwUrlPathLength * sizeof(WCHAR) );
+    if (uc.dwExtraInfoLength)
+        memcpy( w + uc.dwUrlPathLength, uc.lpszExtraInfo, uc.dwExtraInfoLength * sizeof(WCHAR) );
+    n = WideCharToMultiByte( CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL );
+    if ((out = calloc( 1, n ? n : 1 )))
+        WideCharToMultiByte( CP_UTF8, 0, w, -1, out, n, NULL, NULL );
+    free( w );
+    return out;
+}
+
+static void xbl_be64( BYTE *p, ULONGLONG v )
+{
+    for (int i = 7; i >= 0; i--) { p[i] = v & 0xff; v >>= 8; }
+}
+
+/* Build the Xbox "Signature" header value for one request. method/path/
+ * authorization are NUL-terminated UTF-8; body may be NULL. malloc'd. */
+static char *xbl_sign( struct XUser *impl, const char *method, const char *path,
+                       const char *authorization, const BYTE *body, SIZE_T body_len )
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    BYTE digest[32], sig[64], hdr[76], z = 0, pol5[5] = {0,0,0,1,0}, ts8[8];
+    NTSTATUS st;
+    char *out = NULL;
+    FILETIME ft;
+    ULONGLONG ts;
+    ULONG cb;
+
+    if (!authorization) authorization = "";
+    if (FAILED(xbl_ensure_key( impl ))) return NULL;
+
+    GetSystemTimeAsFileTime( &ft );
+    ts = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;  /* 100ns since 1601 */
+    xbl_be64( ts8, ts );
+
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider( &alg, BCRYPT_SHA256_ALGORITHM, NULL, 0 ))) return NULL;
+    if (!BCRYPT_SUCCESS(BCryptCreateHash( alg, &hash, NULL, 0, NULL, 0, 0 ))) goto done;
+
+#define H(p,n) do { if (!BCRYPT_SUCCESS(BCryptHashData( hash, (PUCHAR)(p), (ULONG)(n), 0 ))) goto done; } while (0)
+    H( pol5, 5 );                                   /* policy 0,0,0,1 + 0 */
+    H( ts8, 8 ); H( &z, 1 );                        /* timestamp + 0 */
+    H( method, strlen( method ) ); H( &z, 1 );      /* method + 0 */
+    H( path, strlen( path ) ); H( &z, 1 );          /* path?query + 0 */
+    H( authorization, strlen( authorization ) ); H( &z, 1 );
+    if (body && body_len) H( body, body_len );
+    H( &z, 1 );                                     /* body + 0 */
+#undef H
+
+    if (!BCRYPT_SUCCESS(BCryptFinishHash( hash, digest, sizeof(digest), 0 ))) goto done;
+    st = BCryptSignHash( impl->proof_key, NULL, digest, sizeof(digest), sig, sizeof(sig), &cb, 0 );
+    if (!BCRYPT_SUCCESS(st) || cb != sizeof(sig)) goto done;
+
+    /* header = policy(0,0,0,1) + timestamp(8) + r||s(64) -> base64 */
+    hdr[0] = 0; hdr[1] = 0; hdr[2] = 0; hdr[3] = 1;
+    memcpy( hdr + 4, ts8, 8 );
+    memcpy( hdr + 12, sig, 64 );
+    out = xbl_b64( hdr, sizeof(hdr) );
+
+done:
+    if (hash) BCryptDestroyHash( hash );
+    if (alg) BCryptCloseAlgorithmProvider( alg, 0 );
+    return out;
+}
+
+/* Compose the headers string for a signed Xbox token request:
+ * "Content-Type: application/json\r\nSignature: <sig>". malloc'd WCHAR. */
+static WCHAR *xbl_signed_headers( struct XUser *impl, const WCHAR *url, const char *body )
+{
+    char *path, *sig = NULL;
+    WCHAR *out = NULL;
+    int n;
+
+    if (!(path = xbl_url_path( url ))) return NULL;
+    sig = xbl_sign( impl, "POST", path, "", (const BYTE *)body, body ? strlen( body ) : 0 );
+    free( path );
+    if (!sig) return NULL;
+
+    n = MultiByteToWideChar( CP_UTF8, 0, sig, -1, NULL, 0 );
+    if ((out = calloc( wcslen( L"Content-Type: application/json\r\nSignature: " ) + n + 1, sizeof(WCHAR) )))
+    {
+        wcscpy( out, L"Content-Type: application/json\r\nSignature: " );
+        MultiByteToWideChar( CP_UTF8, 0, sig, -1, out + wcslen( out ), n );
+    }
+    free( sig );
+    return out;
 }
 
 static HRESULT WINAPI user_QueryInterface( IUser *iface, REFIID iid, void **out )
@@ -258,6 +460,7 @@ static ULONG WINAPI user_Release( IUser *iface )
         if (impl->user_token) WindowsDeleteString( impl->user_token );
         if (impl->xsts_token) WindowsDeleteString( impl->xsts_token );
         if (impl->classic_gamertag) free( impl->classic_gamertag );
+        if (impl->proof_key) BCryptDestroyKey( impl->proof_key );
         free( impl );
     }
     return ref;
@@ -372,6 +575,7 @@ _CLEANUP:
 static HRESULT WINAPI user_RequestXToken( IUser *iface, const WCHAR *url, const char *relyingParty, const char *props, IUnknown **object )
 {
     const char *template = "{\"TokenType\":\"JWT\",\"RelyingParty\":\"";
+    WCHAR *signed_headers;
     void *buffer = NULL;
     SIZE_T size;
     HRESULT hr;
@@ -389,7 +593,14 @@ static HRESULT WINAPI user_RequestXToken( IUser *iface, const WCHAR *url, const 
     strcat( data, props );
     strcat( data, "}" );
 
-    if (FAILED(hr = HttpRequest( L"POST", url, data, CT_JSON, ACCEPT_JSON, &buffer, &size ))) return hr;
+    /* user/authenticate and xsts/authorize must carry a Signature header
+     * made with the proof key, or the resulting token is unsigned. */
+    signed_headers = xbl_signed_headers( impl_from_IUser( iface ), url, data );
+    hr = HttpRequest( L"POST", url, data, signed_headers ? signed_headers : CT_JSON,
+                      ACCEPT_JSON, &buffer, &size );
+    free( data );
+    if (signed_headers) free( signed_headers );
+    if (FAILED(hr)) return hr;
 
     hr = ParseJsonObject( buffer, size, (IJsonObject **)object );
     free( buffer );
@@ -457,24 +668,35 @@ static HRESULT WINAPI user_RefreshUserToken( IUser *iface )
 {
     const char *template = "{\"AuthMethod\":\"RPS\",\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"";
     struct XUser *impl = impl_from_IUser( iface );
-    char *props, *token_str;
+    char *props, *token_str, *pk;
     IJsonObject *object;
     UINT32 token_size;
     HRESULT hr;
 
     TRACE( "iface %p.\n", iface );
 
-    if (FAILED(hr = HSTRINGToMultiByte( impl->access_token, &token_str, &token_size ))) return hr;
-    if (!(props = calloc( strlen( template ) + token_size + strlen( "\"}" ), sizeof(char) )))
+    /* Bind the user token to the proof key: include its public key as
+     * "ProofKey" here (the request itself is signed in RequestXToken). */
+    if (!(pk = xbl_proofkey_json( impl ))) return E_FAIL;
+    if (FAILED(hr = HSTRINGToMultiByte( impl->access_token, &token_str, &token_size )))
+    {
+        free( pk );
+        return hr;
+    }
+    if (!(props = calloc( strlen( template ) + token_size + strlen( "\"," ) + strlen( pk ) + strlen( "}" ) + 1, sizeof(char) )))
     {
         free( token_str );
+        free( pk );
         return E_OUTOFMEMORY;
     }
 
     strcpy( props, template );
     strncat( props, token_str, token_size );
-    strcat( props, "\"}" );
+    strcat( props, "\"," );
+    strcat( props, pk );
+    strcat( props, "}" );
     free( token_str );
+    free( pk );
 
     hr = IUser_RequestXToken( iface, L"https://user.auth.xboxlive.com/user/authenticate", "http://auth.xboxlive.com", props, (IUnknown **)&object );
     free( props );
@@ -1153,9 +1375,11 @@ static HRESULT WINAPI XUserGetTokenAndSignatureProvider( XAsyncOp op, const XAsy
 
         case XAsyncOp_GetResult:
             if (context->isUtf16)
-                memcpy( data->buffer, context->dataUtf16, sizeof(*context->dataUtf16) + context->dataUtf16->tokenCount );
+                memcpy( data->buffer, context->dataUtf16, sizeof(*context->dataUtf16) +
+                        (context->dataUtf16->tokenCount + context->dataUtf16->signatureCount) * sizeof(WCHAR) );
             else
-                memcpy( data->buffer, context->data, sizeof(*context->data) + context->data->tokenSize );
+                memcpy( data->buffer, context->data, sizeof(*context->data) +
+                        context->data->tokenSize + context->data->signatureSize );
             break;
 
         case XAsyncOp_DoWork:
@@ -1181,59 +1405,120 @@ static HRESULT WINAPI XUserGetTokenAndSignatureProvider( XAsyncOp op, const XAsy
 
             if (context->isUtf16)
             {
-                UINT32 tok_len, uhs_len;
+                UINT32 tok_len, uhs_len, auth_len, sigw_count = 0;
                 const WCHAR *uhs = WindowsGetStringRawBuffer( context->user->user_hash, &uhs_len );
                 const WCHAR *tok = WindowsGetStringRawBuffer( token, &tok_len );
-                UINT32 auth_len = wcslen( L"XBL3.0 x=;" ) + uhs_len + tok_len + 1;
-                WCHAR *auth;
+                char *methodA = NULL, *pathA = NULL, *authA = NULL, *sigA;
+                WCHAR *auth, *sigw = NULL, *dst;
+                int wn;
 
+                auth_len = wcslen( L"XBL3.0 x=;" ) + uhs_len + tok_len + 1;
+                if (!(auth = calloc( auth_len, sizeof(WCHAR) )))
+                {
+                    WindowsDeleteString( token );
+                    hr = E_OUTOFMEMORY;
+                    goto _CLEANUP;
+                }
+                wcscpy( auth, L"XBL3.0 x=" );
+                wcsncat( auth, uhs, uhs_len );
+                wcscat( auth, L";" );
+                wcsncat( auth, tok, tok_len );
                 WindowsDeleteString( token );
 
-                data_size = sizeof(*context->dataUtf16) + auth_len * sizeof(WCHAR);
+                /* signature over the game's actual request */
+                if ((wn = WideCharToMultiByte( CP_UTF8, 0, context->methodUtf16, -1, NULL, 0, NULL, NULL )) &&
+                    (methodA = calloc( 1, wn )))
+                    WideCharToMultiByte( CP_UTF8, 0, context->methodUtf16, -1, methodA, wn, NULL, NULL );
+                pathA = xbl_url_path( context->urlUtf16 );
+                if ((wn = WideCharToMultiByte( CP_UTF8, 0, auth, -1, NULL, 0, NULL, NULL )) &&
+                    (authA = calloc( 1, wn )))
+                    WideCharToMultiByte( CP_UTF8, 0, auth, -1, authA, wn, NULL, NULL );
+                sigA = xbl_sign( context->user, methodA ? methodA : "GET", pathA ? pathA : "/",
+                                 authA ? authA : "", context->bodyBuffer, context->bodySize );
+                if (sigA && (wn = MultiByteToWideChar( CP_UTF8, 0, sigA, -1, NULL, 0 )) &&
+                    (sigw = calloc( wn, sizeof(WCHAR) )))
+                {
+                    MultiByteToWideChar( CP_UTF8, 0, sigA, -1, sigw, wn );
+                    sigw_count = wn;   /* incl. NUL, in WCHARs */
+                }
+                free( methodA ); free( pathA ); free( authA ); free( sigA );
+
+                data_size = sizeof(*context->dataUtf16) + (auth_len + sigw_count) * sizeof(WCHAR);
                 if (!(context->dataUtf16 = calloc( 1, data_size )))
                 {
+                    free( auth ); free( sigw );
                     hr = E_OUTOFMEMORY;
                     goto _CLEANUP;
                 }
 
                 context->dataUtf16->tokenCount = auth_len;
-                context->dataUtf16->signatureCount = 0;
+                context->dataUtf16->signatureCount = sigw_count;
+                context->dataUtf16->token = NULL;
                 context->dataUtf16->signature = NULL;
 
-                auth = (WCHAR *)context->dataUtf16 + sizeof(*context->dataUtf16);
-                wcscpy( auth, L"XBL3.0 x=" );
-                wcsncat( auth, uhs, uhs_len );
-                wcscat( auth, L";" );
-                wcsncat( auth, tok, tok_len );
+                dst = (WCHAR *)((char *)context->dataUtf16 + sizeof(*context->dataUtf16));
+                memcpy( dst, auth, auth_len * sizeof(WCHAR) );
+                if (sigw) memcpy( dst + auth_len, sigw, sigw_count * sizeof(WCHAR) );
+                free( auth ); free( sigw );
             }
             else
             {
-                UINT32 auth_len, tok_len, uhs_len;
-                char *auth, *tok, *uhs;
+                UINT32 auth_len, tok_len, uhs_len, sig_size = 0;
+                char *auth, *tok, *uhs, *sig, *pathA = NULL;
+                WCHAR *wurl = NULL;
+                int wn;
 
                 hr = HSTRINGToMultiByte( token, &tok, &tok_len );
                 WindowsDeleteString( token );
                 if (FAILED(hr)) goto _CLEANUP;
-                if (FAILED(hr = HSTRINGToMultiByte( context->user->user_hash, &uhs, &uhs_len ))) goto _CLEANUP;
+                if (FAILED(hr = HSTRINGToMultiByte( context->user->user_hash, &uhs, &uhs_len )))
+                {
+                    free( tok );
+                    goto _CLEANUP;
+                }
 
                 auth_len = strlen( "XBL3.0 x=;" ) + uhs_len + tok_len + 1;
+                if (!(auth = calloc( 1, auth_len )))
+                {
+                    free( tok ); free( uhs );
+                    hr = E_OUTOFMEMORY;
+                    goto _CLEANUP;
+                }
+                strcpy( auth, "XBL3.0 x=" );
+                strncat( auth, uhs, uhs_len );
+                strcat( auth, ";" );
+                strncat( auth, tok, tok_len );
+                free( tok );
+                free( uhs );
 
-                data_size = sizeof(*context->data) + auth_len;
+                /* signature over the game's actual request */
+                if ((wn = MultiByteToWideChar( CP_UTF8, 0, context->url, -1, NULL, 0 )) &&
+                    (wurl = calloc( wn, sizeof(WCHAR) )))
+                {
+                    MultiByteToWideChar( CP_UTF8, 0, context->url, -1, wurl, wn );
+                    pathA = xbl_url_path( wurl );
+                }
+                sig = xbl_sign( context->user, context->method, pathA ? pathA : "/",
+                                auth, context->bodyBuffer, context->bodySize );
+                sig_size = sig ? strlen( sig ) + 1 : 0;
+
+                data_size = sizeof(*context->data) + auth_len + sig_size;
                 if (!(context->data = calloc( 1, data_size )))
                 {
+                    free( auth ); free( sig ); free( pathA ); free( wurl );
                     hr = E_OUTOFMEMORY;
                     goto _CLEANUP;
                 }
 
                 context->data->tokenSize = auth_len;
-                context->data->signatureSize = 0;
+                context->data->signatureSize = sig_size;
+                context->data->token = NULL;
                 context->data->signature = NULL;
 
-                auth = (char *)context->data + sizeof(*context->data);
-                strcpy( auth, "XBL3.0 x=" );
-                strncat( auth, uhs, uhs_len );
-                strcat( auth, ";" );
-                strncat( auth, tok, tok_len );
+                memcpy( (char *)context->data + sizeof(*context->data), auth, auth_len );
+                if (sig)
+                    memcpy( (char *)context->data + sizeof(*context->data) + auth_len, sig, sig_size );
+                free( auth ); free( sig ); free( pathA ); free( wurl );
             }
 
         _CLEANUP:
