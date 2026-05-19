@@ -228,6 +228,8 @@ struct XUser
     HSTRING access_token;
     HSTRING refresh_token;
     HSTRING user_token;
+    HSTRING device_token;
+    HSTRING title_token;
     HSTRING xsts_token;
 
     char *classic_gamertag;
@@ -477,6 +479,8 @@ static ULONG WINAPI user_Release( IUser *iface )
         if (impl->access_token) WindowsDeleteString( impl->access_token );
         if (impl->refresh_token) WindowsDeleteString( impl->refresh_token );
         if (impl->user_token) WindowsDeleteString( impl->user_token );
+        if (impl->device_token) WindowsDeleteString( impl->device_token );
+        if (impl->title_token) WindowsDeleteString( impl->title_token );
         if (impl->xsts_token) WindowsDeleteString( impl->xsts_token );
         if (impl->classic_gamertag) free( impl->classic_gamertag );
         if (impl->proof_key) BCryptDestroyKey( impl->proof_key );
@@ -683,6 +687,116 @@ _CLEANUP:
     return hr;
 }
 
+/* Device token (ProofOfPossession, bound to our proof key). Minecraft's
+ * PlayFab/title login needs a title-authenticated XSTS token, which in turn
+ * needs a device token then a title token — olivi-r's flow only had the
+ * user token, so PlayFab rejected it (game stuck "signing in"). */
+static HRESULT user_RefreshDeviceToken( IUser *iface )
+{
+    const char *template = "{\"AuthMethod\":\"ProofOfPossession\","
+        "\"Id\":\"{e7e2a1c0-bf01-4d4f-9c2a-7b5a6f3d2e10}\","
+        "\"DeviceType\":\"Win32\",\"Version\":\"10.0.22631.0\",";
+    struct XUser *impl = impl_from_IUser( iface );
+    IJsonObject *object;
+    char *props, *pk;
+    HRESULT hr;
+
+    TRACE( "iface %p.\n", iface );
+
+    if (!(pk = xbl_proofkey_json( impl ))) return E_FAIL;
+    if (!(props = calloc( strlen( template ) + strlen( pk ) + strlen( "}" ) + 1, sizeof(char) )))
+    {
+        free( pk );
+        return E_OUTOFMEMORY;
+    }
+    strcpy( props, template );
+    strcat( props, pk );
+    strcat( props, "}" );
+    free( pk );
+
+    hr = IUser_RequestXToken( iface, L"https://device.auth.xboxlive.com/device/authenticate", "http://auth.xboxlive.com", props, (IUnknown **)&object );
+    free( props );
+    if (FAILED(hr)) return hr;
+
+    hr = GetJsonStringValue( object, L"Token", &impl->device_token );
+    IJsonObject_Release( object );
+    return hr;
+}
+
+/* Title token: RPS ticket + device token, bound to the proof key. */
+static HRESULT user_RefreshTitleToken( IUser *iface )
+{
+    const char *template = "{\"AuthMethod\":\"RPS\",\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"";
+    struct XUser *impl = impl_from_IUser( iface );
+    char *props, *rps = NULL, *dev = NULL, *pk = NULL;
+    UINT32 rps_size, dev_size;
+    IJsonObject *object;
+    HRESULT hr;
+
+    TRACE( "iface %p.\n", iface );
+
+    if (!(pk = xbl_proofkey_json( impl ))) return E_FAIL;
+    if (FAILED(hr = HSTRINGToMultiByte( impl->access_token, &rps, &rps_size ))) goto _DONE;
+    if (FAILED(hr = HSTRINGToMultiByte( impl->device_token, &dev, &dev_size ))) goto _DONE;
+    if (!(props = calloc( strlen( template ) + rps_size + strlen( "\",\"DeviceToken\":\"" )
+                          + dev_size + strlen( "\"," ) + strlen( pk ) + strlen( "}" ) + 1, sizeof(char) )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto _DONE;
+    }
+    strcpy( props, template );
+    strncat( props, rps, rps_size );
+    strcat( props, "\",\"DeviceToken\":\"" );
+    strncat( props, dev, dev_size );
+    strcat( props, "\"," );
+    strcat( props, pk );
+    strcat( props, "}" );
+
+    hr = IUser_RequestXToken( iface, L"https://title.auth.xboxlive.com/title/authenticate", "http://auth.xboxlive.com", props, (IUnknown **)&object );
+    free( props );
+    if (SUCCEEDED(hr))
+    {
+        hr = GetJsonStringValue( object, L"Token", &impl->title_token );
+        IJsonObject_Release( object );
+    }
+
+_DONE:
+    free( rps );
+    free( dev );
+    free( pk );
+    return hr;
+}
+
+/* Append ,"DeviceToken":"…","TitleToken":"…" before the closing brace of
+ * an xsts/authorize Properties object. Returns a new malloc'd string (the
+ * original is freed); on any issue the original is returned unchanged. */
+static char *xsts_add_device_title( char *props, struct XUser *impl )
+{
+    char *dev = NULL, *tit = NULL, *out = NULL;
+    UINT32 dev_size = 0, tit_size = 0;
+    size_t len;
+
+    if (!impl->device_token || !impl->title_token) return props;
+    if (FAILED(HSTRINGToMultiByte( impl->device_token, &dev, &dev_size ))) goto _DONE;
+    if (FAILED(HSTRINGToMultiByte( impl->title_token, &tit, &tit_size ))) goto _DONE;
+    len = strlen( props );
+    if (!len || props[len - 1] != '}') goto _DONE;
+    if (!(out = calloc( len + strlen( ",\"DeviceToken\":\"\",\"TitleToken\":\"\"" )
+                        + dev_size + tit_size + 1, sizeof(char) ))) goto _DONE;
+    memcpy( out, props, len - 1 );           /* drop trailing '}' */
+    strcat( out, ",\"DeviceToken\":\"" );
+    strncat( out, dev, dev_size );
+    strcat( out, "\",\"TitleToken\":\"" );
+    strncat( out, tit, tit_size );
+    strcat( out, "\"}" );
+    free( props );
+
+_DONE:
+    free( dev );
+    free( tit );
+    return out ? out : props;
+}
+
 static HRESULT WINAPI user_RefreshUserToken( IUser *iface )
 {
     const char *template = "{\"AuthMethod\":\"RPS\",\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"";
@@ -750,6 +864,7 @@ static HRESULT WINAPI user_RefreshXstsToken( IUser *iface, const char *relyingPa
     strncat( props, token_str, token_size );
     strcat( props, "\"]}" );
     free( token_str );
+    props = xsts_add_device_title( props, impl );
 
     hr = IUser_RequestXToken( iface, L"https://xsts.auth.xboxlive.com/xsts/authorize", relyingParty, props, (IUnknown **)&object );
     free( props );
@@ -936,7 +1051,9 @@ static HRESULT LoadDefaultUser( XUserHandle *user )
 
     if (FAILED(hr = MultiByteToHSTRING( buffer, size, &impl->refresh_token ))) goto _CLEANUP;
     if (FAILED(hr = IUser_RefreshOAuthToken( iface ))) goto _CLEANUP;
+    if (FAILED(hr = user_RefreshDeviceToken( iface ))) goto _CLEANUP;
     if (FAILED(hr = IUser_RefreshUserToken( iface ))) goto _CLEANUP;
+    if (FAILED(hr = user_RefreshTitleToken( iface ))) goto _CLEANUP;
     if (FAILED(hr = IUser_RefreshXstsToken( iface, "http://xboxlive.com" ))) goto _CLEANUP;
     if (FAILED(hr = IUser_FetchProfileSettings( iface, L"Gamertag", (IUnknown **)&object ))) goto _CLEANUP;
     hr = GetJsonStringValue( object, L"Gamertag", &classic_gamertag );
@@ -1427,6 +1544,7 @@ static HRESULT WINAPI XUserGetTokenAndSignatureProvider( XAsyncOp op, const XAsy
             strncat( props, token_str, token_size );
             strcat( props, "\"]}" );
             free( token_str );
+            props = xsts_add_device_title( props, context->user );
 
             hr = IUser_RequestXToken( user, L"https://xsts.auth.xboxlive.com/xsts/authorize", context->url, props, (IUnknown **)&object );
             free( props );
