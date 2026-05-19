@@ -1560,30 +1560,10 @@ static char *resolve_relying_party( const char *url )
     else
         h = NULL;
 
-    /* Auto-sweep: the request shape is now correct (XSTS 200) but PlayFab
-     * still rejects the token, so the relying-party VALUE is the unknown.
-     * Rotate candidates across the game's successive token retries within
-     * one session; whichever stops the PlayFab retry loop is the answer
-     * (grep proton.log for "PLAYFAB RP SWEEP"). Env override still wins. */
-    if (!h && strstr( host, "playfabapi.com" ))
-    {
-        static const char *cands[] = {
-            "https://b980a380.playfabapi.com/",
-            "http://playfabapi.com/",
-            "https://b980a380.minecraft.playfabapi.com/",
-            "http://xboxlive.com",
-            "https://multiplayer.minecraft.net/",
-            "rp://api.minecraftservices.com/",
-        };
-        static LONG sweep_idx = 0;
-        LONG n = sizeof(cands) / sizeof(cands[0]);
-        LONG i = (InterlockedIncrement( &sweep_idx ) - 1) % n;
-        if (!(rp = calloc( strlen( cands[i] ) + 1, 1 ))) return NULL;
-        strcpy( rp, cands[i] );
-        ERR( "PLAYFAB RP SWEEP attempt #%ld for %s -> %s\n", i, host, rp );
-        return rp;
-    }
-
+    /* The relying-party value was swept (6 candidates, all giving XSTS
+     * 200 except one) and PlayFab still rejected every one — proving the
+     * block is PlayFab/title-side, not the RP. Plain resolver kept; the
+     * WINEGDK_XSTS_RP[_<host>] env override still wins for manual tries. */
     if (h)
     {
         if (!(rp = calloc( strlen( h ) + 1, 1 ))) return NULL;
