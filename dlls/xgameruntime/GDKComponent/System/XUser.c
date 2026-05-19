@@ -1608,31 +1608,53 @@ static HRESULT WINAPI XUserGetTokenAndSignatureProvider( XAsyncOp op, const XAsy
             break;
 
         case XAsyncOp_DoWork:
-            if (FAILED(hr = HSTRINGToMultiByte( context->user->user_token, &token_str, &token_size ))) goto _CLEANUP;
-            if (!(props = calloc( strlen( template ) + token_size + strlen( "\"]}" ), sizeof(char) )))
+            /* Per-URL XSTS, replicated byte-for-byte from ChristopherHX's
+             * working WineGDK (CC0): resolved relying party + ProofKey at
+             * the request TOP LEVEL (sibling of Properties), signed. Our
+             * old path put no top-level ProofKey -> PlayFab rejected it. */
             {
-                free( token_str );
-                hr = E_OUTOFMEMORY;
-                goto _CLEANUP;
-            }
+                const char *fmt = "{\"RelyingParty\":\"%s\",\"TokenType\":\"JWT\","
+                    "\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"%s\"]},\"ProofKey\":%s}";
+                char *rp = NULL, *jwk = NULL, *pk = NULL, *body = NULL;
+                WCHAR *hdrs = NULL;
+                void *buf = NULL;
+                SIZE_T sz = 0, blen;
 
-            strcpy( props, template );
-            strncat( props, token_str, token_size );
-            strcat( props, "\"]}" );
-            free( token_str );
-            props = xsts_add_device_title( props, context->user );
+                if (FAILED(hr = HSTRINGToMultiByte( context->user->user_token, &token_str, &token_size ))) goto _CLEANUP;
+                rp = resolve_relying_party( context->url );
+                pk = xbl_proofkey_json( context->user );   /* "ProofKey":{...} */
+                jwk = pk ? strchr( pk, '{' ) : NULL;        /* the {...} only */
+                if (!rp || !jwk)
+                {
+                    free( token_str ); free( rp ); free( pk );
+                    hr = E_FAIL;
+                    goto _CLEANUP;
+                }
+                blen = strlen( fmt ) + strlen( rp ) + token_size + strlen( jwk ) + 1;
+                if (!(body = calloc( blen, sizeof(char) )))
+                {
+                    free( token_str ); free( rp ); free( pk );
+                    hr = E_OUTOFMEMORY;
+                    goto _CLEANUP;
+                }
+                snprintf( body, blen, fmt, rp, token_str, jwk );
+                free( token_str ); free( rp ); free( pk );
 
-            {
-                char *rp = resolve_relying_party( context->url );
-                hr = IUser_RequestXToken( user, L"https://xsts.auth.xboxlive.com/xsts/authorize",
-                                          rp ? rp : context->url, props, (IUnknown **)&object );
-                free( rp );
+                hdrs = xbl_signed_headers( context->user,
+                    L"https://xsts.auth.xboxlive.com/xsts/authorize", body );
+                hr = HttpRequest( L"POST",
+                    L"https://xsts.auth.xboxlive.com/xsts/authorize", body,
+                    hdrs ? hdrs : CT_JSON, ACCEPT_JSON, &buf, &sz );
+                free( hdrs );
+                free( body );
+                if (FAILED(hr)) goto _CLEANUP;
+                hr = ParseJsonObject( buf, sz, &object );
+                free( buf );
+                if (FAILED(hr)) goto _CLEANUP;
+                hr = GetJsonStringValue( object, L"Token", &token );
+                IJsonObject_Release( object );
+                if (FAILED(hr)) goto _CLEANUP;
             }
-            free( props );
-            if (FAILED(hr)) goto _CLEANUP;
-            hr = GetJsonStringValue( object, L"Token", &token );
-            IJsonObject_Release( object );
-            if (FAILED(hr)) goto _CLEANUP;
 
             if (context->isUtf16)
             {
