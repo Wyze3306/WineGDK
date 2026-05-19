@@ -1629,6 +1629,17 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl6 *iface
 
     if (FAILED(hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&xthreading ))) return hr;
     hr = IXThreadingImpl_XAsyncGetResult( xthreading, async, NULL, bufferSize, buffer, bufferUsed );
+    if (SUCCEEDED(hr) && buffer)
+    {
+        /* The provider laid the buffer out as [struct][token][signature];
+         * the token/signature pointers were NULL (their target only exists
+         * now, in the caller's buffer). Point them at it — the game reads
+         * data->token, so a NULL here made it retry forever. */
+        XUserGetTokenAndSignatureData *d = buffer;
+        d->token = (const char *)buffer + sizeof(*d);
+        d->signature = d->signatureSize
+            ? (const char *)buffer + sizeof(*d) + d->tokenSize : NULL;
+    }
     *ptrToBuffer = (XUserGetTokenAndSignatureData *)buffer;
     IXThreadingImpl_Release( xthreading );
     return hr;
@@ -1709,6 +1720,14 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl6 *
 
     if (FAILED(hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&xthreading ))) return hr;
     hr = IXThreadingImpl_XAsyncGetResult( xthreading, async, NULL, bufferSize, buffer, bufferUsed );
+    if (SUCCEEDED(hr) && buffer)
+    {
+        XUserGetTokenAndSignatureUtf16Data *d = buffer;
+        d->token = (const WCHAR *)((char *)buffer + sizeof(*d));
+        d->signature = d->signatureCount
+            ? (const WCHAR *)((char *)buffer + sizeof(*d)
+                              + d->tokenCount * sizeof(WCHAR)) : NULL;
+    }
     *ptrToBuffer = (XUserGetTokenAndSignatureUtf16Data *)buffer;
     IXThreadingImpl_Release( xthreading );
     return hr;
