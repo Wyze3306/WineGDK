@@ -68,8 +68,27 @@ static HRESULT HttpRequest( const WCHAR *method, const WCHAR *url, char *data, c
     if (!WinHttpSendRequest( request, headers, -1, data, strlen( data ), strlen( data ), 0 )) goto _FAILED;
     if (!WinHttpReceiveResponse( request, NULL )) goto _FAILED;
     if (!WinHttpQueryHeaders( request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX )) goto _FAILED;
+    TRACE( "%s %s -> HTTP %lu\n", debugstr_w( method ), debugstr_w( url ), status );
     if (status != 200)
     {
+        /* Log why (Xbox puts a code in the x-err header / a JSON body) —
+         * otherwise a rejected token is invisible and the game just loops. */
+        WCHAR rawhdr[2048] = {0};
+        char body[1024] = {0};
+        DWORD hn = sizeof(rawhdr), got = 0, n = 0;
+
+        WinHttpQueryHeaders( request, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                             WINHTTP_HEADER_NAME_BY_INDEX, rawhdr, &hn,
+                             WINHTTP_NO_HEADER_INDEX );
+        while (got < sizeof(body) - 1 && WinHttpQueryDataAvailable( request, &n ) && n)
+        {
+            if (n > sizeof(body) - 1 - got) n = sizeof(body) - 1 - got;
+            if (!WinHttpReadData( request, body + got, n, &n ) || !n) break;
+            got += n;
+        }
+        ERR( "%s %s -> HTTP %lu\n  headers: %s\n  body: %s\n",
+             debugstr_w( method ), debugstr_w( url ), status,
+             debugstr_w( rawhdr ), debugstr_a( body ) );
         hr = E_FAIL;
         goto _CLEANUP;
     }
