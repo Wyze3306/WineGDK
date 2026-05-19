@@ -22,6 +22,7 @@
 #include "../../private.h"
 
 #include <errno.h>
+#include <ctype.h>
 #include <time.h>
 #include <winhttp.h>
 #include <bcrypt.h>
@@ -1506,6 +1507,73 @@ struct XUserGetTokenAndSignatureContext
     };
 };
 
+/* Map a target URL to the XSTS relying party Xbox actually validates,
+ * instead of blindly using the raw URL (which PlayFab/Xbox reject).
+ * Ported from ChristopherHX's WineGDK (CC0). The env override
+ * WINEGDK_XSTS_RP[_<HOST>] lets the relying party be tuned WITHOUT
+ * rebuilding WineGDK. Returns a malloc'd string (caller frees) or NULL. */
+static char *resolve_relying_party( const char *url )
+{
+    char host[256] = {0}, scheme[16] = {0}, envname[300], *env, *rp;
+    const char *p, *h, *e;
+    DWORD n;
+    size_t i;
+
+    if (!url) return NULL;
+    p = strstr( url, "://" );
+    if (!p || (size_t)(p - url) >= sizeof(scheme)) return NULL;
+    memcpy( scheme, url, p - url );
+    h = p + 3;
+    for (e = h; *e && *e != '/' && *e != ':'; e++) {}
+    if ((size_t)(e - h) >= sizeof(host)) return NULL;
+    memcpy( host, h, e - h );
+
+    /* env override: WINEGDK_XSTS_RP_<SANITIZED HOST>, then WINEGDK_XSTS_RP */
+    strcpy( envname, "WINEGDK_XSTS_RP_" );
+    for (i = 0; host[i]; i++)
+    {
+        char c = host[i];
+        envname[16 + i] = isalnum( (unsigned char)c ) ? toupper( (unsigned char)c ) : '_';
+    }
+    envname[16 + i] = 0;
+    if (!(n = GetEnvironmentVariableA( envname, NULL, 0 )))
+        n = GetEnvironmentVariableA( "WINEGDK_XSTS_RP", NULL, 0 );
+    if (n && (env = calloc( n, 1 )))
+    {
+        if (GetEnvironmentVariableA( envname, env, n ) ||
+            GetEnvironmentVariableA( "WINEGDK_XSTS_RP", env, n ))
+        {
+            TRACE( "relying party (env) for %s -> %s\n", host, env );
+            return env;
+        }
+        free( env );
+    }
+
+    if (!strcmp( host, "collections.mp.microsoft.com" ) ||
+        !strcmp( host, "purchase.mp.microsoft.com" ) ||
+        !strcmp( host, "inventory.xboxlive.com" ) ||
+        !strcmp( host, "licensing.xboxlive.com" ))
+        h = "http://licensing.xboxlive.com";
+    else if (!strcmp( host, "xboxlive.com" ) ||
+             (strlen( host ) > 13 && !strcmp( host + strlen( host ) - 13, ".xboxlive.com" )))
+        h = "http://xboxlive.com";
+    else
+        h = NULL;
+
+    if (h)
+    {
+        if (!(rp = calloc( strlen( h ) + 1, 1 ))) return NULL;
+        strcpy( rp, h );
+    }
+    else
+    {
+        if (!(rp = calloc( strlen( scheme ) + strlen( host ) + 5, 1 ))) return NULL;
+        sprintf( rp, "%s://%s/", scheme, host );
+    }
+    TRACE( "relying party for %s -> %s\n", host, rp );
+    return rp;
+}
+
 static HRESULT WINAPI XUserGetTokenAndSignatureProvider( XAsyncOp op, const XAsyncProviderData *data )
 {
     const char *template = "{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"";
@@ -1554,7 +1622,12 @@ static HRESULT WINAPI XUserGetTokenAndSignatureProvider( XAsyncOp op, const XAsy
             free( token_str );
             props = xsts_add_device_title( props, context->user );
 
-            hr = IUser_RequestXToken( user, L"https://xsts.auth.xboxlive.com/xsts/authorize", context->url, props, (IUnknown **)&object );
+            {
+                char *rp = resolve_relying_party( context->url );
+                hr = IUser_RequestXToken( user, L"https://xsts.auth.xboxlive.com/xsts/authorize",
+                                          rp ? rp : context->url, props, (IUnknown **)&object );
+                free( rp );
+            }
             free( props );
             if (FAILED(hr)) goto _CLEANUP;
             hr = GetJsonStringValue( object, L"Token", &token );
