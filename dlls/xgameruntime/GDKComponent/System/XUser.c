@@ -1051,9 +1051,17 @@ static HRESULT LoadDefaultUser( XUserHandle *user )
 
     if (FAILED(hr = MultiByteToHSTRING( buffer, size, &impl->refresh_token ))) goto _CLEANUP;
     if (FAILED(hr = IUser_RefreshOAuthToken( iface ))) goto _CLEANUP;
-    if (FAILED(hr = user_RefreshDeviceToken( iface ))) goto _CLEANUP;
+    /* Device/Title tokens are best-effort: title.auth needs the real
+     * Minecraft title's MSA credentials (returns 401 otherwise), which a
+     * reimplementation can't mint. If they fail, xsts_add_device_title
+     * skips them and we fall back to the user-only XSTS (gamertag etc.
+     * still work) instead of failing sign-in entirely. */
+    if (FAILED(user_RefreshDeviceToken( iface )))
+        WARN( "device token unavailable — continuing user-only.\n" );
     if (FAILED(hr = IUser_RefreshUserToken( iface ))) goto _CLEANUP;
-    if (FAILED(hr = user_RefreshTitleToken( iface ))) goto _CLEANUP;
+    if (FAILED(user_RefreshTitleToken( iface )))
+        WARN( "title token unavailable (title.auth needs the game's MSA "
+              "credentials) — continuing user-only.\n" );
     if (FAILED(hr = IUser_RefreshXstsToken( iface, "http://xboxlive.com" ))) goto _CLEANUP;
     if (FAILED(hr = IUser_FetchProfileSettings( iface, L"Gamertag", (IUnknown **)&object ))) goto _CLEANUP;
     hr = GetJsonStringValue( object, L"Gamertag", &classic_gamertag );
