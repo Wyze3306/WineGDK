@@ -88,21 +88,39 @@ static HRESULT WINAPI x_system_XSystemGetXboxLiveSandboxId( IXSystemImpl *iface,
 
     TRACE( "iface %p, sandboxIdSize %d, sandboxId %p, sandboxIdUsed %p\n", iface, sandboxIdSize, sandboxId, sandboxIdUsed );
 
-    if ( !sandboxId || !sandboxIdUsed )
+    /* sandboxIdUsed is [out, optional]: XSAPI's XblInitialize calls this
+     * with sandboxIdUsed == NULL. Failing it here aborts XBL init, so the
+     * game's online/sign-in never completes (gamertag works, "Sign in"
+     * stays). Only sandboxId is required. */
+    if ( !sandboxId )
         return E_POINTER;
 
     if ( sandboxIdSize < XSystemXboxLiveSandboxIdMaxBytes )
         return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
 
     strcpy_s( sandboxId, sandboxIdSize, Id );
-    *sandboxIdUsed = strlen( Id ) + 1;
+    if ( sandboxIdUsed )
+        *sandboxIdUsed = strlen( Id ) + 1;
     return S_OK;
 }
 
 static HRESULT WINAPI x_system_XSystemGetAppSpecificDeviceId( IXSystemImpl *iface, INT32 appSpecificDeviceIdSize, LPSTR appSpecificDeviceId, SIZE_T *appSpecificDeviceIdUsed )
-{    
-    FIXME( "iface %p, appSpecificDeviceIdSize %d, appSpecificDeviceId %p, appSpecificDeviceIdUsed %p stub!\n", iface, appSpecificDeviceIdSize, appSpecificDeviceId, appSpecificDeviceIdUsed );
-    return E_NOTIMPL;
+{
+    /* Stable opaque per-app device id. E_NOTIMPL here can also abort XBL
+     * init; *Used is [out, optional]. */
+    LPCSTR Id = "00000000-0000-0000-0000-000000000000";
+
+    TRACE( "iface %p, appSpecificDeviceIdSize %d, appSpecificDeviceId %p, appSpecificDeviceIdUsed %p\n", iface, appSpecificDeviceIdSize, appSpecificDeviceId, appSpecificDeviceIdUsed );
+
+    if ( !appSpecificDeviceId )
+        return E_POINTER;
+    if ( appSpecificDeviceIdSize < (INT32)strlen( Id ) + 1 )
+        return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+
+    strcpy_s( appSpecificDeviceId, appSpecificDeviceIdSize, Id );
+    if ( appSpecificDeviceIdUsed )
+        *appSpecificDeviceIdUsed = strlen( Id ) + 1;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_system_XSystemHandleTrack( IXSystemImpl *iface )
