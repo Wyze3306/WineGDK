@@ -52,6 +52,7 @@ typedef struct APP_LOCAL_DEVICE_ID
     BYTE value[32];
 } APP_LOCAL_DEVICE_ID;
 cpp_quote("#endif")
+cpp_quote("#endif")
 
 typedef enum GameInputArcadeStickButtons GameInputArcadeStickButtons;
 typedef enum GameInputBatteryStatus GameInputBatteryStatus;
