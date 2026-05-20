@@ -21,6 +21,7 @@
 
 #include "XAsync.h"
 #include "XTaskQueue.h"
+#include "wine/exception.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -376,16 +377,17 @@ static HRESULT AllocStateNoCompletion( XAsyncBlock* asyncBlock, AsyncBlockIntern
         /* Validate the queue by checking if headQueue looks like a valid COM object.
          * Our XTaskQueue has headQueue pointing to a struct with a vtable.
          * Native DLL queues have different layout - accessing headQueue would crash. */
-        __try
+        __TRY
         {
             queue->headQueue->lpVtbl->AddRef( queue->headQueue );
             stateImpl->queue = queue;
         }
-        __except(EXCEPTION_EXECUTE_HANDLER)
+        __EXCEPT_ALL
         {
             WARN( "asyncBlock queue %p is not a Wine XTaskQueue, using process queue\n", queue );
             queue = NULL;
         }
+        __ENDTRY
     }
 
     if ( queue == NULL )
