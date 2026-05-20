@@ -234,7 +234,7 @@ struct XUserAddContext
     LPCSTR client_id;
 };
 
-static HRESULT XUserAddProvider( XAsyncOp operation, const XAsyncProviderData *providerData )
+static HRESULT CALLBACK XUserAddProvider( XAsyncOp operation, const XAsyncProviderData *providerData )
 {
     struct XUserAddContext *context;
     IXThreadingImpl *impl;
@@ -459,7 +459,7 @@ struct XUserGetTokenAndSignatureContext
     SIZE_T result_size;
 };
 
-static HRESULT XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsyncProviderData *providerData )
+static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsyncProviderData *providerData )
 {
     struct XUserGetTokenAndSignatureContext *context;
     IXThreadingImpl *impl;
@@ -1004,7 +1004,7 @@ static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
     return ref;
 }
 
-static HRESULT x_user_gt_XUserGetGamertag( IXUserGamertag *iface, XUserHandle user, XUserGamertagComponent component, SIZE_T size, LPSTR gamertag, SIZE_T *used )
+static HRESULT WINAPI x_user_gt_XUserGetGamertag( IXUserGamertag *iface, XUserHandle user, XUserGamertagComponent component, SIZE_T size, LPSTR gamertag, SIZE_T *used )
 {
     struct x_user *impl;
     SIZE_T len;

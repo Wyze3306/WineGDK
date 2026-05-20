@@ -33,7 +33,7 @@ static HRESULT WINAPI store_CreateContext( void *iface, void *user, void **conte
 
 /* --- XStore license async provider (proper XAsync pattern) --- */
 
-static HRESULT store_license_provider( XAsyncOp op, const XAsyncProviderData *data )
+static HRESULT CALLBACK store_license_provider( XAsyncOp op, const XAsyncProviderData *data )
 {
     if (!data) return E_POINTER;
 
@@ -84,7 +84,7 @@ static HRESULT WINAPI store_QueryGameLicenseResult( void *iface, void *asyncBloc
 
 /* --- XStore associated products async provider --- */
 
-static HRESULT store_products_provider( XAsyncOp op, const XAsyncProviderData *data )
+static HRESULT CALLBACK store_products_provider( XAsyncOp op, const XAsyncProviderData *data )
 {
     if (!data) return E_POINTER;
 
