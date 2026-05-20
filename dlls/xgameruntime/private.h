@@ -48,7 +48,7 @@
 
 // October 2025 Release of GDK
 #define GDKC_VERSION 10002L
-#define GAMING_SERVICES_VERSION 4429L
+#define GAMING_SERVICES_VERSION 6247L
 
 extern IXSystemImpl *x_system_impl;
 extern IXSystemAnalyticsImpl *x_system_analytics_impl;
