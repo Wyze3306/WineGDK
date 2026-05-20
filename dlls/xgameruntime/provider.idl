@@ -38,7 +38,7 @@ typedef struct XAsyncBlock XAsyncBlock;
 typedef struct XTaskQueueObject* XTaskQueueHandle;
 typedef struct XTaskQueueRegistrationToken XTaskQueueRegistrationToken;
 
-typedef void XAsyncCompletionRoutine(struct XAsyncBlock* asyncBlock);
+typedef void __stdcall XAsyncCompletionRoutine(struct XAsyncBlock* asyncBlock);
 
 interface IWineAsyncWorkImpl;
 interface IXSystemImpl;
