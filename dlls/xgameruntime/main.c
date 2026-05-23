@@ -407,35 +407,21 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
                 }
             }
 
-            /* Patch the native DLL's vtable[11] (offset 0x58) - the "user sign-in slot".
-             * XSAPI's XblInitialize gate calls this to check for a signed-in user.
-             * The native DLL returns E_FAIL without Gaming Services. Patching the
-             * vtable function pointer to our stub makes it return S_OK, allowing
-             * XblInitialize to proceed and the social manager to initialize. */
-            if (SUCCEEDED( thr ) && *out)
-            {
-                static BOOLEAN vtable_patched = FALSE;
-                if (!vtable_patched)
-                {
-                    void **vtable = *(void ***)(*out);
-                    DWORD op;
-                    /* Allocate executable stub: mov eax, 0; ret = xor eax,eax; ret */
-                    static BYTE signin_stub[] = { 0x31, 0xC0, 0xC3 }; /* xor eax,eax; ret = S_OK */
-                    void *stub_mem = VirtualAlloc( NULL, sizeof(signin_stub), MEM_COMMIT, PAGE_EXECUTE_READWRITE );
-                    if (stub_mem)
-                    {
-                        memcpy( stub_mem, signin_stub, sizeof(signin_stub) );
-                        /* vtable[11] = offset 0x58 bytes = 11th pointer */
-                        if (VirtualProtect( &vtable[11], sizeof(void*), PAGE_READWRITE, &op ))
-                        {
-                            ERR( "patching native XThreading vtable[11] from %p to %p (S_OK stub)\n", vtable[11], stub_mem );
-                            vtable[11] = stub_mem;
-                            VirtualProtect( &vtable[11], sizeof(void*), op, &op );
-                            vtable_patched = TRUE;
-                        }
-                    }
-                }
-            }
+            /* DO NOT touch vtable[11].  Per xthread.h's IXThreadingImplVtbl
+             * layout (QueryInterface, AddRef, Release, XAsyncGetStatus,
+             * XAsyncGetResultSize, XAsyncCancel, XAsyncRun, XAsyncBegin,
+             * __PADDING__, XAsyncSchedule, XAsyncComplete, XAsyncGetResult,
+             * ...) slot 11 is XAsyncGetResult, NOT a hidden "user sign-in
+             * slot".  Stubbing it to `xor eax,eax; ret` makes every async
+             * result come back as S_OK with the caller's output buffer
+             * untouched: XUserAddAsync's DoWork populates context->user,
+             * but XAsyncGetResult never invokes the provider's GetResult
+             * branch, so XUserAddResult returns user=NULL → XUserGetId
+             * dereferences NULL → Minecraft's GDK auth path bubbles back
+             * as "Llama (0x80004003)" on the title screen.  Whatever
+             * XblInitialize needed before has to be solved elsewhere
+             * (a real per-purpose hook, not blanketing a busy vtable
+             * slot).  See bedrockonlinux-native-login-contract memory. */
 
             return thr;
         }
