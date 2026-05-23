@@ -1,12 +1,5 @@
 IMPORTS   = user32 advapi32 crypt32 combase winhttp bcrypt
 MODULE    = xgameruntime.dll
-# i386 PE half catches many calling-convention mismatches (vtable members
-# declared without WINAPI/CALLBACK while the vtable typedef has
-# STDMETHODCALLTYPE).  Game runs the 64-bit Minecraft.Windows.exe so the
-# i386 xgameruntime is never loaded; demote the strict pointer-types check
-# to a warning so the WoW64 build compiles without auditing every static
-# vtable member.
-EXTRADEFS = -Wno-error=incompatible-pointer-types -Wno-incompatible-pointer-types
 
 SOURCES = \
 	main.c \
