@@ -36,6 +36,18 @@ HRESULT RefreshOAuth( LPCSTR client_id, LPCSTR refresh_token, time_t *new_expiry
 HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *localId );
 HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUserAgeGroup *age_group, LPSTR gamertag, SIZE_T gamertag_size );
 HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_party, HSTRING *token );
+/* SISU single-call auth: takes the MSA OAuth token + the previously-issued
+ * device token and asks sisu.xboxlive.com/authorize for an XSTS token
+ * **bound to the Minecraft title** (via client_id 0000000048183522 which
+ * Microsoft has on file for the Bedrock title id).  This is the path
+ * gophertunnel / ProxyPass use to authenticate against PlayFab without a
+ * separate title.auth call (which always returns 401 here because we
+ * can't mint a title-credential RPS ticket).  Returns the XSTS-equivalent
+ * Token from AuthorizationToken — same XBL3.0 shape as
+ * RequestXstsTokenForRelyingParty, just title-bound. */
+HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
+                              HSTRING device_token, LPCSTR relying_party,
+                              HSTRING *xsts_token );
 HRESULT HSTRINGToMultiByte( HSTRING hstr, LPSTR *str, UINT32 *str_len );
 HRESULT HttpRequest( LPCWSTR method, LPCWSTR host, LPCWSTR path, LPSTR data,
                      LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *size );

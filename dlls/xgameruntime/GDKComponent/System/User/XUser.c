@@ -529,7 +529,29 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
 
             TRACE( "requesting token for url=%s, rp=%s\n", url ? url : "(utf16)", rp );
 
-            dowork_hr = RequestXstsTokenForRelyingParty( user_impl->user_token, rp, &xsts_token );
+            /* Try SISU first for PlayFab/multiplayer (title-bound XSTS in a
+             * single round-trip with our MSA AppId + device key — the path
+             * gophertunnel/ProxyPass use to get past PlayFab's title check).
+             * Falls back to the plain user→xsts/authorize exchange if SISU
+             * is unavailable (device auth uninitialised, network error,
+             * Microsoft returning non-2xx). */
+            dowork_hr = E_FAIL;
+            if (DeviceAuth_IsInitialized() && user_impl->oauth_token)
+            {
+                HSTRING device_token = NULL;
+                if (SUCCEEDED( DeviceAuth_GetDeviceToken( &device_token ) ) && device_token)
+                {
+                    dowork_hr = RequestSisuAuthorize(
+                        "0000000048183522",
+                        user_impl->oauth_token, device_token, rp, &xsts_token );
+                    WindowsDeleteString( device_token );
+                    if (FAILED( dowork_hr ))
+                        WARN( "SISU for RP %s failed: 0x%08lx — falling back to user-only XSTS\n",
+                              rp, dowork_hr );
+                }
+            }
+            if (FAILED( dowork_hr ))
+                dowork_hr = RequestXstsTokenForRelyingParty( user_impl->user_token, rp, &xsts_token );
             if (FAILED( dowork_hr ))
             {
                 WARN( "XSTS token request for RP %s failed: 0x%08lx\n", rp, dowork_hr );

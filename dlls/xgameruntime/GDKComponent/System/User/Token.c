@@ -17,6 +17,7 @@
  */
 
 #include "Token.h"
+#include "DeviceAuth.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -601,5 +602,111 @@ HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_part
     hr = GetJsonStringValue( object, L"Token", token );
     IJsonObject_Release( object );
 
+    return hr;
+}
+
+HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
+                              HSTRING device_token, LPCSTR relying_party,
+                              HSTRING *xsts_token )
+{
+    LPCWSTR accept[] = {L"application/json", NULL};
+    LPSTR oauth_str = NULL, device_str = NULL;
+    LPSTR proof_key_json = NULL;
+    LPSTR sig_header = NULL;
+    LPSTR body = NULL, response = NULL;
+    UINT32 oauth_len, device_len;
+    SIZE_T response_size;
+    IJsonObject *root = NULL, *auth = NULL;
+    HRESULT hr;
+
+    if (!relying_party || !xsts_token) return E_POINTER;
+    *xsts_token = NULL;
+    if (!DeviceAuth_IsInitialized())
+    {
+        WARN( "RequestSisuAuthorize: DeviceAuth not initialised\n" );
+        return E_FAIL;
+    }
+
+    if (FAILED( hr = HSTRINGToMultiByte( oauth_token, &oauth_str, &oauth_len ) ))
+        goto cleanup;
+    if (FAILED( hr = HSTRINGToMultiByte( device_token, &device_str, &device_len ) ))
+        goto cleanup;
+    if (FAILED( hr = DeviceAuth_GetProofKeyJson( &proof_key_json ) ))
+        goto cleanup;
+
+    /* Build SISU body: title-bound XSTS in a single call.  AppId is the
+     * Bedrock MSA client_id Microsoft has linked to the Minecraft title
+     * id; passing it here is what makes PlayFab accept the resulting
+     * AuthorizationToken without a separate title.auth (which always
+     * returns 401 without Microsoft's title credentials). */
+    {
+        SIZE_T body_cap = oauth_len + device_len + strlen( proof_key_json )
+                          + strlen( relying_party ) + strlen( client_id ) + 512;
+        if (!(body = calloc( 1, body_cap )))
+        {
+            hr = E_OUTOFMEMORY;
+            goto cleanup;
+        }
+        snprintf( body, body_cap,
+                  "{\"AccessToken\":\"t=%s\","
+                  "\"AppId\":\"%s\","
+                  "\"deviceToken\":\"%s\","
+                  "\"Sandbox\":\"RETAIL\","
+                  "\"UseModernGamertag\":true,"
+                  "\"SiteName\":\"user.auth.xboxlive.com\","
+                  "\"RelyingParty\":\"%s\","
+                  "\"ProofKey\":%s}",
+                  oauth_str, client_id, device_str, relying_party,
+                  proof_key_json );
+    }
+
+    /* Sign the SISU request — Microsoft rejects unsigned /authorize. */
+    if (FAILED( hr = DeviceAuth_SignRequest( "POST", "/authorize", "",
+                                              body, strlen( body ),
+                                              &sig_header ) ))
+    {
+        WARN( "RequestSisuAuthorize: SignRequest failed 0x%08lx\n", hr );
+        goto cleanup;
+    }
+
+    {
+        WCHAR sig_w[256];
+        WCHAR headers[512];
+        MultiByteToWideChar( CP_UTF8, 0, sig_header, -1, sig_w, 256 );
+        swprintf( headers, 512,
+                  L"content-type: application/json\r\n"
+                  L"Signature: %s\r\n"
+                  L"x-xbl-contract-version: 1",
+                  sig_w );
+        TRACE( "RequestSisuAuthorize POST sisu.xboxlive.com/authorize, "
+               "client_id=%s, rp=%s\n", client_id, relying_party );
+        hr = HttpRequest( L"POST", L"sisu.xboxlive.com", L"/authorize",
+                          body, headers, accept, &response, &response_size );
+        if (FAILED( hr ))
+        {
+            WARN( "RequestSisuAuthorize: HTTP failed 0x%08lx\n", hr );
+            goto cleanup;
+        }
+    }
+    TRACE( "RequestSisuAuthorize response size=%llu, first 200 chars: %.200s\n",
+           (unsigned long long)response_size, response );
+
+    if (FAILED( hr = ParseJsonObject( response, response_size, &root ) ))
+        goto cleanup;
+
+    /* SISU returns { AuthorizationToken: { Token, DisplayClaims, ... }, ... } */
+    if (FAILED( hr = GetJsonObjectValue( root, L"AuthorizationToken", &auth ) ))
+        goto cleanup;
+    hr = GetJsonStringValue( auth, L"Token", xsts_token );
+
+cleanup:
+    if (auth) IJsonObject_Release( auth );
+    if (root) IJsonObject_Release( root );
+    free( response );
+    free( sig_header );
+    free( body );
+    free( proof_key_json );
+    free( device_str );
+    free( oauth_str );
     return hr;
 }
