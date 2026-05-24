@@ -536,6 +536,12 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
              * is unavailable (device auth uninitialised, network error,
              * Microsoft returning non-2xx). */
             dowork_hr = E_FAIL;
+            /* uhs that goes into the XBL3.0 header.  PlayFab cross-checks
+             * it against the uhs claim INSIDE the token: SISU returns a
+             * different uhs than the user-only RequestUserToken flow,
+             * so when SISU is what minted the token the header must use
+             * the SISU one or PlayFab silently rejects → sign-in loops. */
+            UINT64 token_uhs = user_impl->local_id.value;
             if (DeviceAuth_IsInitialized() && user_impl->oauth_token)
             {
                 HSTRING device_token = NULL;
@@ -553,11 +559,15 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                     if (url && (strstr( url, "playfab" ) ||
                                 strstr( url, "multiplayer.minecraft" )))
                         sisu_rp = "https://multiplayer.minecraft.net/";
+                    UINT64 sisu_uhs = 0;
                     dowork_hr = RequestSisuAuthorize(
                         "0000000048183522",
-                        user_impl->oauth_token, device_token, sisu_rp, &xsts_token );
+                        user_impl->oauth_token, device_token, sisu_rp,
+                        &xsts_token, &sisu_uhs );
                     WindowsDeleteString( device_token );
-                    if (FAILED( dowork_hr ))
+                    if (SUCCEEDED( dowork_hr ) && sisu_uhs)
+                        token_uhs = sisu_uhs;
+                    else if (FAILED( dowork_hr ))
                         WARN( "SISU for RP %s failed: 0x%08lx — falling back to user-only XSTS\n",
                               rp, dowork_hr );
                 }
@@ -579,9 +589,11 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 break;
             }
 
-            /* Format: XBL3.0 x=<userHash>;<xstsToken> */
+            /* Format: XBL3.0 x=<userHash>;<xstsToken> — userHash MUST match
+             * the uhs claim inside the token (set above to sisu_uhs when
+             * SISU minted, falls back to local_id.value for user-only). */
             context->result_token_len = snprintf( NULL, 0, "XBL3.0 x=%llu;%.*s",
-                (unsigned long long)user_impl->local_id.value, (int)xsts_len, xsts_str );
+                (unsigned long long)token_uhs, (int)xsts_len, xsts_str );
             context->result_token = calloc( 1, context->result_token_len + 1 );
             if (!context->result_token)
             {
@@ -590,7 +602,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 break;
             }
             snprintf( context->result_token, context->result_token_len + 1, "XBL3.0 x=%llu;%.*s",
-                (unsigned long long)user_impl->local_id.value, (int)xsts_len, xsts_str );
+                (unsigned long long)token_uhs, (int)xsts_len, xsts_str );
             free( xsts_str );
 
             TRACE( "token for %s: %.40s...\n", rp, context->result_token );

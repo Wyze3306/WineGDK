@@ -607,7 +607,7 @@ HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_part
 
 HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
                               HSTRING device_token, LPCSTR relying_party,
-                              HSTRING *xsts_token )
+                              HSTRING *xsts_token, UINT64 *uhs )
 {
     LPCWSTR accept[] = {L"application/json", NULL};
     LPSTR oauth_str = NULL, device_str = NULL;
@@ -617,10 +617,13 @@ HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
     UINT32 oauth_len, device_len;
     SIZE_T response_size;
     IJsonObject *root = NULL, *auth = NULL;
+    IJsonObject *display = NULL, *xui0 = NULL;
+    IJsonArray *xui = NULL;
     HRESULT hr;
 
     if (!relying_party || !xsts_token) return E_POINTER;
     *xsts_token = NULL;
+    if (uhs) *uhs = 0;
     if (!DeviceAuth_IsInitialized())
     {
         WARN( "RequestSisuAuthorize: DeviceAuth not initialised\n" );
@@ -721,9 +724,43 @@ HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
     }
     hr = GetJsonStringValue( auth, L"Token", xsts_token );
     if (FAILED( hr ))
+    {
         WARN( "RequestSisuAuthorize: AuthorizationToken.Token missing 0x%08lx\n", hr );
+        goto cleanup;
+    }
+
+    /* Extract AuthorizationToken.DisplayClaims.xui[0].uhs — PlayFab
+     * cross-checks the uhs in the XBL3.0 header (`XBL3.0 x=<uhs>;<token>`)
+     * against the uhs claim baked into the JWT.  Using the user-only
+     * RequestUserToken uhs caused a mismatch and PlayFab silently looped
+     * the sign-in screen even though the title-bound XSTS itself was
+     * valid. */
+    if (uhs)
+    {
+        HSTRING uhs_str = NULL;
+        LPSTR uhs_mb = NULL;
+        UINT32 uhs_len;
+        if (SUCCEEDED( GetJsonObjectValue( auth, L"DisplayClaims", &display ) ) &&
+            SUCCEEDED( GetJsonArrayValue( display, L"xui", &xui ) ) &&
+            SUCCEEDED( IJsonArray_GetObjectAt( xui, 0, &xui0 ) ) &&
+            SUCCEEDED( GetJsonStringValue( xui0, L"uhs", &uhs_str ) ) &&
+            SUCCEEDED( HSTRINGToMultiByte( uhs_str, &uhs_mb, &uhs_len ) ))
+        {
+            errno = 0;
+            *uhs = strtoull( uhs_mb, NULL, 10 );
+            if (errno == ERANGE) { *uhs = 0; errno = 0; }
+            TRACE( "RequestSisuAuthorize: AuthorizationToken uhs=%llu\n",
+                   (unsigned long long)*uhs );
+        }
+        else WARN( "RequestSisuAuthorize: could not extract AuthorizationToken uhs\n" );
+        if (uhs_mb) free( uhs_mb );
+        if (uhs_str) WindowsDeleteString( uhs_str );
+    }
 
 cleanup:
+    if (xui0) IJsonObject_Release( xui0 );
+    if (xui) IJsonArray_Release( xui );
+    if (display) IJsonObject_Release( display );
     if (auth) IJsonObject_Release( auth );
     if (root) IJsonObject_Release( root );
     free( response );

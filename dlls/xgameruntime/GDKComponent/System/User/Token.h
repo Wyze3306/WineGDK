@@ -47,7 +47,7 @@ HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_part
  * RequestXstsTokenForRelyingParty, just title-bound. */
 HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
                               HSTRING device_token, LPCSTR relying_party,
-                              HSTRING *xsts_token );
+                              HSTRING *xsts_token, UINT64 *uhs );
 HRESULT HSTRINGToMultiByte( HSTRING hstr, LPSTR *str, UINT32 *str_len );
 HRESULT HttpRequest( LPCWSTR method, LPCWSTR host, LPCWSTR path, LPSTR data,
                      LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *size );
