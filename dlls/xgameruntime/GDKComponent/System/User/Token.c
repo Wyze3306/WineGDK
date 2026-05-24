@@ -662,6 +662,8 @@ HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
                   "\"UseModernGamertag\":true,"
                   "\"SiteName\":\"user.auth.xboxlive.com\","
                   "\"RelyingParty\":\"%s\","
+                  "\"OfferTermsAcceptance\":true,"
+                  "\"AcceptOffers\":true,"
                   "\"ProofKey\":%s}",
                   oauth_str, client_id, device_str, relying_party,
                   proof_key_json );
