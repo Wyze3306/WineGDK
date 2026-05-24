@@ -118,7 +118,11 @@ HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data,
         WINHTTP_NO_HEADER_INDEX
     )) hr = HRESULT_FROM_WIN32( GetLastError() );
 
-    if (SUCCEEDED( hr ) && status / 100 != 2) hr = E_FAIL;
+    if (SUCCEEDED( hr ) && status / 100 != 2)
+    {
+        WARN( "HttpRequest %S%S returned HTTP %lu\n", domain, object, status );
+        hr = E_FAIL;
+    }
 
     /* buffer response data */
     *buffer = NULL;

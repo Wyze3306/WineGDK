@@ -182,6 +182,7 @@ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
         WindowsDeleteString( impl->oauth_token );
         WindowsDeleteString( impl->user_token );
         WindowsDeleteString( impl->xsts_token );
+        if (impl->sisu_token) WindowsDeleteString( impl->sisu_token );
         free( impl );
     }
     return ref;
@@ -542,35 +543,68 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
              * so when SISU is what minted the token the header must use
              * the SISU one or PlayFab silently rejects → sign-in loops. */
             UINT64 token_uhs = user_impl->local_id.value;
+            xsts_token = NULL;
+
             if (DeviceAuth_IsInitialized() && user_impl->oauth_token)
             {
-                HSTRING device_token = NULL;
-                if (SUCCEEDED( DeviceAuth_GetDeviceToken( &device_token ) ) && device_token)
+                /* Reuse the cached SISU token if it's still fresh for
+                 * the requested RP — SISU is rate-limited per AppId
+                 * (HTTP 4xx after the first call) and the AuthorizationToken
+                 * is valid for ~4 h. */
+                time_t now = time( NULL );
+                if (user_impl->sisu_token && user_impl->sisu_expiry > now + 30 &&
+                    strcmp( user_impl->sisu_rp, rp ) == 0)
                 {
-                    /* Use the caller's actual RP for SISU.  Earlier
-                     * attempt pinned it to multiplayer.minecraft.net so
-                     * the audience would match what PlayFab "should"
-                     * accept, but xal/imLinguin's working Bedrock auth
-                     * just uses the per-title playfabapi.com subdomain
-                     * directly — what makes PlayFab accept it isn't the
-                     * audience, it's the title-binding SISU adds via
-                     * AppId 0000000048183522.  Keep the audience the
-                     * game requested so PlayFab's pre-validation
-                     * cross-check passes. */
-                    LPCSTR sisu_rp = rp;
-                    UINT64 sisu_uhs = 0;
-                    dowork_hr = RequestSisuAuthorize(
-                        "0000000048183522",
-                        user_impl->oauth_token, device_token, sisu_rp,
-                        &xsts_token, &sisu_uhs );
-                    WindowsDeleteString( device_token );
-                    if (SUCCEEDED( dowork_hr ) && sisu_uhs)
-                        token_uhs = sisu_uhs;
-                    else if (FAILED( dowork_hr ))
-                        WARN( "SISU for RP %s failed: 0x%08lx — falling back to user-only XSTS\n",
-                              rp, dowork_hr );
+                    HSTRING dup = NULL;
+                    if (SUCCEEDED( WindowsDuplicateString( user_impl->sisu_token, &dup ) ))
+                    {
+                        xsts_token = dup;
+                        token_uhs = user_impl->sisu_uhs;
+                        dowork_hr = S_OK;
+                        TRACE( "reusing cached SISU token for %s (expires in %lds)\n",
+                               rp, (long)(user_impl->sisu_expiry - now) );
+                    }
+                }
+
+                if (FAILED( dowork_hr ))
+                {
+                    HSTRING device_token = NULL;
+                    if (SUCCEEDED( DeviceAuth_GetDeviceToken( &device_token ) ) && device_token)
+                    {
+                        /* xal/imLinguin's working Bedrock-PlayFab auth uses
+                         * the caller's URL as RP unchanged — what unlocks
+                         * PlayFab is SISU's title-binding via AppId
+                         * 0000000048183522, not an audience swap. */
+                        UINT64 sisu_uhs = 0;
+                        dowork_hr = RequestSisuAuthorize(
+                            "0000000048183522",
+                            user_impl->oauth_token, device_token, rp,
+                            &xsts_token, &sisu_uhs );
+                        WindowsDeleteString( device_token );
+                        if (SUCCEEDED( dowork_hr ) && sisu_uhs)
+                        {
+                            token_uhs = sisu_uhs;
+                            /* Cache for the next ~4 h.  Replace whatever
+                             * we had — RP may have changed. */
+                            if (user_impl->sisu_token)
+                                WindowsDeleteString( user_impl->sisu_token );
+                            user_impl->sisu_token = NULL;
+                            if (SUCCEEDED( WindowsDuplicateString( xsts_token,
+                                                                    &user_impl->sisu_token ) ))
+                            {
+                                user_impl->sisu_uhs = sisu_uhs;
+                                user_impl->sisu_expiry = time( NULL ) + 4 * 3600;
+                                strncpy( user_impl->sisu_rp, rp, sizeof(user_impl->sisu_rp) - 1 );
+                                user_impl->sisu_rp[sizeof(user_impl->sisu_rp) - 1] = 0;
+                            }
+                        }
+                        else if (FAILED( dowork_hr ))
+                            WARN( "SISU for RP %s failed: 0x%08lx — falling back to user-only XSTS\n",
+                                  rp, dowork_hr );
+                    }
                 }
             }
+
             if (FAILED( dowork_hr ))
                 dowork_hr = RequestXstsTokenForRelyingParty( user_impl->user_token, rp, &xsts_token );
             if (FAILED( dowork_hr ))
@@ -1044,6 +1078,7 @@ static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
         WindowsDeleteString( impl->oauth_token );
         WindowsDeleteString( impl->user_token );
         WindowsDeleteString( impl->xsts_token );
+        if (impl->sisu_token) WindowsDeleteString( impl->sisu_token );
         free( impl );
     }
     return ref;

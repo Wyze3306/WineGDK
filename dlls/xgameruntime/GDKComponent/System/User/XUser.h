@@ -43,6 +43,16 @@ struct x_user
     HSTRING user_token;
     HSTRING xsts_token;
     CHAR gamertag[128];
+
+    /* Cached SISU AuthorizationToken (PlayFab/multiplayer audience).
+     * SISU's /authorize is rate-limited per AppId — calling it per
+     * outgoing HTTP request earned a long string of HTTP 4xx after
+     * the first hit.  Mint once per RP and reuse until ~30 s before
+     * NotAfter; rebuild after expiry. */
+    HSTRING sisu_token;
+    UINT64 sisu_uhs;
+    time_t sisu_expiry;
+    CHAR sisu_rp[256];
 };
 
 #endif
