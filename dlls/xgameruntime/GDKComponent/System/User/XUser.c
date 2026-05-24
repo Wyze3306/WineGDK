@@ -594,8 +594,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                             {
                                 user_impl->sisu_uhs = sisu_uhs;
                                 user_impl->sisu_expiry = time( NULL ) + 4 * 3600;
-                                strncpy( user_impl->sisu_rp, rp, sizeof(user_impl->sisu_rp) - 1 );
-                                user_impl->sisu_rp[sizeof(user_impl->sisu_rp) - 1] = 0;
+                                lstrcpynA( user_impl->sisu_rp, rp, sizeof(user_impl->sisu_rp) );
                             }
                         }
                         else if (FAILED( dowork_hr ))
