@@ -541,9 +541,21 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 HSTRING device_token = NULL;
                 if (SUCCEEDED( DeviceAuth_GetDeviceToken( &device_token ) ) && device_token)
                 {
+                    /* gophertunnel/ProxyPass auth Bedrock servers using
+                     * RP=https://multiplayer.minecraft.net/ — that's the
+                     * audience PlayFab actually validates against, not the
+                     * per-title playfabapi.com subdomain.  Pin SISU to that
+                     * RP whenever the caller is a PlayFab or multiplayer
+                     * URL so the AuthorizationToken comes back with the
+                     * audience PlayFab will accept; sub-target xboxlive.com
+                     * profile calls keep their original RP. */
+                    LPCSTR sisu_rp = rp;
+                    if (url && (strstr( url, "playfab" ) ||
+                                strstr( url, "multiplayer.minecraft" )))
+                        sisu_rp = "https://multiplayer.minecraft.net/";
                     dowork_hr = RequestSisuAuthorize(
                         "0000000048183522",
-                        user_impl->oauth_token, device_token, rp, &xsts_token );
+                        user_impl->oauth_token, device_token, sisu_rp, &xsts_token );
                     WindowsDeleteString( device_token );
                     if (FAILED( dowork_hr ))
                         WARN( "SISU for RP %s failed: 0x%08lx — falling back to user-only XSTS\n",

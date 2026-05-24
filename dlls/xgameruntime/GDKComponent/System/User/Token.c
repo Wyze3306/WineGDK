@@ -688,16 +688,40 @@ HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
             goto cleanup;
         }
     }
-    TRACE( "RequestSisuAuthorize response size=%llu, first 200 chars: %.200s\n",
-           (unsigned long long)response_size, response );
+    TRACE( "RequestSisuAuthorize response size=%llu\n", (unsigned long long)response_size );
+    /* Dump the full response in WARN so it lands even without +gdkc tracing
+     * — we need to see whether AuthorizationToken is actually in the body
+     * or just TitleToken/UserToken (Microsoft sometimes returns the latter
+     * with a 200 when the device or proof key isn't trusted for the title).
+     * Logged in chunks because WINE's debug helpers truncate long strings. */
+    {
+        SIZE_T off;
+        for (off = 0; off < response_size; off += 800)
+        {
+            SIZE_T n = response_size - off;
+            if (n > 800) n = 800;
+            WARN( "RequestSisuAuthorize response[%llu..%llu]: %.*s\n",
+                  (unsigned long long)off,
+                  (unsigned long long)(off + n),
+                  (int)n, response + off );
+        }
+    }
 
     if (FAILED( hr = ParseJsonObject( response, response_size, &root ) ))
+    {
+        WARN( "RequestSisuAuthorize: ParseJsonObject failed 0x%08lx\n", hr );
         goto cleanup;
+    }
 
     /* SISU returns { AuthorizationToken: { Token, DisplayClaims, ... }, ... } */
     if (FAILED( hr = GetJsonObjectValue( root, L"AuthorizationToken", &auth ) ))
+    {
+        WARN( "RequestSisuAuthorize: AuthorizationToken not found in SISU response 0x%08lx\n", hr );
         goto cleanup;
+    }
     hr = GetJsonStringValue( auth, L"Token", xsts_token );
+    if (FAILED( hr ))
+        WARN( "RequestSisuAuthorize: AuthorizationToken.Token missing 0x%08lx\n", hr );
 
 cleanup:
     if (auth) IJsonObject_Release( auth );
