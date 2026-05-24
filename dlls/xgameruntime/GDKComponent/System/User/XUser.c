@@ -547,18 +547,17 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 HSTRING device_token = NULL;
                 if (SUCCEEDED( DeviceAuth_GetDeviceToken( &device_token ) ) && device_token)
                 {
-                    /* gophertunnel/ProxyPass auth Bedrock servers using
-                     * RP=https://multiplayer.minecraft.net/ — that's the
-                     * audience PlayFab actually validates against, not the
-                     * per-title playfabapi.com subdomain.  Pin SISU to that
-                     * RP whenever the caller is a PlayFab or multiplayer
-                     * URL so the AuthorizationToken comes back with the
-                     * audience PlayFab will accept; sub-target xboxlive.com
-                     * profile calls keep their original RP. */
+                    /* Use the caller's actual RP for SISU.  Earlier
+                     * attempt pinned it to multiplayer.minecraft.net so
+                     * the audience would match what PlayFab "should"
+                     * accept, but xal/imLinguin's working Bedrock auth
+                     * just uses the per-title playfabapi.com subdomain
+                     * directly — what makes PlayFab accept it isn't the
+                     * audience, it's the title-binding SISU adds via
+                     * AppId 0000000048183522.  Keep the audience the
+                     * game requested so PlayFab's pre-validation
+                     * cross-check passes. */
                     LPCSTR sisu_rp = rp;
-                    if (url && (strstr( url, "playfab" ) ||
-                                strstr( url, "multiplayer.minecraft" )))
-                        sisu_rp = "https://multiplayer.minecraft.net/";
                     UINT64 sisu_uhs = 0;
                     dowork_hr = RequestSisuAuthorize(
                         "0000000048183522",
