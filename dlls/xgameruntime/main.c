@@ -223,7 +223,8 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                      *   48 89 74 24 18   mov [rsp+18h], rsi
                      *   57               push rdi
                      *   48 83 EC 30      sub rsp, 30h
-                     * Then within ~20 bytes: 48 8B 49 50 (mov rcx,[rcx+50h]) = mUserManager
+                     * Then within ~30 bytes: 48 8B 49 XX (mov rcx,[rcx+disp8]) = mUserManager
+                     *   v1.26.12 had disp8=0x50, v1.26.20 has disp8=0x38 — accept any.
                      * Then within ~80 bytes: BA 01 00 00 00 (mov edx,1) = NetworkType::XboxLive */
                     static const BYTE prologue[] = {
                         0x48, 0x89, 0x5C, 0x24, 0x10,
@@ -231,18 +232,20 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                         0x57,
                         0x48, 0x83, 0xEC, 0x30
                     };
+                    SIZE_T best_score = 0;
 
                     for (i = 0; i + sizeof(prologue) + 80 < size; i++)
                     {
                         SIZE_T j;
                         BOOLEAN found_usermgr = FALSE, found_xboxlive = FALSE;
+                        SIZE_T score = 0;
 
                         if (memcmp( base + i, prologue, sizeof(prologue) ) != 0)
                             continue;
 
-                        /* Verify: mov rcx,[rcx+50h] within next 20 bytes */
-                        for (j = i + sizeof(prologue); j < i + sizeof(prologue) + 20 && j + 4 < size; j++)
-                            if (base[j]==0x48 && base[j+1]==0x8B && base[j+2]==0x49 && base[j+3]==0x50)
+                        /* Verify: mov rcx,[rcx+disp8] within next 30 bytes (any disp8) */
+                        for (j = i + sizeof(prologue); j < i + sizeof(prologue) + 30 && j + 4 < size; j++)
+                            if (base[j]==0x48 && base[j+1]==0x8B && base[j+2]==0x49)
                                 { found_usermgr = TRUE; break; }
 
                         if (!found_usermgr) continue;
@@ -254,7 +257,17 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 
                         if (!found_xboxlive) continue;
 
+                        /* Tighten the match: prefer functions that ALSO have
+                         * `call <near>` (E8 ...) within +90 — isSignedIn calls
+                         * the user-manager's isConnected.  This rules out any
+                         * inline/stub function that happens to share the
+                         * prologue but doesn't dispatch. */
+                        for (j = i + sizeof(prologue); j < i + sizeof(prologue) + 90 && j < size; j++)
+                            if (base[j] == 0xE8) { score++; break; }
+
+                        if (!score) continue;
                         addr = base + i;
+                        best_score = score;
                         break;
                     }
 
