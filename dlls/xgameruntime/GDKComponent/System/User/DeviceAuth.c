@@ -253,25 +253,100 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
     status = BCryptOpenAlgorithmProvider( &g_sha256_alg, BCRYPT_SHA256_ALGORITHM, NULL, 0 );
     if (status) { WARN( "BCryptOpenAlgorithmProvider SHA256 failed: 0x%08lx\n", status ); return HRESULT_FROM_NT(status); }
 
-    /* Generate P-256 key pair */
-    status = BCryptGenerateKeyPair( g_ecdsa_alg, &g_device_key, 256, 0 );
-    if (status) { WARN( "BCryptGenerateKeyPair failed: 0x%08lx\n", status ); return HRESULT_FROM_NT(status); }
+    /* Try to reuse the device identity persisted from a previous run.
+     * Microsoft tracks "trusted devices" per Xbox account; regenerating a
+     * fresh UUID + EC key pair on every launch tells SISU we're a brand
+     * new device every time, and the AuthorizationToken stays provisional
+     * (WebPage in the response).  Persisting the UUID + ECCPRIVATE blob
+     * in HKCU\\Software\\Wine\\WineGDK\\Device lets MS see the same
+     * device repeated and trust may eventually establish. */
+    {
+        HKEY hKey;
+        DWORD id_size = sizeof( g_device_id );
+        BYTE key_blob[256];
+        DWORD key_size = sizeof( key_blob );
+        DWORD type;
+        BOOLEAN loaded = FALSE;
+        if (RegOpenKeyExA( HKEY_CURRENT_USER,
+                           "Software\\Wine\\WineGDK\\Device", 0, KEY_READ,
+                           &hKey ) == ERROR_SUCCESS)
+        {
+            if (RegQueryValueExA( hKey, "DeviceId", NULL, &type,
+                                   (LPBYTE)g_device_id, &id_size ) == ERROR_SUCCESS
+                && type == REG_SZ
+                && RegQueryValueExA( hKey, "PrivateKey", NULL, &type,
+                                      key_blob, &key_size ) == ERROR_SUCCESS
+                && type == REG_BINARY
+                && BCryptImportKeyPair( g_ecdsa_alg, NULL,
+                                         BCRYPT_ECCPRIVATE_BLOB, &g_device_key,
+                                         key_blob, key_size, 0 ) == 0)
+            {
+                /* Export public key for ProofKey */
+                if (BCryptExportKey( g_device_key, NULL, BCRYPT_ECCPUBLIC_BLOB,
+                                      blob, sizeof(blob), &blob_size, 0 ) == 0)
+                {
+                    memcpy( g_pubkey_x, blob + sizeof(BCRYPT_ECCKEY_BLOB), 32 );
+                    memcpy( g_pubkey_y, blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 32 );
+                    loaded = TRUE;
+                    TRACE( "reusing persisted device id=%s\n", g_device_id );
+                }
+                else
+                {
+                    BCryptDestroyKey( g_device_key );
+                    g_device_key = NULL;
+                }
+            }
+            RegCloseKey( hKey );
+        }
 
-    status = BCryptFinalizeKeyPair( g_device_key, 0 );
-    if (status) { WARN( "BCryptFinalizeKeyPair failed: 0x%08lx\n", status ); return HRESULT_FROM_NT(status); }
+        if (!loaded)
+        {
+            /* Generate P-256 key pair */
+            status = BCryptGenerateKeyPair( g_ecdsa_alg, &g_device_key, 256, 0 );
+            if (status) { WARN( "BCryptGenerateKeyPair failed: 0x%08lx\n", status ); return HRESULT_FROM_NT(status); }
 
-    /* Export public key */
-    status = BCryptExportKey( g_device_key, NULL, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &blob_size, 0 );
-    if (status) { WARN( "BCryptExportKey failed: 0x%08lx\n", status ); return HRESULT_FROM_NT(status); }
+            status = BCryptFinalizeKeyPair( g_device_key, 0 );
+            if (status) { WARN( "BCryptFinalizeKeyPair failed: 0x%08lx\n", status ); return HRESULT_FROM_NT(status); }
 
-    ecc_blob = (BCRYPT_ECCKEY_BLOB *)blob;
-    memcpy( g_pubkey_x, blob + sizeof(BCRYPT_ECCKEY_BLOB), 32 );
-    memcpy( g_pubkey_y, blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 32 );
+            /* Export public key */
+            status = BCryptExportKey( g_device_key, NULL, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &blob_size, 0 );
+            if (status) { WARN( "BCryptExportKey failed: 0x%08lx\n", status ); return HRESULT_FROM_NT(status); }
 
-    TRACE( "generated EC P-256 key pair, cbKey=%lu\n", ecc_blob->cbKey );
+            ecc_blob = (BCRYPT_ECCKEY_BLOB *)blob;
+            memcpy( g_pubkey_x, blob + sizeof(BCRYPT_ECCKEY_BLOB), 32 );
+            memcpy( g_pubkey_y, blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 32 );
 
-    /* Generate device ID */
-    generate_uuid( g_device_id );
+            TRACE( "generated EC P-256 key pair, cbKey=%lu\n", ecc_blob->cbKey );
+
+            /* Generate device ID */
+            generate_uuid( g_device_id );
+
+            /* Persist for the next launch.  Export ECCPRIVATE_BLOB (108 bytes
+             * for P-256: 8-byte header + X[32] + Y[32] + D[32]) so we can
+             * BCryptImportKeyPair it next time.  Best-effort; failures here
+             * just mean next launch regenerates. */
+            {
+                BYTE priv_blob[256];
+                ULONG priv_size = 0;
+                if (BCryptExportKey( g_device_key, NULL, BCRYPT_ECCPRIVATE_BLOB,
+                                      priv_blob, sizeof(priv_blob), &priv_size, 0 ) == 0
+                    && RegCreateKeyExA( HKEY_CURRENT_USER,
+                                         "Software\\Wine\\WineGDK\\Device", 0, NULL,
+                                         REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL,
+                                         &hKey, NULL ) == ERROR_SUCCESS)
+                {
+                    RegSetValueExA( hKey, "DeviceId", 0, REG_SZ,
+                                     (const BYTE *)g_device_id,
+                                     strlen( g_device_id ) + 1 );
+                    RegSetValueExA( hKey, "PrivateKey", 0, REG_BINARY,
+                                     priv_blob, priv_size );
+                    RegCloseKey( hKey );
+                    TRACE( "persisted device id=%s + EC private key (%lu bytes)\n",
+                           g_device_id, priv_size );
+                }
+            }
+        }
+    }
 
     /* Get ProofKey JSON */
     hr = DeviceAuth_GetProofKeyJson( &proof_key_json );
