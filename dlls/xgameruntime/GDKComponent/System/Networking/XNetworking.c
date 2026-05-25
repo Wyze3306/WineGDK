@@ -154,20 +154,90 @@ static BOOLEAN WINAPI x_networking_XNetworkingUnregisterPreferredLocalUdpMultipl
 
 static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsync( IXNetworkingImpl *iface, LPCSTR url, XAsyncBlock *asyncBlock )
 {
-    FIXME( "iface %p, url %p, asyncBlock %p stub!\n", iface, url, asyncBlock );
-    return E_NOTIMPL;
+    /* MC's PlayFab / Servers-list path on Win32 calls the ANSI variant
+     * of this function for every URL it wants to talk to.  Returning
+     * E_NOTIMPL silently broke the chain: the game waits forever for
+     * a "security info" verdict before fetching the featured Servers
+     * list, so the tab stays in the spinner state.
+     *
+     * Delegate to the UTF16 variant after a CP_UTF8→UTF-16 conversion.
+     * HTTPClientProvider does the real HTTP probe, completes the
+     * XAsyncBlock, and lets the game proceed.  Ownership: the wide
+     * URL string is leaked here — it lives until the async completes
+     * and HTTPClientProvider's Cleanup branch should free it (we
+     * pass it through UrlSecurityInfoContext->url so the provider
+     * owns the lifecycle alongside its context). */
+    HRESULT status;
+    IXThreadingImpl *threadingImpl;
+    WCHAR *wurl;
+    int wlen;
+
+    TRACE( "iface %p, url %s, asyncBlock %p\n", iface, url ? url : "(null)", asyncBlock );
+
+    if (!url) return E_POINTER;
+
+    wlen = MultiByteToWideChar( CP_UTF8, 0, url, -1, NULL, 0 );
+    if (wlen <= 0) return HRESULT_FROM_WIN32( GetLastError() );
+    if (!(wurl = malloc( wlen * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
+    if (MultiByteToWideChar( CP_UTF8, 0, url, -1, wurl, wlen ) <= 0)
+    {
+        free( wurl );
+        return HRESULT_FROM_WIN32( GetLastError() );
+    }
+
+    status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
+    if ( FAILED( status ) ) { free( wurl ); return status; }
+
+    struct UrlSecurityInfoContext *context = (struct UrlSecurityInfoContext *)malloc( sizeof( struct UrlSecurityInfoContext ) );
+    if ( !context ) { free( wurl ); return E_OUTOFMEMORY; }
+
+    /* Zero the context so HTTPClientProvider sees uninitialised fields
+     * as NULL and decides safely. */
+    memset( context, 0, sizeof( *context ) );
+    context->url = wurl;
+
+    status = IXThreadingImpl_XAsyncBegin( threadingImpl, asyncBlock, context, NULL,
+                                           "XNetworkingQuerySecurityInformationForUrlAsync", HTTPClientProvider );
+    if ( FAILED( status ) )
+    {
+        free( context );
+        free( wurl );
+    }
+    return status;
 }
 
 static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyncResultSize( IXNetworkingImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *securityInformationBufferByteCount )
 {
-    FIXME( "iface %p, asyncBlock %p, securityInformationBufferByteCount %p stub!\n", iface, asyncBlock, securityInformationBufferByteCount );
-    return E_NOTIMPL;
+    HRESULT status;
+    IXThreadingImpl *threadingImpl;
+
+    TRACE( "iface %p, asyncBlock %p, securityInformationBufferByteCount %p\n", iface, asyncBlock, securityInformationBufferByteCount );
+
+    status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
+    if ( FAILED( status ) ) return status;
+    return IXThreadingImpl_XAsyncGetResultSize( threadingImpl, asyncBlock, securityInformationBufferByteCount );
 }
 
 static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyncResult( IXNetworkingImpl *iface, XAsyncBlock *asyncBlock, SIZE_T securityInformationBufferByteCount, SIZE_T *securityInformationBufferByteCountUsed, UINT8 *securityInformationBuffer, XNetworkingSecurityInformation **securityInformation )
 {
-    FIXME( "iface %p, asyncBlock %p, securityInformationBufferByteCount %lld, securityInformationBufferByteCountUsed %p, securityInformationBuffer %p, securityInformation %p stub!\n", iface, asyncBlock, securityInformationBufferByteCount, securityInformationBufferByteCountUsed, securityInformationBuffer, securityInformation );
-    return E_NOTIMPL;
+    HRESULT status;
+    IXThreadingImpl *threadingImpl;
+
+    TRACE( "iface %p, asyncBlock %p, bufferByteCount %lld, buffer %p, secInfo %p\n",
+           iface, asyncBlock, securityInformationBufferByteCount, securityInformationBuffer, securityInformation );
+
+    status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
+    if ( FAILED( status ) ) return status;
+
+    status = IXThreadingImpl_XAsyncGetResult( threadingImpl, asyncBlock, NULL,
+                                               securityInformationBufferByteCount,
+                                               securityInformationBuffer,
+                                               securityInformationBufferByteCountUsed );
+    if ( FAILED( status ) ) return status;
+
+    if (securityInformation)
+        *securityInformation = (XNetworkingSecurityInformation *)securityInformationBuffer;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlUtf16Async( IXNetworkingImpl *iface, LPCWSTR url, XAsyncBlock *asyncBlock )
