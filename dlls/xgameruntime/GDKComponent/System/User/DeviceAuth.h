@@ -8,6 +8,7 @@
 
 #include "../../../private.h"
 #include <bcrypt.h>
+#include <wincrypt.h>
 
 /* Initialize device auth - generate key pair and get device token */
 HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token );

@@ -253,6 +253,90 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
     status = BCryptOpenAlgorithmProvider( &g_sha256_alg, BCRYPT_SHA256_ALGORITHM, NULL, 0 );
     if (status) { WARN( "BCryptOpenAlgorithmProvider SHA256 failed: 0x%08lx\n", status ); return HRESULT_FROM_NT(status); }
 
+    /* Pre-auth bypass: Wine 11.1's GnuTLS schannel ClientHello is
+     * fingerprinted by Microsoft Azure — *.auth.xboxlive.com TCP-RSTs the
+     * HTTP body right after the handshake, breaking our /device/authenticate
+     * POST with 0x80072746 and surfacing as MC's "Llama 0x80072746" dialog.
+     * The host-side launcher's xbl_preauth() does the same call with the
+     * system OpenSSL stack and persists {device_id, ecc_private_blob, device_
+     * token} as a JSON file whose Wine path is in WINEGDK_PREAUTH_DEVICE.
+     * When that file exists we just import the EC key + device token from
+     * it and skip the broken POST. */
+    {
+        const char *preauth_path = getenv( "WINEGDK_PREAUTH_DEVICE" );
+        if (preauth_path && *preauth_path)
+        {
+            HANDLE fh = CreateFileA( preauth_path, GENERIC_READ, FILE_SHARE_READ,
+                                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
+            if (fh != INVALID_HANDLE_VALUE)
+            {
+                DWORD sz = GetFileSize( fh, NULL ), rd = 0;
+                if (sz > 0 && sz < 64 * 1024)
+                {
+                    LPSTR buf = calloc( 1, sz + 1 );
+                    if (buf && ReadFile( fh, buf, sz, &rd, NULL ) && rd == sz)
+                    {
+                        IJsonObject *root = NULL;
+                        HSTRING tok = NULL, blob_b64 = NULL, devid = NULL;
+                        if (SUCCEEDED( ParseJsonObject( buf, sz, &root ) ))
+                        {
+                            (void)GetJsonStringValue( root, L"device_token", &tok );
+                            (void)GetJsonStringValue( root, L"ecc_private_blob_b64", &blob_b64 );
+                            (void)GetJsonStringValue( root, L"device_id", &devid );
+                        }
+                        if (tok && blob_b64)
+                        {
+                            /* base64-decode the ECC private blob and import */
+                            LPSTR blob_mb = NULL; UINT32 blob_len = 0;
+                            HSTRINGToMultiByte( blob_b64, &blob_mb, &blob_len );
+                            DWORD raw_size = 0;
+                            CryptStringToBinaryA( blob_mb, blob_len, CRYPT_STRING_BASE64,
+                                                  NULL, &raw_size, NULL, NULL );
+                            BYTE *raw = malloc( raw_size );
+                            if (raw && CryptStringToBinaryA( blob_mb, blob_len, CRYPT_STRING_BASE64,
+                                                              raw, &raw_size, NULL, NULL )
+                                && BCryptImportKeyPair( g_ecdsa_alg, NULL,
+                                                         BCRYPT_ECCPRIVATE_BLOB, &g_device_key,
+                                                         raw, raw_size, 0 ) == 0)
+                            {
+                                /* Cache public key components for proof-key building */
+                                if (BCryptExportKey( g_device_key, NULL, BCRYPT_ECCPUBLIC_BLOB,
+                                                      blob, sizeof(blob), &blob_size, 0 ) == 0)
+                                {
+                                    memcpy( g_pubkey_x, blob + sizeof(BCRYPT_ECCKEY_BLOB), 32 );
+                                    memcpy( g_pubkey_y, blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 32 );
+                                }
+                                if (devid)
+                                {
+                                    LPSTR id_mb = NULL; UINT32 id_len = 0;
+                                    HSTRINGToMultiByte( devid, &id_mb, &id_len );
+                                    if (id_mb && id_len < sizeof(g_device_id))
+                                        memcpy( g_device_id, id_mb, id_len + 1 );
+                                    free( id_mb );
+                                }
+                                /* Steal the device token straight from the JSON */
+                                WindowsDuplicateString( tok, &g_device_token );
+                                g_initialized = TRUE;
+                                ERR( "preauth: loaded device token (%u-byte ECC blob) for id=%s — skipping Wine HTTP\n",
+                                     raw_size, g_device_id );
+                            }
+                            free( raw );
+                            free( blob_mb );
+                        }
+                        if (tok) WindowsDeleteString( tok );
+                        if (blob_b64) WindowsDeleteString( blob_b64 );
+                        if (devid) WindowsDeleteString( devid );
+                        if (root) IJsonObject_Release( root );
+                    }
+                    free( buf );
+                }
+                CloseHandle( fh );
+                if (g_initialized) return S_OK;
+            }
+            else WARN( "preauth: WINEGDK_PREAUTH_DEVICE=%s but file unreadable\n", preauth_path );
+        }
+    }
+
     /* Try to reuse the device identity persisted from a previous run.
      * Microsoft tracks "trusted devices" per Xbox account; regenerating a
      * fresh UUID + EC key pair on every launch tells SISU we're a brand
