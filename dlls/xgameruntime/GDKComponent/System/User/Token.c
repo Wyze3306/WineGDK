@@ -71,8 +71,14 @@ HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data,
     HRESULT hr = S_OK;
     DWORD status;
 
+    /* Use the same User-Agent xal/imLinguin's Bedrock-PlayFab auth uses —
+     * Xbox Live's *.auth.xboxlive.com edges silently TCP-RST the connection
+     * after seeing the HTTP request body when the UA doesn't look like a
+     * known XAL/XSAPI client (we got `sock_recv recv error 10054` against
+     * device.auth.xboxlive.com with "WineGDK/1.0"). Matches the XAL Win32
+     * SDK string so the edge accepts the POST and replies normally. */
     if (!(session = WinHttpOpen(
-        L"WineGDK/1.0",
+        L"XAL Xbox Live Game (Windows; SDK; 1.0.0.0)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
