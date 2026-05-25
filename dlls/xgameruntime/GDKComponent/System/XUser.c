@@ -22,7 +22,9 @@
 #include "../../private.h"
 #include "../../userprovider.h"
 #include "../../util.h"
+#include <ntdef.h>
 #include <time.h>
+#include <wincrypt.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -80,6 +82,8 @@ struct XUser
     HSTRING accessToken;
     HSTRING refreshToken;
     HSTRING userToken;
+
+    BCRYPT_KEY_HANDLE key;
 };
 
 static struct XUser *impl_from_IUser( IUser *iface )
@@ -106,6 +110,7 @@ static ULONG WINAPI user_Release( IUser *iface )
         if (impl->accessToken) WindowsDeleteString( impl->accessToken );
         if (impl->refreshToken) WindowsDeleteString( impl->refreshToken );
         if (impl->userToken) WindowsDeleteString( impl->userToken );
+        if (impl->key) BCryptDestroyKey( impl->key );
         free( impl );
     }
     return ref;
@@ -321,14 +326,61 @@ static HRESULT WINAPI user_FetchProfileSettings( IUser *iface, const WCHAR *sett
 
 static HRESULT WINAPI user_GenerateKeyPair( IUser *iface )
 {
-    FIXME( "iface %p stub!\n", iface );
-    return E_NOTIMPL;
+    struct XUser *impl = impl_from_IUser( iface );
+    BCRYPT_ALG_HANDLE ecdsa = NULL;
+    NTSTATUS status;
+
+    TRACE( "iface %p.\n", iface );
+
+    if (impl->key)
+    {
+        BCryptDestroyKey( impl->key );
+        impl->key = NULL;
+    }
+
+    if (!NT_SUCCESS(status = BCryptOpenAlgorithmProvider( &ecdsa, BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0 ))) goto error;
+    if (!NT_SUCCESS(status = BCryptGenerateKeyPair( ecdsa, &impl->key, 256, 0 ))) goto error;
+    if (!NT_SUCCESS(status = BCryptFinalizeKeyPair( impl->key, 0 ))) goto error;
+    goto cleanup;
+
+error:
+    if (impl->key)
+    {
+        BCryptDestroyKey( impl->key );
+        impl->key = NULL;
+    }
+cleanup:
+    if (ecdsa) BCryptCloseAlgorithmProvider( ecdsa, 0 );
+    return HRESULT_FROM_NT( status );
 }
 
 static HRESULT WINAPI user_SignData( IUser *iface, ULONG dataSize, UCHAR *data, ULONG signatureSize, UCHAR *signature )
 {
-    FIXME( "iface %p, dataSize %lu, data %p, signatureSize %lu, signature %p stub!\n", iface, dataSize, data, signatureSize, signature );
-    return E_NOTIMPL;
+    struct XUser *impl = impl_from_IUser( iface );
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE object = NULL;
+    HRESULT hr = S_OK;
+    NTSTATUS status;
+    UCHAR hash[32];
+    ULONG dummy;
+
+    TRACE( "iface %p, dataSize %lu, data %p, signatureSize %lu, signature %p.\n", iface, dataSize, data, signatureSize, signature );
+
+    /* ES256 signs sha-256 hash of data */
+    if (signatureSize < 64) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+    if (!NT_SUCCESS(status = BCryptOpenAlgorithmProvider( &algorithm, BCRYPT_SHA256_ALGORITHM, NULL, 0 ))) goto error;
+    if (!NT_SUCCESS(status = BCryptCreateHash( algorithm, &object, NULL, 0, NULL, 0, 0 ))) goto error;
+    if (!NT_SUCCESS(status = BCryptHashData( object, data, dataSize, 0 ))) goto error;
+    if (!NT_SUCCESS(status = BCryptFinishHash( object, hash, 32, 0 ))) goto error;
+    if (!NT_SUCCESS(status = BCryptSignHash( impl->key, NULL, hash, 32, signature, signatureSize, &dummy, 0 ))) goto error;
+    goto cleanup;
+
+error:
+    hr = HRESULT_FROM_NT( status );
+cleanup:
+    if (object) BCryptDestroyHash( object );
+    if (algorithm) BCryptCloseAlgorithmProvider( algorithm, 0 );
+    return hr;
 }
 
 static HRESULT WINAPI user_CacheEndpoints( IUser *iface )
