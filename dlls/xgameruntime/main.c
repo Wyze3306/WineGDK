@@ -294,9 +294,22 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 
     /* Patch 2: NOP the credential check gate that blocks XblInitialize.
      * The game's XboxLiveServices::signIn checks a credential provider
-     * which returns E_FAIL without Gaming Services. This JL skips XblInitialize.
-     * Pattern: cmp [rbp-0x18], 0; JL (83 7D E8 00 0F 8C)
-     * followed by xorps xmm0,xmm0; xor eax,eax (0F 57 C0 33 C0) */
+     * (call returns into a local at [rbp+disp8]); a JL on that result skips
+     * the entire "user is signed in" success path including XblInitialize.
+     *
+     * Shape we look for: a 4-byte `cmp DWORD PTR [rbp+disp8], 0` (83 7D
+     * disp8 00) followed by the 6-byte long-form JL (0F 8C off32) followed
+     * (after the 6-byte JL) by `xorps xmm0, xmm0` (0F 57 C0).  Three
+     * suffixes after xorps are accepted because compiler output varies
+     * across MC versions:
+     *   - `33 C0`           (xor eax, eax)         ≤ 1.26.12
+     *   - `F3 0F 7F 45 ??`  (movdqu [rbp+disp8], xmm0)  1.26.20+
+     *   - `F3 0F 7F 85 ?? ?? ?? ??` (movdqu [rbp+disp32], xmm0) wide form
+     *
+     * The disp8 of the cmp also changed between versions (was 0xE8 / rbp-24,
+     * now 0xFF / rbp-1), so we no longer pin it.  To stay precise we still
+     * require the JL to target a forward offset of at least +30 (typical
+     * for the failure-skip branch — backward-jumping JLs are loop tails). */
     {
         static BOOLEAN patched2 = FALSE;
         if (!patched2)
@@ -309,29 +322,41 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                 {
                     BYTE *base = (BYTE *)mi2.lpBaseOfDll;
                     SIZE_T size = mi2.SizeOfImage;
-                    static const BYTE pat2[] = { 0x83, 0x7D, 0xE8, 0x00, 0x0F, 0x8C };
-                    static const BYTE verify[] = { 0x0F, 0x57, 0xC0, 0x33, 0xC0 };
+                    static const BYTE xorps[] = { 0x0F, 0x57, 0xC0 };
                     SIZE_T i;
                     DWORD op;
 
-                    for (i = 0; i + sizeof(pat2) + 10 < size; i++)
+                    for (i = 0; i + 16 < size; i++)
                     {
-                        if (memcmp( base + i, pat2, sizeof(pat2) ) != 0) continue;
-                        /* Verify: after the 6-byte JL (at +4), check for xorps pattern */
-                        if (i + 10 + sizeof(verify) < size &&
-                            memcmp( base + i + 10, verify, sizeof(verify) ) == 0)
+                        /* cmp DWORD PTR [rbp+disp8], 0  (83 7D ?? 00) */
+                        if (base[i] != 0x83 || base[i+1] != 0x7D || base[i+3] != 0x00) continue;
+                        /* 6-byte JL long form right after */
+                        if (base[i+4] != 0x0F || base[i+5] != 0x8C) continue;
+                        /* JL must jump forward by >=30 (real gates always
+                         * skip a real chunk of success-path code) */
+                        INT32 jdisp = *(INT32 *)(base + i + 6);
+                        if (jdisp < 30 || jdisp > 0x10000) continue;
+                        /* After the 6-byte JL: xorps xmm0, xmm0 */
+                        if (memcmp( base + i + 10, xorps, sizeof(xorps) ) != 0) continue;
+                        /* And one of the accepted "zero-the-local" suffixes */
+                        BYTE *s = base + i + 13;
+                        BOOLEAN suffix_ok = (s[0] == 0x33 && s[1] == 0xC0) ||                       /* xor eax,eax */
+                                            (s[0] == 0xF3 && s[1] == 0x0F && s[2] == 0x7F && s[3] == 0x45) || /* movdqu [rbp+d8],xmm0 */
+                                            (s[0] == 0xF3 && s[1] == 0x0F && s[2] == 0x7F && s[3] == 0x85);   /* movdqu [rbp+d32],xmm0 */
+                        if (!suffix_ok) continue;
+
+                        /* NOP the JL: 0F 8C xx xx xx xx → 66 0F 1F 44 00 00 */
+                        if (VirtualProtect( base + i + 4, 6, PAGE_EXECUTE_READWRITE, &op ))
                         {
-                            /* NOP the JL: 0F 8C xx xx xx xx → 66 0F 1F 44 00 00 */
-                            if (VirtualProtect( base + i + 4, 6, PAGE_EXECUTE_READWRITE, &op ))
-                            {
-                                base[i+4] = 0x66; base[i+5] = 0x0F; base[i+6] = 0x1F;
-                                base[i+7] = 0x44; base[i+8] = 0x00; base[i+9] = 0x00;
-                                VirtualProtect( base + i + 4, 6, op, &op );
-                                ERR( "patched XblInitialize gate at %p (RVA 0x%lx)\n", base + i + 4, (ULONG_PTR)(i + 4) );
-                                patched2 = TRUE;
-                            }
-                            break;
+                            base[i+4] = 0x66; base[i+5] = 0x0F; base[i+6] = 0x1F;
+                            base[i+7] = 0x44; base[i+8] = 0x00; base[i+9] = 0x00;
+                            VirtualProtect( base + i + 4, 6, op, &op );
+                            ERR( "patched XblInitialize gate at %p (RVA 0x%lx, disp8=%d, jdisp=+%d)\n",
+                                 base + i + 4, (ULONG_PTR)(i + 4),
+                                 (signed char)base[i+2], jdisp );
+                            patched2 = TRUE;
                         }
+                        break;
                     }
                     if (!patched2)
                         ERR( "XblInitialize gate pattern not found\n" );
