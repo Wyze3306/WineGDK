@@ -652,12 +652,30 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
 
             if (DeviceAuth_IsInitialized() && user_impl->oauth_token)
             {
+                /* Preauth: when MC asks for the http://xboxlive.com RP
+                 * (Friends/Social), serve the xbl_token the launcher
+                 * pre-fetched and stashed into impl->xsts_token — that
+                 * token IS a SISU AuthorizationToken for that exact RP
+                 * with the matching uhs in impl->local_id.value. Hitting
+                 * SISU from Wine would just TCP-RST against GnuTLS. */
+                time_t now = time( NULL );
+                if (user_impl->xsts_token && !strcmp( rp, "http://xboxlive.com" ))
+                {
+                    HSTRING dup = NULL;
+                    if (SUCCEEDED( WindowsDuplicateString( user_impl->xsts_token, &dup ) ))
+                    {
+                        xsts_token = dup;
+                        token_uhs = user_impl->local_id.value;
+                        dowork_hr = S_OK;
+                        TRACE( "reusing preauth xbl_token for %s\n", rp );
+                    }
+                }
                 /* Reuse the cached SISU token if it's still fresh for
                  * the requested RP — SISU is rate-limited per AppId
                  * (HTTP 4xx after the first call) and the AuthorizationToken
                  * is valid for ~4 h. */
-                time_t now = time( NULL );
-                if (user_impl->sisu_token && user_impl->sisu_expiry > now + 30 &&
+                if (FAILED( dowork_hr ) &&
+                    user_impl->sisu_token && user_impl->sisu_expiry > now + 30 &&
                     strcmp( user_impl->sisu_rp, rp ) == 0)
                 {
                     HSTRING dup = NULL;
