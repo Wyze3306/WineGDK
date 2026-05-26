@@ -27,6 +27,17 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
+/* Same shape as the DeviceAuth.c local helper — the macro isn't exported. */
+static inline HRESULT GetJsonStringValue( IJsonObject *object, LPCWSTR key, HSTRING *value )
+{
+    HSTRING_HEADER key_hdr;
+    HSTRING key_hstr;
+    HRESULT hr;
+    if (FAILED( hr = WindowsCreateStringReference( key, wcslen( key ), &key_hdr, &key_hstr ) ))
+        return hr;
+    return IJsonObject_GetNamedString( object, key_hstr, value );
+}
+
 static const struct IXUserImplVtbl x_user_vtbl;
 static const struct IXUserGamertagVtbl x_user_gt_vtbl;
 
@@ -106,18 +117,112 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
         }
     }
 
-    if (FAILED( hr = RequestUserToken( impl->oauth_token, &impl->user_token, &impl->local_id ) ))
+    /* Pre-auth bypass for the rest of the Xbox Live chain. Wine 11.1/GnuTLS
+     * gets TCP-RSTed by user.auth + xsts.auth + sisu.xboxlive after the body
+     * lands, so the launcher pre-fetches user_token, the http://xboxlive.com
+     * XSTS token (which carries xuid/gamertag/agegroup), and the PlayFab-RP
+     * SISU token, all into the device.json blob whose Wine path is in
+     * $WINEGDK_PREAUTH_DEVICE. If the file has those fields we use them
+     * straight and skip RequestUserToken + RequestXstsToken entirely. The
+     * Wine path still runs as a fallback for completeness. */
+    BOOLEAN preauth_done = FALSE;
     {
-        TRACE( "failed to get user token\n" );
-        IXUserImpl_Release( &impl->IXUserImpl_iface );
-        return hr;
+        const char *preauth_path = getenv( "WINEGDK_PREAUTH_DEVICE" );
+        if (preauth_path && *preauth_path)
+        {
+            HANDLE fh = CreateFileA( preauth_path, GENERIC_READ, FILE_SHARE_READ,
+                                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
+            if (fh != INVALID_HANDLE_VALUE)
+            {
+                DWORD sz = GetFileSize( fh, NULL ), rd = 0;
+                LPSTR buf = (sz > 0 && sz < 65536) ? calloc( 1, sz + 1 ) : NULL;
+                if (buf && ReadFile( fh, buf, sz, &rd, NULL ) && rd == sz)
+                {
+                    IJsonObject *root = NULL;
+                    if (SUCCEEDED( ParseJsonObject( buf, sz, &root ) ) && root)
+                    {
+                        HSTRING utok = NULL, xtok = NULL, stok = NULL;
+                        HSTRING gtg = NULL, xuid_s = NULL, agg_s = NULL;
+                        HSTRING uhs_s = NULL, sisu_uhs_s = NULL, sisu_rp_s = NULL;
+                        (void)GetJsonStringValue( root, L"user_token", &utok );
+                        (void)GetJsonStringValue( root, L"xbl_token", &xtok );
+                        (void)GetJsonStringValue( root, L"sisu_token", &stok );
+                        (void)GetJsonStringValue( root, L"xbl_gamertag", &gtg );
+                        (void)GetJsonStringValue( root, L"xbl_xuid", &xuid_s );
+                        (void)GetJsonStringValue( root, L"xbl_age_group", &agg_s );
+                        (void)GetJsonStringValue( root, L"xbl_uhs", &uhs_s );
+                        (void)GetJsonStringValue( root, L"sisu_uhs", &sisu_uhs_s );
+                        (void)GetJsonStringValue( root, L"sisu_rp", &sisu_rp_s );
+                        if (utok && xtok && xuid_s)
+                        {
+                            LPSTR mb = NULL; UINT32 ml = 0;
+                            WindowsDuplicateString( utok, &impl->user_token );
+                            WindowsDuplicateString( xtok, &impl->xsts_token );
+                            /* xuid */
+                            if (SUCCEEDED( HSTRINGToMultiByte( xuid_s, &mb, &ml ) ) && mb)
+                            { impl->xuid = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+                            /* gamertag */
+                            if (gtg && SUCCEEDED( HSTRINGToMultiByte( gtg, &mb, &ml ) ) && mb)
+                            { lstrcpynA( impl->gamertag, mb, sizeof(impl->gamertag) ); free( mb ); mb = NULL; }
+                            /* age group: "Adult" → 3, "Teen" → 2, "Child" → 1 */
+                            if (agg_s && SUCCEEDED( HSTRINGToMultiByte( agg_s, &mb, &ml ) ) && mb)
+                            {
+                                if (!lstrcmpiA( mb, "Adult" )) impl->age_group = XUserAgeGroup_Adult;
+                                else if (!lstrcmpiA( mb, "Teen" )) impl->age_group = XUserAgeGroup_Teen;
+                                else impl->age_group = XUserAgeGroup_Child;
+                                free( mb ); mb = NULL;
+                            }
+                            /* local_id uses the xboxlive-RP uhs */
+                            if (uhs_s && SUCCEEDED( HSTRINGToMultiByte( uhs_s, &mb, &ml ) ) && mb)
+                            { impl->local_id.value = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+                            else impl->local_id.value = impl->xuid;
+                            /* SISU cache for the PlayFab RP */
+                            if (stok && sisu_uhs_s && sisu_rp_s)
+                            {
+                                WindowsDuplicateString( stok, &impl->sisu_token );
+                                if (SUCCEEDED( HSTRINGToMultiByte( sisu_uhs_s, &mb, &ml ) ) && mb)
+                                { impl->sisu_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+                                if (SUCCEEDED( HSTRINGToMultiByte( sisu_rp_s, &mb, &ml ) ) && mb)
+                                { lstrcpynA( impl->sisu_rp, mb, sizeof(impl->sisu_rp) ); free( mb ); mb = NULL; }
+                                impl->sisu_expiry = time( NULL ) + 4 * 3600;
+                            }
+                            preauth_done = TRUE;
+                            ERR( "preauth: loaded user/XSTS tokens for xuid=%llu gtg=%s — skipping Wine HTTP\n",
+                                 (unsigned long long)impl->xuid, impl->gamertag );
+                        }
+                        if (utok) WindowsDeleteString( utok );
+                        if (xtok) WindowsDeleteString( xtok );
+                        if (stok) WindowsDeleteString( stok );
+                        if (gtg) WindowsDeleteString( gtg );
+                        if (xuid_s) WindowsDeleteString( xuid_s );
+                        if (agg_s) WindowsDeleteString( agg_s );
+                        if (uhs_s) WindowsDeleteString( uhs_s );
+                        if (sisu_uhs_s) WindowsDeleteString( sisu_uhs_s );
+                        if (sisu_rp_s) WindowsDeleteString( sisu_rp_s );
+                        IJsonObject_Release( root );
+                    }
+                }
+                free( buf );
+                CloseHandle( fh );
+            }
+        }
     }
 
-    if (FAILED( hr = RequestXstsToken( impl->user_token, &impl->xsts_token, &impl->xuid, &impl->age_group, impl->gamertag, sizeof(impl->gamertag) ) ))
+    if (!preauth_done)
     {
-        TRACE( "failed to get xsts token\n" );
-        IXUserImpl_Release( &impl->IXUserImpl_iface );
-        return hr;
+        if (FAILED( hr = RequestUserToken( impl->oauth_token, &impl->user_token, &impl->local_id ) ))
+        {
+            TRACE( "failed to get user token\n" );
+            IXUserImpl_Release( &impl->IXUserImpl_iface );
+            return hr;
+        }
+
+        if (FAILED( hr = RequestXstsToken( impl->user_token, &impl->xsts_token, &impl->xuid, &impl->age_group, impl->gamertag, sizeof(impl->gamertag) ) ))
+        {
+            TRACE( "failed to get xsts token\n" );
+            IXUserImpl_Release( &impl->IXUserImpl_iface );
+            return hr;
+        }
     }
 
     *user = (XUserHandle)impl;
