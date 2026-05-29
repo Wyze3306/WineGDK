@@ -87,12 +87,32 @@ static HRESULT httpclient_SendRequest( URL_COMPONENTS uc, HINTERNET *inetRequest
         goto _CLEANUP;
     }
 
-    if ( !WinHttpSendRequest( *inetRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0 ) ||
-         !WinHttpReceiveResponse( *inetRequest, NULL ) )
+    if ( !WinHttpSendRequest( *inetRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0 ) )
     {
         status = HRESULT_FROM_WIN32( GetLastError() );
         goto _CLEANUP;
     }
+
+    /* The TLS handshake (and therefore the server certificate) is complete the
+     * moment WinHttpSendRequest returns — the cert is captured by
+     * netconn_get_certificate at connection time and stays queryable via
+     * WINHTTP_OPTION_SERVER_CERT_CONTEXT regardless of the HTTP response.
+     *
+     * Reading the response body is NOT required to obtain the pinning info
+     * (thumbprints + protocol flags) this call exists for, and on Wine 11.1 it
+     * actively breaks us: secur32's GnuTLS backend fails to decrypt the first
+     * response record from Azure-fronted hosts (*.playfabapi.com,
+     * client.discovery.minecraft-services.net, *.events.data.microsoft.com)
+     * with schan_DecryptMessage 0x80090304 (SEC_E_INTERNAL_ERROR). Treating
+     * that as fatal made XNetworkingQuerySecurityInformationForUrl fail, which
+     * Minecraft's libHttpClient gates every PlayFab call on — so the real
+     * LoginWithXbox POST (which runs over XCurl/libcurl, immune to the bug)
+     * never fired and the Servers list / sign-in looped forever.
+     *
+     * Make the response read best-effort: log a failure and carry on so the
+     * caller can still pull the certificate it needs. */
+    if ( !WinHttpReceiveResponse( *inetRequest, NULL ) )
+        WARN( "WinHttpReceiveResponse failed (%#lx) — proceeding with cert only\n", GetLastError() );
 
 _CLEANUP:
     if ( FAILED( status ) )
