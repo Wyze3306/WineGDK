@@ -263,10 +263,41 @@ HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffe
     URL_COMPONENTS uc = { .dwStructSize = sizeof(URL_COMPONENTS), 
         .dwSchemeLength = (DWORD)-1, .dwHostNameLength = (DWORD)-1, .dwUrlPathLength = (DWORD)-1, .dwExtraInfoLength = (DWORD)-1 };
     XNetworkingSecurityInformation *information = NULL;
+    LPWSTR httpUrl = NULL;
 
     FIXME( "url %s, securityInformation %p\n", debugstr_w( url ), securityInformation );
 
-    if ( !WinHttpCrackUrl( url, 0, 0, &uc ) )
+    /* Minecraft asks for the pinning info of its Real-Time-Activity WebSocket
+     * endpoint (wss://signal-*.franchise.minecraft-services.net/...). Wine's
+     * WinHttpCrackUrl only understands the http/https schemes — handed a "wss"
+     * or "ws" URL it fails and leaves the components empty, so SendRequest
+     * connects to an empty host, no certificate/thumbprints come back, and
+     * XNetworkingQuerySecurityInformationForUrl fails. Minecraft then never
+     * opens the RTA socket, so presence/multiplayer never comes up and the
+     * "Play" button stays greyed out. The cert is identical over the
+     * equivalent https origin, so rewrite the scheme before cracking. */
+    if ( url )
+    {
+        SIZE_T urlLen = wcslen( url );
+        const WCHAR *rest = NULL;
+        if ( _wcsnicmp( url, L"wss://", 6 ) == 0 )
+            rest = url + 6;
+        else if ( _wcsnicmp( url, L"ws://", 5 ) == 0 )
+            rest = url + 5;
+        if ( rest )
+        {
+            /* "https://" (8) or "http://" (7) + rest + NUL */
+            SIZE_T n = urlLen + 8 + 1;
+            httpUrl = HeapAlloc( GetProcessHeap(), 0, n * sizeof(WCHAR) );
+            if ( httpUrl )
+            {
+                wcscpy_s( httpUrl, n, ( rest == url + 6 ) ? L"https://" : L"http://" );
+                wcscat_s( httpUrl, n, rest );
+            }
+        }
+    }
+
+    if ( !WinHttpCrackUrl( httpUrl ? httpUrl : url, 0, 0, &uc ) )
     {
         status = HRESULT_FROM_WIN32( GetLastError() );
         goto _CLEANUP;
@@ -329,5 +360,6 @@ _CLEANUP:
         free( buffer );
     }
     if ( inetRequest ) WinHttpCloseHandle( inetRequest );
+    if ( httpUrl ) HeapFree( GetProcessHeap(), 0, httpUrl );
     return status;
 }

@@ -365,6 +365,155 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
         }
     }
 
+    /* Patch 3: force the game's isLoggedInWithMicrosoftAccount getter to TRUE.
+     * The UI ("userAccount" facet) reads this bool to decide whether the player
+     * is signed in with an MSA; on Win32/Wine XSAPI's social manager never
+     * finishes so it stays false, which keeps the home-screen "Sign in" button
+     * up and greys the Servers tab's join buttons. The getter is a tiny
+     * `movzx eax, byte ptr [rcx+disp8] ; ret` whose address is the 2nd `lea`
+     * (the value-getter) emitted right after the field-name string in the facet
+     * serializer. We anchor on the immutable string "isLoggedInWithMicrosoftAccount":
+     *   1. find the string in .rdata,
+     *   2. scan .text for the `lea rXX,[rip+d]` that points at it (the name lea),
+     *   3. the getter `lea rax,[rip+d]` sits 0x13 bytes after that name lea,
+     *   4. resolve its target and overwrite the getter with `mov eax,1; ret`.
+     * Version-robust: the string + serializer shape are stable; disp8/offsets
+     * are read at runtime, never hard-coded. */
+    {
+        static BOOLEAN patched3 = FALSE;
+        if (!patched3)
+        {
+            HMODULE game3 = GetModuleHandleA( NULL );
+            if (game3)
+            {
+                MODULEINFO mi3;
+                if (GetModuleInformation( GetCurrentProcess(), game3, &mi3, sizeof(mi3) ))
+                {
+                    BYTE *base = (BYTE *)mi3.lpBaseOfDll;
+                    SIZE_T size = mi3.SizeOfImage;
+                    static const char needle[] = "isLoggedInWithMicrosoftAccount";
+                    SIZE_T nlen = sizeof(needle) - 1;
+                    BYTE *str = NULL;
+                    SIZE_T i;
+                    DWORD oldprot;
+
+                    /* 1. locate the field-name string (must be NUL-terminated to
+                     *    avoid matching a longer superset). */
+                    for (i = 0; i + nlen + 1 < size; i++)
+                    {
+                        if (base[i] == 'i' &&
+                            memcmp( base + i, needle, nlen ) == 0 &&
+                            base[i + nlen] == 0)
+                        { str = base + i; break; }
+                    }
+
+                    if (str)
+                    {
+                        ULONG_PTR str_rva = (ULONG_PTR)(str - base);
+                        BYTE *name_lea = NULL;
+
+                        /* 2. find the `lea reg,[rip+disp32]` whose target == str.
+                         *    encoding: (48|4C) 8D modrm(rm=101) disp32, len 7. */
+                        for (i = 0; i + 7 < size; i++)
+                        {
+                            if ((base[i] == 0x48 || base[i] == 0x4C) &&
+                                base[i+1] == 0x8D &&
+                                (base[i+2] & 0xC7) == 0x05)
+                            {
+                                INT32 disp = *(INT32 *)(base + i + 3);
+                                ULONG_PTR tgt = (ULONG_PTR)(i + 7) + disp;
+                                if (tgt == str_rva) { name_lea = base + i; break; }
+                            }
+                        }
+
+                        if (name_lea)
+                        {
+                            /* 3. the value-getter lea is 0x13 bytes after the
+                             *    name lea, same `(48|4C) 8D 05 disp32` shape. */
+                            BYTE *gl = name_lea + 0x13;
+                            if ((gl[0] == 0x48 || gl[0] == 0x4C) &&
+                                gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05)
+                            {
+                                INT32 gdisp = *(INT32 *)(gl + 3);
+                                ULONG_PTR getter_rva =
+                                    (ULONG_PTR)(gl + 7 - base) + gdisp;
+                                BYTE *getter = base + getter_rva;
+                                /* 4. expect `movzx eax,byte[rcx+disp8]; ret`
+                                 *    (0F B6 41 disp8 C3) — overwrite with
+                                 *    `mov eax,1; ret` (B8 01 00 00 00 C3). */
+                                if (getter_rva + 6 <= size &&
+                                    getter[0] == 0x0F && getter[1] == 0xB6 &&
+                                    getter[2] == 0x41 && getter[4] == 0xC3)
+                                {
+                                    if (VirtualProtect( getter, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
+                                    {
+                                        getter[0] = 0xB8; getter[1] = 0x01;
+                                        getter[2] = 0x00; getter[3] = 0x00;
+                                        getter[4] = 0x00; getter[5] = 0xC3;
+                                        VirtualProtect( getter, 6, oldprot, &oldprot );
+                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx\n",
+                                             (ULONG_PTR)getter_rva );
+                                        patched3 = TRUE;
+                                    }
+                                }
+                                else
+                                    ERR( "MSA getter shape unexpected at RVA 0x%lx (%02x %02x %02x %02x %02x)\n",
+                                         (ULONG_PTR)getter_rva,
+                                         getter[0], getter[1], getter[2], getter[3], getter[4] );
+                            }
+                            else
+                                ERR( "MSA value-getter lea not at name_lea+0x13\n" );
+                        }
+                        else
+                            ERR( "MSA name-lea xref not found\n" );
+                    }
+                    else
+                        ERR( "isLoggedInWithMicrosoftAccount string not found\n" );
+                }
+            }
+        }
+    }
+
+    /* Patch 4: unlock joining online Bedrock servers.
+     * The connect dispatcher gates the join on an "online Xbox Live sign-in"
+     * check that wrongly fails for our native login, returning
+     * UserNeedsToBeSignedIn before any packet is sent. The auth is actually
+     * valid, so flip that branch to always take the connect path:
+     *   80 BE 98 00 00 00 00  cmp byte[rsi+0x98],0
+     *   75 34                 jne <success>   <- patch 0x75 (jne) -> 0xEB (jmp)
+     *   49 8B 06 48 8B 80 78 02 00 00         (unique tail) */
+    {
+        static BOOLEAN patched4 = FALSE;
+        if (!patched4)
+        {
+            HMODULE game = GetModuleHandleA( NULL );
+            MODULEINFO modinfo;
+            if (game && GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
+            {
+                BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
+                SIZE_T size = modinfo.SizeOfImage;
+                static const BYTE sig[] = { 0x80,0xBE,0x98,0x00,0x00,0x00,0x00, 0x75,0x34,
+                                            0x49,0x8B,0x06, 0x48,0x8B,0x80,0x78,0x02,0x00,0x00 };
+                SIZE_T i;
+                for (i = 0; i + sizeof(sig) < size; i++)
+                {
+                    if (memcmp( base + i, sig, sizeof(sig) ) != 0) continue;
+                    BYTE *jne = base + i + 7;   /* the 0x75 (jne) */
+                    DWORD oldprot;
+                    if (VirtualProtect( jne, 1, PAGE_EXECUTE_READWRITE, &oldprot ))
+                    {
+                        *jne = 0xEB;           /* jne -> jmp */
+                        VirtualProtect( jne, 1, oldprot, &oldprot );
+                        ERR( "patched online-server join gate at RVA 0x%lx\n", (ULONG_PTR)(jne - base) );
+                        patched4 = TRUE;
+                    }
+                    break;
+                }
+                if (!patched4) ERR( "online-server join gate signature not found\n" );
+            }
+        }
+    }
+
     return GDKC_InitAPI( gdkVer, gsVer, mode, options );
 }
 

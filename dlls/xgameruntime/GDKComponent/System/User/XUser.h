@@ -53,6 +53,14 @@ struct x_user
     UINT64 sisu_uhs;
     time_t sisu_expiry;
     CHAR sisu_rp[256];
+
+    /* Cached SISU token for the multiplayer RP (https://multiplayer.minecraft.net/),
+     * pre-minted by the launcher so joining a server doesn't need a live SISU
+     * call (which RSTs under Wine GnuTLS and leaves the join token empty). */
+    HSTRING mp_token;
+    UINT64 mp_uhs;
+    time_t mp_expiry;
+    CHAR mp_rp[256];
 };
 
 #endif

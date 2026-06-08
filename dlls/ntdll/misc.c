@@ -513,3 +513,21 @@ ULONG WINAPIV EtwTraceMessage( TRACEHANDLE handle, ULONG flags, LPGUID guid, /*U
     va_end( valist );
     return ret;
 }
+
+/******************************************************************************
+ *                  NtQueryWnfStateData (NTDLL.@)
+ *
+ * WNF (Windows Notification Facility) is unimplemented in Wine.  Minecraft's
+ * GameInput pulls this in and, with no export, Wine's loader installs an
+ * aborting stub that kills the game intermittently at startup.  Provide a real
+ * no-op export so the import resolves and a clean STATUS_NOT_IMPLEMENTED is
+ * returned instead of aborting the process.
+ */
+NTSTATUS WINAPI NtQueryWnfStateData( void *state_name, void *type_id, const void *explicit_scope,
+                                     void *change_stamp, void *buffer, ULONG *buffer_size )
+{
+    FIXME( "(%p %p %p %p %p %p) stub\n", state_name, type_id, explicit_scope,
+           change_stamp, buffer, buffer_size );
+    if (buffer_size) *buffer_size = 0;
+    return STATUS_NOT_IMPLEMENTED;
+}
