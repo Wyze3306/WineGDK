@@ -145,6 +145,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         HSTRING gtg = NULL, xuid_s = NULL, agg_s = NULL;
                         HSTRING uhs_s = NULL, sisu_uhs_s = NULL, sisu_rp_s = NULL;
                         HSTRING mptok = NULL, mp_uhs_s = NULL, mp_rp_s = NULL;
+                        HSTRING lictok = NULL, lic_uhs_s = NULL, lic_rp_s = NULL;
                         (void)GetJsonStringValue( root, L"user_token", &utok );
                         (void)GetJsonStringValue( root, L"xbl_token", &xtok );
                         (void)GetJsonStringValue( root, L"sisu_token", &stok );
@@ -157,6 +158,9 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         (void)GetJsonStringValue( root, L"mp_token", &mptok );
                         (void)GetJsonStringValue( root, L"mp_uhs", &mp_uhs_s );
                         (void)GetJsonStringValue( root, L"mp_rp", &mp_rp_s );
+                        (void)GetJsonStringValue( root, L"lic_token", &lictok );
+                        (void)GetJsonStringValue( root, L"lic_uhs", &lic_uhs_s );
+                        (void)GetJsonStringValue( root, L"lic_rp", &lic_rp_s );
                         if (utok && xtok && xuid_s)
                         {
                             LPSTR mb = NULL; UINT32 ml = 0;
@@ -200,6 +204,16 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                                 { lstrcpynA( impl->mp_rp, mb, sizeof(impl->mp_rp) ); free( mb ); mb = NULL; }
                                 impl->mp_expiry = time( NULL ) + 4 * 3600;
                             }
+                            /* SISU cache for the marketplace/licensing RP (in-game Store) */
+                            if (lictok && lic_uhs_s && lic_rp_s)
+                            {
+                                WindowsDuplicateString( lictok, &impl->lic_token );
+                                if (SUCCEEDED( HSTRINGToMultiByte( lic_uhs_s, &mb, &ml ) ) && mb)
+                                { impl->lic_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+                                if (SUCCEEDED( HSTRINGToMultiByte( lic_rp_s, &mb, &ml ) ) && mb)
+                                { lstrcpynA( impl->lic_rp, mb, sizeof(impl->lic_rp) ); free( mb ); mb = NULL; }
+                                impl->lic_expiry = time( NULL ) + 4 * 3600;
+                            }
                             preauth_done = TRUE;
                             ERR( "preauth: loaded user/XSTS tokens for xuid=%llu gtg=%s — skipping Wine HTTP\n",
                                  (unsigned long long)impl->xuid, impl->gamertag );
@@ -216,6 +230,9 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         if (mptok) WindowsDeleteString( mptok );
                         if (mp_uhs_s) WindowsDeleteString( mp_uhs_s );
                         if (mp_rp_s) WindowsDeleteString( mp_rp_s );
+                        if (lictok) WindowsDeleteString( lictok );
+                        if (lic_uhs_s) WindowsDeleteString( lic_uhs_s );
+                        if (lic_rp_s) WindowsDeleteString( lic_rp_s );
                         IJsonObject_Release( root );
                     }
                 }
@@ -306,6 +323,7 @@ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
         WindowsDeleteString( impl->xsts_token );
         if (impl->sisu_token) WindowsDeleteString( impl->sisu_token );
         if (impl->mp_token) WindowsDeleteString( impl->mp_token );
+        if (impl->lic_token) WindowsDeleteString( impl->lic_token );
         free( impl );
     }
     return ref;
@@ -562,6 +580,39 @@ static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiResult( IXUserImpl *ifac
     return E_NOTIMPL;
 }
 
+/* Map an outgoing request URL to the XSTS relying party (token audience) the
+ * destination service accepts.  Minecraft signs every Xbox Live / commerce
+ * request with XUserGetTokenAndSignature; handing back a token minted for the
+ * wrong audience makes the service reject it (Friends stay empty, the
+ * Marketplace catalog never loads).  Host-based, matching the canonical GDK
+ * map:
+ *   - Marketplace / entitlements edges -> http://licensing.xboxlive.com
+ *   - Friends / Social / Profile / People (*.xboxlive.com) -> http://xboxlive.com
+ *   - PlayFab title services -> the PlayFab RP
+ *   - Joining an external Bedrock server -> the multiplayer RP
+ * Order matters: the licensing hosts end in xboxlive.com, so they are matched
+ * before the generic xboxlive.com fallback. */
+static LPCSTR resolve_relying_party_for_url( LPCSTR url )
+{
+    if (!url) return "http://xboxlive.com";
+
+    if (strstr( url, "collections.mp.microsoft.com" ) ||
+        strstr( url, "purchase.mp.microsoft.com" ) ||
+        strstr( url, "displaycatalog.mp.microsoft.com" ) ||
+        strstr( url, "inventory.xboxlive.com" ) ||
+        strstr( url, "licensing.xboxlive.com" ))
+        return "http://licensing.xboxlive.com";
+
+    if (strstr( url, "playfab" ))
+        return "https://b980a380.minecraft.playfabapi.com/";
+
+    if (strstr( url, "multiplayer.minecraft" ))
+        return "https://multiplayer.minecraft.net/";
+
+    /* Friends/Social/Profile and any other Xbox Live edge. */
+    return "http://xboxlive.com";
+}
+
 struct XUserGetTokenAndSignatureContext
 {
     BOOLEAN utf16;
@@ -645,11 +696,10 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 break;
             }
 
-            /* Determine relying party from URL */
-            if (url && strstr( url, "playfab" ))
-                rp = "https://b980a380.minecraft.playfabapi.com/";
-            else if (url && strstr( url, "multiplayer.minecraft" ))
-                rp = "https://multiplayer.minecraft.net/";
+            /* Determine relying party from the request host (Friends/Social,
+             * Marketplace, PlayFab and external-server joins each need a
+             * different XSTS audience). */
+            rp = resolve_relying_party_for_url( url );
 
             TRACE( "requesting token for url=%s, rp=%s\n", url ? url : "(utf16)", rp );
 
@@ -702,6 +752,22 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                         token_uhs = user_impl->mp_uhs;
                         dowork_hr = S_OK;
                         TRACE( "reusing preauth multiplayer SISU token for %s\n", rp );
+                    }
+                }
+                /* Reuse the pre-minted licensing-RP SISU token for the in-game
+                 * Marketplace (catalog + entitlement calls). Same rationale as
+                 * mp_token: a live SISU call for this RP RSTs under Wine. */
+                if (FAILED( dowork_hr ) &&
+                    user_impl->lic_token && user_impl->lic_expiry > now + 30 &&
+                    strcmp( user_impl->lic_rp, rp ) == 0)
+                {
+                    HSTRING dup = NULL;
+                    if (SUCCEEDED( WindowsDuplicateString( user_impl->lic_token, &dup ) ))
+                    {
+                        xsts_token = dup;
+                        token_uhs = user_impl->lic_uhs;
+                        dowork_hr = S_OK;
+                        TRACE( "reusing preauth licensing SISU token for %s\n", rp );
                     }
                 }
                 /* Reuse the cached SISU token if it's still fresh for
@@ -1236,6 +1302,7 @@ static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
         WindowsDeleteString( impl->xsts_token );
         if (impl->sisu_token) WindowsDeleteString( impl->sisu_token );
         if (impl->mp_token) WindowsDeleteString( impl->mp_token );
+        if (impl->lic_token) WindowsDeleteString( impl->lic_token );
         free( impl );
     }
     return ref;

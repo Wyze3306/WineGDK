@@ -61,6 +61,16 @@ struct x_user
     UINT64 mp_uhs;
     time_t mp_expiry;
     CHAR mp_rp[256];
+
+    /* Cached SISU token for the marketplace/licensing RP
+     * (http://licensing.xboxlive.com), pre-minted by the launcher so the
+     * in-game Marketplace's catalog and entitlement calls
+     * (collections/purchase.mp.microsoft.com, inventory/licensing.xboxlive.com)
+     * resolve to a valid XSTS audience without a live SISU call. */
+    HSTRING lic_token;
+    UINT64 lic_uhs;
+    time_t lic_expiry;
+    CHAR lic_rp[256];
 };
 
 #endif
