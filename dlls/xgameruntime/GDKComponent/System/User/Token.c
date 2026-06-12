@@ -50,7 +50,12 @@ HRESULT HSTRINGToMultiByte( HSTRING hstr, LPSTR *str, UINT32 *str_len )
     if (!(*str_len = WideCharToMultiByte( CP_UTF8, 0, wstr, wstr_len, NULL, 0, NULL, NULL )))
         return HRESULT_FROM_WIN32( GetLastError() );
 
-    if (!(*str = calloc( 1, *str_len ))) return E_OUTOFMEMORY;
+    /* +1 so the buffer is NUL-terminated: wstr_len excludes the terminator, so
+     * the conversion fills exactly *str_len bytes. Callers run strtoull() on the
+     * result (xuid, uhs); without the trailing NUL it reads into adjacent memory
+     * and appends stray digits — e.g. xuid 2535458430309376 -> 25354584303093761,
+     * which then faults Minecraft. calloc zeroes the extra byte. */
+    if (!(*str = calloc( 1, *str_len + 1 ))) return E_OUTOFMEMORY;
 
     if (!(*str_len = WideCharToMultiByte( CP_UTF8, 0, wstr, wstr_len, *str, *str_len, NULL, NULL )))
     {
