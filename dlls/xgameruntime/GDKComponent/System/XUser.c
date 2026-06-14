@@ -34,6 +34,7 @@ const char msaAppId[] = "0000000040159362";
 static const WCHAR *ACCEPT_JSON[] = { L"application/json", NULL };
 static const WCHAR CT_JSON[] = L"Content-Type: application/json";
 static const WCHAR CT_FORM_URLENCODED[] = L"Content-Type: application/x-www-form-urlencoded";
+static const SIZE_T PROOF_KEY_SIZE = strlen( "{\"alg\":\"ES256\",\"kty\":\"EC\",\"use\":\"sig\",\"crv\":\"P-256\",\"x\":\"\",\"y\":\"\"}" ) + 86;
 
 static HRESULT parse_json( const char *json, SIZE_T jsonLen, IJsonObject **object )
 {
@@ -651,8 +652,32 @@ cleanup:
 
 static HRESULT WINAPI user_GetProofKey( IUser *iface, SIZE_T bufferSize, char *buffer )
 {
-    FIXME( "iface %p, bufferSize %Iu, buffer %p stub!\n", iface, bufferSize, buffer );
-    return E_NOTIMPL;
+    static const char template[] = "{\"alg\":\"ES256\",\"kty\":\"EC\",\"use\":\"sig\",\"crv\":\"P-256\",\"x\":\"";
+    struct XUser *impl = impl_from_IUser( iface );
+    UCHAR blob[sizeof(BCRYPT_ECCKEY_BLOB) + 64];
+    NTSTATUS status;
+    char *x, *y;
+    ULONG dummy;
+    HRESULT hr;
+
+    TRACE( "iface %p, bufferSize %Iu, buffer %p.\n", iface, bufferSize, buffer );
+
+    if (bufferSize < PROOF_KEY_SIZE) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+
+    x = buffer + ARRAY_SIZE( template ) - 1;
+    y = x + 43 + strlen( "\",\"y\":\"" );
+
+    memcpy( buffer, template, ARRAY_SIZE( template ) - 1 );
+    if (!NT_SUCCESS(status = BCryptExportKey( impl->key, NULL, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &dummy, 0 ))) goto error;
+    if (FAILED(hr = encode_base64_url( 32, blob + sizeof(BCRYPT_ECCKEY_BLOB), 43, x, FALSE ))) goto cleanup;
+    strcat( buffer, "\",\"y\":\"" );
+    if (FAILED(hr = encode_base64_url( 32, blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 43, y, FALSE ))) goto cleanup;
+    memcpy( y + 43, "\"}", 2 );
+
+error:
+    hr = HRESULT_FROM_NT( status );
+cleanup:
+    return hr;
 }
 
 static const struct IUserVtbl user_vtbl =
