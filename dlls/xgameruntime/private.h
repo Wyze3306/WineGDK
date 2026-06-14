@@ -64,6 +64,8 @@
 #include "windows.globalization.h"
 #define WIDL_using_Windows_System_Profile
 #include "windows.system.profile.h"
+#define WIDL_using_Windows_Data_Json
+#include "windows.data.json.h"
 #define WIDL_using_Xodus
 #include "xodusprovider.h"
 
@@ -111,6 +113,8 @@ struct async_operation_iids
 };
 
 typedef HRESULT (WINAPI *async_operation_callback)( IUnknown *invoker, PVOID param, PROPVARIANT *result );
+
+HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out );
 
 typedef struct _INITIALIZE_OPTIONS
 {

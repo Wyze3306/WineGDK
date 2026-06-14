@@ -4,6 +4,7 @@ MODULE    = xgameruntime.dll
 SOURCES = \
 	main.c \
 	userprovider.idl \
+	util.c \
 	xodusprovider.idl \
 	provider.idl \
 	\
