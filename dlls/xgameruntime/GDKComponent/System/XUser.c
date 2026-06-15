@@ -20,8 +20,100 @@
  */
 
 #include "../../private.h"
+#include "../../userprovider.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+
+struct XUser
+{
+    IUser IUser_iface;
+    LONG ref;
+};
+
+static struct XUser *impl_from_IUser( IUser *iface )
+{
+    return CONTAINING_RECORD( iface, struct XUser, IUser_iface );
+}
+
+static ULONG WINAPI user_AddRef( IUser *iface )
+{
+    struct XUser *impl = impl_from_IUser( iface );
+    ULONG ref = InterlockedIncrement( &impl->ref );
+    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
+    return ref;
+}
+
+static ULONG WINAPI user_Release( IUser *iface )
+{
+    struct XUser *impl = impl_from_IUser( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
+    return ref;
+}
+
+static HRESULT WINAPI user_RequestOAuthCode( IUser *iface, HSTRING *userCode, HSTRING *verificationUri )
+{
+    FIXME( "iface %p, userCode %p, verificationUri %p stub!\n", iface, userCode, verificationUri );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI user_RequestOAuthToken( IUser *iface )
+{
+    FIXME( "iface %p stub!\n", iface );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI user_RefreshOAuthToken( IUser *iface )
+{
+    FIXME( "iface %p stub!\n", iface );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI user_RefreshUserToken( IUser *iface )
+{
+    FIXME( "iface %p stub!\n", iface );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI user_RefreshXstsToken( IUser *iface )
+{
+    FIXME( "iface %p stub!\n", iface );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI user_FetchProfileSettings( IUser *iface, const WCHAR *settings, IUnknown **result )
+{
+    FIXME( "iface %p, settings %s, result %p stub!\n", iface, debugstr_w( settings ), result );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI user_GenerateKeyPair( IUser *iface )
+{
+    FIXME( "iface %p stub!\n", iface );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI user_SignData( IUser *iface, ULONG dataSize, UCHAR *data, ULONG signatureSize, UCHAR *signature )
+{
+    FIXME( "iface %p, dataSize %lu, data %p, signatureSize %lu, signature %p stub!\n", iface, dataSize, data, signatureSize, signature );
+    return E_NOTIMPL;
+}
+
+static const struct IUserVtbl user_vtbl =
+{
+    NULL,
+    user_AddRef,
+    user_Release,
+    /* IUser methods */
+    user_RequestOAuthCode,
+    user_RequestOAuthToken,
+    user_RefreshOAuthToken,
+    user_RefreshUserToken,
+    user_RefreshXstsToken,
+    user_FetchProfileSettings,
+    user_GenerateKeyPair,
+    user_SignData,
+};
 
 struct x_user
 {
