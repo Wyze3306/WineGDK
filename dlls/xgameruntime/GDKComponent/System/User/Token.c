@@ -67,7 +67,7 @@ HRESULT HSTRINGToMultiByte( HSTRING hstr, LPSTR *str, UINT32 *str_len )
     return S_OK;
 }
 
-HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data, LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *bufferSize )
+static HRESULT HttpRequestWinHttp( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data, LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *bufferSize )
 {
     HINTERNET connection = NULL;
     DWORD size = sizeof( DWORD );
@@ -171,6 +171,231 @@ HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data,
     if (session) WinHttpCloseHandle( session );
     if (FAILED( hr ) && *buffer) free( *buffer );
 
+    return hr;
+}
+
+/* ---- OpenSSL transport via the shipped XCurl.dll (libcurl) ---------------
+ * Wine 11.1's secur32/GnuTLS cannot complete the TLS handshake to the Azure
+ * Front Door auth edges (sisu.xboxlive.com, xsts.auth.xboxlive.com and the
+ * PlayFab relying party): they fail mid-session with 0x80072F7D /0x80090304,
+ * so the engine cannot mint/refresh tokens once the launcher's pre-auth set
+ * ages out (~1h). The Minecraft-Services session then collapses — Realms, the
+ * franchise signaling socket and the MSA sign-in state all break. The game
+ * ships an OpenSSL-backed libcurl (XCurl.dll) that reaches those exact edges
+ * (it is what carries PlayFab LoginWithXbox), so drive it directly here. Falls
+ * back to WinHttp when the DLL can't be loaded so first launch never regresses. */
+typedef void CURL;
+typedef void CURLM;
+struct curl_slist;
+typedef CURL  *(*curl_easy_init_t)( void );
+typedef int    (*curl_easy_setopt_t)( CURL *, int, ... );
+typedef int    (*curl_easy_getinfo_t)( CURL *, int, ... );
+typedef void   (*curl_easy_cleanup_t)( CURL * );
+typedef CURLM *(*curl_multi_init_t)( void );
+typedef int    (*curl_multi_add_handle_t)( CURLM *, CURL * );
+typedef int    (*curl_multi_remove_handle_t)( CURLM *, CURL * );
+typedef int    (*curl_multi_perform_t)( CURLM *, int * );
+typedef int    (*curl_multi_poll_t)( CURLM *, void *, unsigned, int, int * );
+typedef void   (*curl_multi_cleanup_t)( CURLM * );
+typedef struct curl_slist *(*curl_slist_append_t)( struct curl_slist *, const char * );
+typedef void   (*curl_slist_free_all_t)( struct curl_slist * );
+
+static struct curl_api
+{
+    BOOL tried, ok;
+    HMODULE mod;
+    curl_easy_init_t easy_init;
+    curl_easy_setopt_t easy_setopt;
+    curl_easy_getinfo_t easy_getinfo;
+    curl_easy_cleanup_t easy_cleanup;
+    curl_multi_init_t multi_init;
+    curl_multi_add_handle_t multi_add;
+    curl_multi_remove_handle_t multi_remove;
+    curl_multi_perform_t multi_perform;
+    curl_multi_poll_t multi_poll;
+    curl_multi_cleanup_t multi_cleanup;
+    curl_slist_append_t slist_append;
+    curl_slist_free_all_t slist_free;
+} g_curl;
+
+static BOOL load_curl( void )
+{
+    if (g_curl.tried) return g_curl.ok;
+    g_curl.tried = TRUE;
+    if (!(g_curl.mod = LoadLibraryA( "xcurl.dll" )))
+    {
+        WARN( "xcurl.dll not loadable — auth HTTP stays on WinHttp\n" );
+        return FALSE;
+    }
+#define LD(f,n) (g_curl.f = (void *)GetProcAddress( g_curl.mod, n ))
+    g_curl.ok = LD(easy_init,"curl_easy_init") && LD(easy_setopt,"curl_easy_setopt") &&
+                LD(easy_getinfo,"curl_easy_getinfo") && LD(easy_cleanup,"curl_easy_cleanup") &&
+                LD(multi_init,"curl_multi_init") && LD(multi_add,"curl_multi_add_handle") &&
+                LD(multi_remove,"curl_multi_remove_handle") && LD(multi_perform,"curl_multi_perform") &&
+                LD(multi_poll,"curl_multi_poll") && LD(multi_cleanup,"curl_multi_cleanup") &&
+                LD(slist_append,"curl_slist_append") && LD(slist_free,"curl_slist_free_all");
+#undef LD
+    if (g_curl.ok) TRACE( "xcurl.dll OpenSSL transport ready\n" );
+    else WARN( "xcurl.dll missing curl_* exports — auth HTTP stays on WinHttp\n" );
+    return g_curl.ok;
+}
+
+struct curl_resp { LPSTR data; SIZE_T len; };
+
+static SIZE_T curl_write_cb( char *ptr, SIZE_T size, SIZE_T nmemb, void *ud )
+{
+    struct curl_resp *r = ud;
+    SIZE_T add = size * nmemb;
+    LPSTR grown = realloc( r->data, r->len + add );
+    if (!grown) return 0;
+    r->data = grown;
+    memcpy( r->data + r->len, ptr, add );
+    r->len += add;
+    return add;
+}
+
+static LPSTR wide_to_utf8( LPCWSTR w )
+{
+    int n;
+    LPSTR s;
+    if (!w) return NULL;
+    if ((n = WideCharToMultiByte( CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL )) <= 0) return NULL;
+    if (!(s = malloc( n ))) return NULL;
+    WideCharToMultiByte( CP_UTF8, 0, w, -1, s, n, NULL, NULL );
+    return s;
+}
+
+/* libcurl ABI constants (stable across versions) */
+#define BOL_CURLOPT_URL            10002
+#define BOL_CURLOPT_WRITEDATA      10001
+#define BOL_CURLOPT_WRITEFUNCTION  20011
+#define BOL_CURLOPT_POSTFIELDS     10015
+#define BOL_CURLOPT_POSTFIELDSIZE  60
+#define BOL_CURLOPT_HTTPHEADER     10023
+#define BOL_CURLOPT_USERAGENT      10018
+#define BOL_CURLOPT_CUSTOMREQUEST  10036
+#define BOL_CURLOPT_FOLLOWLOCATION 52
+#define BOL_CURLOPT_TIMEOUT        13
+#define BOL_CURLOPT_NOSIGNAL       99
+#define BOL_CURLINFO_RESPONSE_CODE 2097154
+#define BOL_CURL_UNAVAILABLE       ((HRESULT)0x8007007EL) /* ERROR_MOD_NOT_FOUND: let WinHttp try */
+
+static HRESULT HttpRequestCurl( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data, LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *bufferSize )
+{
+    struct curl_resp resp = { NULL, 0 };
+    struct curl_slist *hdrs = NULL;
+    LPSTR url = NULL, dom = NULL, obj = NULL, mth = NULL, hdr = NULL;
+    CURL *easy = NULL;
+    CURLM *multi = NULL;
+    HRESULT hr = E_FAIL;
+    long status = 0;
+    int running = 1;
+    SIZE_T url_len;
+
+    *buffer = NULL;
+    *bufferSize = 0;
+    if (!load_curl()) return BOL_CURL_UNAVAILABLE;
+
+    dom = wide_to_utf8( domain );
+    obj = wide_to_utf8( object );
+    mth = wide_to_utf8( method );
+    if (!dom || !obj) { hr = E_OUTOFMEMORY; goto done; }
+
+    url_len = strlen( "https://" ) + strlen( dom ) + strlen( obj ) + 1;
+    if (!(url = malloc( url_len ))) { hr = E_OUTOFMEMORY; goto done; }
+    strcpy( url, "https://" );
+    strcat( url, dom );
+    strcat( url, obj );
+
+    /* headers may be a single CRLF-joined block (WinHttp style) */
+    if (headers && *headers && (hdr = wide_to_utf8( headers )))
+    {
+        LPSTR p = hdr;
+        while (p && *p)
+        {
+            LPSTR nl = strstr( p, "\r\n" );
+            if (nl) *nl = '\0';
+            if (*p) hdrs = g_curl.slist_append( hdrs, p );
+            p = nl ? nl + 2 : NULL;
+        }
+    }
+    if (accept)
+    {
+        int i;
+        for (i = 0; accept[i]; i++)
+        {
+            LPSTR a = wide_to_utf8( accept[i] ), line;
+            SIZE_T n;
+            if (!a) continue;
+            n = strlen( "Accept: " ) + strlen( a ) + 1;
+            if ((line = malloc( n )))
+            {
+                strcpy( line, "Accept: " );
+                strcat( line, a );
+                hdrs = g_curl.slist_append( hdrs, line );
+                free( line );
+            }
+            free( a );
+        }
+    }
+
+    if (!(easy = g_curl.easy_init()) || !(multi = g_curl.multi_init())) { hr = E_FAIL; goto done; }
+    g_curl.easy_setopt( easy, BOL_CURLOPT_URL, url );
+    g_curl.easy_setopt( easy, BOL_CURLOPT_USERAGENT, "XAL Xbox Live Game (Windows; SDK; 1.0.0.0)" );
+    g_curl.easy_setopt( easy, BOL_CURLOPT_WRITEFUNCTION, curl_write_cb );
+    g_curl.easy_setopt( easy, BOL_CURLOPT_WRITEDATA, &resp );
+    g_curl.easy_setopt( easy, BOL_CURLOPT_FOLLOWLOCATION, 1L );
+    g_curl.easy_setopt( easy, BOL_CURLOPT_TIMEOUT, 30L );
+    g_curl.easy_setopt( easy, BOL_CURLOPT_NOSIGNAL, 1L );
+    if (hdrs) g_curl.easy_setopt( easy, BOL_CURLOPT_HTTPHEADER, hdrs );
+    if (mth && strcmp( mth, "GET" )) g_curl.easy_setopt( easy, BOL_CURLOPT_CUSTOMREQUEST, mth );
+    if (data)
+    {
+        g_curl.easy_setopt( easy, BOL_CURLOPT_POSTFIELDS, data );
+        g_curl.easy_setopt( easy, BOL_CURLOPT_POSTFIELDSIZE, (long)strlen( data ) );
+    }
+
+    g_curl.multi_add( multi, easy );
+    do
+    {
+        if (g_curl.multi_perform( multi, &running )) break;
+        if (running) g_curl.multi_poll( multi, NULL, 0, 1000, NULL );
+    }
+    while (running);
+
+    g_curl.easy_getinfo( easy, BOL_CURLINFO_RESPONSE_CODE, &status );
+    if (status / 100 == 2 && resp.data)
+    {
+        *buffer = resp.data;
+        *bufferSize = resp.len;
+        resp.data = NULL;
+        hr = S_OK;
+    }
+    else
+    {
+        WARN( "HttpRequestCurl %S%S -> HTTP %ld\n", domain, object, status );
+        hr = status ? E_FAIL : BOL_CURL_UNAVAILABLE; /* 0 = transport failed → let WinHttp try */
+    }
+
+done:
+    if (multi && easy) g_curl.multi_remove( multi, easy );
+    if (easy) g_curl.easy_cleanup( easy );
+    if (multi) g_curl.multi_cleanup( multi );
+    if (hdrs) g_curl.slist_free( hdrs );
+    free( resp.data );
+    free( url );
+    free( dom );
+    free( obj );
+    free( mth );
+    free( hdr );
+    return hr;
+}
+
+HRESULT HttpRequest( LPCWSTR method, LPCWSTR domain, LPCWSTR object, LPSTR data, LPCWSTR headers, LPCWSTR *accept, LPSTR *buffer, SIZE_T *bufferSize )
+{
+    HRESULT hr = HttpRequestCurl( method, domain, object, data, headers, accept, buffer, bufferSize );
+    if (hr == BOL_CURL_UNAVAILABLE)
+        hr = HttpRequestWinHttp( method, domain, object, data, headers, accept, buffer, bufferSize );
     return hr;
 }
 

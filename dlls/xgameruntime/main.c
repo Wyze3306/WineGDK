@@ -639,11 +639,10 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
         if (broker) { *out = broker; return S_OK; }
     }
 
-    /* Remaining GDK CLSIDs - return E_NOINTERFACE.
-     * Returning fake objects causes worse problems than E_NOINTERFACE
-     * because the game calls vtable methods expecting specific interfaces. */
-
-    FIXME( "%s (iid %s) not implemented, returning E_NOINTERFACE.\n", debugstr_guid( runtimeClassId ), debugstr_guid( interfaceId ) );
+    /* Unmapped GDK runtime classes: report not-implemented (the RE logger that
+     * used to hand back a fake object here was removed — its fake objects could
+     * fail-fast/NULL-crash MC at startup, and the 6 startup CLSIDs it captured
+     * are not the in-game social path). */
     if (out) *out = NULL;
     return E_NOTIMPL;
 }

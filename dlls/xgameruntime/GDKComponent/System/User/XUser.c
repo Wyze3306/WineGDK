@@ -792,6 +792,34 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 if (FAILED( dowork_hr ))
                 {
                     HSTRING device_token = NULL;
+                    /* The launcher's pre-auth oauth_token lasts ~1h; once it
+                     * lapses, SISU below rejects it and the Minecraft-Services
+                     * session (Realms, signaling, sign-in) can't be renewed.
+                     * Now that HttpRequest reaches the auth edges over OpenSSL,
+                     * refresh it on demand from the stored refresh token before
+                     * minting. RefreshOAuth hits login.live.com; the resulting
+                     * fresh token is what the sisu/xsts edges require. */
+                    if (user_impl->oauth_token_expiry && user_impl->refresh_token &&
+                        time( NULL ) >= user_impl->oauth_token_expiry - 60)
+                    {
+                        LPSTR rt = NULL; UINT32 rtl = 0;
+                        if (SUCCEEDED( HSTRINGToMultiByte( user_impl->refresh_token, &rt, &rtl ) ) && rt)
+                        {
+                            HSTRING n_oauth = NULL, n_refresh = NULL; time_t n_exp = 0;
+                            if (SUCCEEDED( RefreshOAuth( "0000000048183522", rt, &n_exp, &n_refresh, &n_oauth ) ))
+                            {
+                                if (user_impl->oauth_token) WindowsDeleteString( user_impl->oauth_token );
+                                user_impl->oauth_token = n_oauth;
+                                if (user_impl->refresh_token) WindowsDeleteString( user_impl->refresh_token );
+                                user_impl->refresh_token = n_refresh;
+                                user_impl->oauth_token_expiry = n_exp;
+                                ERR( "refreshed oauth token in-session (good for %llds)\n",
+                                     (long long)(n_exp - time( NULL )) );
+                            }
+                            else WARN( "in-session oauth refresh failed — mint will likely fail\n" );
+                            free( rt );
+                        }
+                    }
                     if (SUCCEEDED( DeviceAuth_GetDeviceToken( &device_token ) ) && device_token)
                     {
                         /* xal/imLinguin's working Bedrock-PlayFab auth uses
