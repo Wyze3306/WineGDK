@@ -428,21 +428,30 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 
                         if (name_lea)
                         {
-                            /* 3. the value-getter lea is 0x13 bytes after the
-                             *    name lea, same `(48|4C) 8D 05 disp32` shape. */
-                            BYTE *gl = name_lea + 0x13;
-                            if ((gl[0] == 0x48 || gl[0] == 0x4C) &&
-                                gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05)
+                            /* 3. the value-getter lea sits a short distance
+                             *    after the name lea — 0x13 in 1.26.20/.21 but
+                             *    0x14 in 1.26.30 (the serializer shape shifts
+                             *    between versions). Scan a small window for the
+                             *    `(48|4C) 8D 05 disp32` whose target is the bool
+                             *    getter `movzx eax,byte[rcx+disp8]; ret`
+                             *    (0F B6 41 disp8 C3) and overwrite it with
+                             *    `mov eax,1; ret`. Scanning by shape (not a
+                             *    hard-coded offset) keeps this version-robust. */
+                            int off;
+                            for (off = 0x10; off <= 0x20 && !patched3; off++)
                             {
-                                INT32 gdisp = *(INT32 *)(gl + 3);
-                                ULONG_PTR getter_rva =
-                                    (ULONG_PTR)(gl + 7 - base) + gdisp;
-                                BYTE *getter = base + getter_rva;
-                                /* 4. expect `movzx eax,byte[rcx+disp8]; ret`
-                                 *    (0F B6 41 disp8 C3) — overwrite with
-                                 *    `mov eax,1; ret` (B8 01 00 00 00 C3). */
-                                if (getter_rva + 6 <= size &&
-                                    getter[0] == 0x0F && getter[1] == 0xB6 &&
+                                BYTE *gl = name_lea + off;
+                                INT32 gdisp;
+                                ULONG_PTR getter_rva;
+                                BYTE *getter;
+                                if (!((gl[0] == 0x48 || gl[0] == 0x4C) &&
+                                      gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05))
+                                    continue;
+                                gdisp = *(INT32 *)(gl + 3);
+                                getter_rva = (ULONG_PTR)(gl + 7 - base) + gdisp;
+                                if (getter_rva + 6 > size) continue;
+                                getter = base + getter_rva;
+                                if (getter[0] == 0x0F && getter[1] == 0xB6 &&
                                     getter[2] == 0x41 && getter[4] == 0xC3)
                                 {
                                     if (VirtualProtect( getter, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
@@ -451,18 +460,14 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                                         getter[2] = 0x00; getter[3] = 0x00;
                                         getter[4] = 0x00; getter[5] = 0xC3;
                                         VirtualProtect( getter, 6, oldprot, &oldprot );
-                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx\n",
-                                             (ULONG_PTR)getter_rva );
+                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx (name_lea+0x%x)\n",
+                                             (ULONG_PTR)getter_rva, off );
                                         patched3 = TRUE;
                                     }
                                 }
-                                else
-                                    ERR( "MSA getter shape unexpected at RVA 0x%lx (%02x %02x %02x %02x %02x)\n",
-                                         (ULONG_PTR)getter_rva,
-                                         getter[0], getter[1], getter[2], getter[3], getter[4] );
                             }
-                            else
-                                ERR( "MSA value-getter lea not at name_lea+0x13\n" );
+                            if (!patched3)
+                                ERR( "MSA value-getter not found in window after name_lea\n" );
                         }
                         else
                             ERR( "MSA name-lea xref not found\n" );
@@ -476,12 +481,21 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 
     /* Patch 4: unlock joining online Bedrock servers.
      * The connect dispatcher gates the join on an "online Xbox Live sign-in"
-     * check that wrongly fails for our native login, returning
-     * UserNeedsToBeSignedIn before any packet is sent. The auth is actually
-     * valid, so flip that branch to always take the connect path:
-     *   80 BE 98 00 00 00 00  cmp byte[rsi+0x98],0
-     *   75 34                 jne <success>   <- patch 0x75 (jne) -> 0xEB (jmp)
-     *   49 8B 06 48 8B 80 78 02 00 00         (unique tail) */
+     * check that wrongly fails for our native login (returns
+     * UserNeedsToBeSignedIn before any packet is sent); flip that branch.
+     *
+     * The gate's exact bytes drift between versions — both the field register
+     * and the first vtable offset change (1.26.20-30: cmp byte[rsi+0x98],0 /
+     * mov rax,[rax+0x278]; 1.26.40: cmp byte[r13+0x98],0 / +0x270). What stays
+     * constant is the SHAPE:
+     *     cmp byte[reg+disp32], 0   ; 80 [B8-BF] dd dd dd dd 00
+     *     jne  <fail>               ; 75 rel8                 <- flip to EB
+     *     mov  rax, [reg]           ; (48|49) 8B (rm 0..3,6,7)
+     *     mov  rax, [rax+disp32]    ; 48 8B 80 dd dd dd dd     (1st vtable call)
+     *     ... mov edx, 1 ...        ; BA 01 00 00 00           (2nd vtable call)
+     * Match that structure with the offsets/registers wildcarded, confirm with
+     * the `mov edx,1` tail, and patch only when EXACTLY ONE such site exists
+     * (never flip an ambiguous match). Covers the whole 1.26.x line (20->40). */
     {
         static BOOLEAN patched4 = FALSE;
         if (!patched4)
@@ -491,25 +505,43 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
             if (game && GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
             {
                 BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
-                SIZE_T size = modinfo.SizeOfImage;
-                static const BYTE sig[] = { 0x80,0xBE,0x98,0x00,0x00,0x00,0x00, 0x75,0x34,
-                                            0x49,0x8B,0x06, 0x48,0x8B,0x80,0x78,0x02,0x00,0x00 };
-                SIZE_T i;
-                for (i = 0; i + sizeof(sig) < size; i++)
+                SIZE_T size = modinfo.SizeOfImage, i, j;
+                BYTE *gate = NULL;
+                int n = 0;
+                for (i = 0; i + 19 < size; i++)
                 {
-                    if (memcmp( base + i, sig, sizeof(sig) ) != 0) continue;
-                    BYTE *jne = base + i + 7;   /* the 0x75 (jne) */
+                    BYTE rm;
+                    BOOLEAN edx1 = FALSE;
+                    if (base[i] != 0x80) continue;                       /* cmp byte */
+                    if (base[i+1] < 0xB8 || base[i+1] > 0xBF) continue;  /* [reg+disp32] */
+                    if (base[i+6] != 0x00) continue;                     /* ,0 */
+                    if (base[i+7] != 0x75) continue;                     /* jne rel8 */
+                    if (!(base[i+9] == 0x48 || base[i+9] == 0x49) ||
+                        base[i+10] != 0x8B) continue;                    /* mov rax,[reg] */
+                    rm = base[i+11];
+                    if (!(rm <= 0x03 || rm == 0x06 || rm == 0x07)) continue;
+                    if (!(base[i+12] == 0x48 && base[i+13] == 0x8B &&
+                          base[i+14] == 0x80)) continue;                 /* mov rax,[rax+disp32] */
+                    for (j = i + 19; j + 5 <= size && j < i + 0x30; j++)
+                        if (base[j] == 0xBA && base[j+1] == 0x01 && base[j+2] == 0x00 &&
+                            base[j+3] == 0x00 && base[j+4] == 0x00) { edx1 = TRUE; break; }
+                    if (!edx1) continue;                                 /* connect-gate tail */
+                    gate = base + i + 7;                                 /* the jne */
+                    if (++n > 1) break;                                  /* ambiguous -> bail */
+                }
+                if (n == 1)
+                {
                     DWORD oldprot;
-                    if (VirtualProtect( jne, 1, PAGE_EXECUTE_READWRITE, &oldprot ))
+                    if (VirtualProtect( gate, 1, PAGE_EXECUTE_READWRITE, &oldprot ))
                     {
-                        *jne = 0xEB;           /* jne -> jmp */
-                        VirtualProtect( jne, 1, oldprot, &oldprot );
-                        ERR( "patched online-server join gate at RVA 0x%lx\n", (ULONG_PTR)(jne - base) );
+                        *gate = 0xEB;          /* jne -> jmp */
+                        VirtualProtect( gate, 1, oldprot, &oldprot );
+                        ERR( "patched online-server join gate at RVA 0x%lx\n", (ULONG_PTR)(gate - base) );
                         patched4 = TRUE;
                     }
-                    break;
                 }
-                if (!patched4) ERR( "online-server join gate signature not found\n" );
+                else
+                    ERR( "online-server join gate: %d candidate(s) (need exactly 1) - not patched\n", n );
             }
         }
     }
