@@ -132,6 +132,25 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
     return TRUE;
 }
 
+/* Whether to force the in-game isLoggedInWithMicrosoftAccount facet (Patch 3).
+ * Default ON. The launcher writes HKLM\Software\Wine\WineGDK\ForceMsaFacet=0
+ * to turn it OFF for users whose game crashes on launch: forcing the flag sends
+ * the game down a code path that derefs an XSAPI account object which never
+ * populates under Wine on some setups (issue #17/#18) — with it off, the game
+ * behaves like the pre-patch engine (Servers tab greyed, but it runs). */
+static BOOLEAN msa_force_enabled( void )
+{
+    HKEY key;
+    DWORD val = 1, sz = sizeof(val), type = REG_DWORD;
+    LONG r = RegOpenKeyExA( HKEY_LOCAL_MACHINE, "Software\\Wine\\WineGDK", 0,
+                            KEY_READ, &key );
+    if (r != ERROR_SUCCESS)
+        return TRUE;                         /* key absent → default ON */
+    r = RegQueryValueExA( key, "ForceMsaFacet", NULL, &type, (BYTE *)&val, &sz );
+    RegCloseKey( key );
+    return !(r == ERROR_SUCCESS && type == REG_DWORD && val == 0);
+}
+
 typedef HRESULT (WINAPI *InitializeApiImplEx2_ext)( ULONG gdkVer, ULONG gsVer, CHAR mode, INITIALIZE_OPTIONS *options );
 
 HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITIALIZE_OPTIONS *options )
@@ -378,7 +397,9 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
      *   3. the getter `lea rax,[rip+d]` sits 0x13 bytes after that name lea,
      *   4. resolve its target and overwrite the getter with `mov eax,1; ret`.
      * Version-robust: the string + serializer shape are stable; disp8/offsets
-     * are read at runtime, never hard-coded. */
+     * are read at runtime, never hard-coded. Gated by ForceMsaFacet (default
+     * ON) so users it crashes (issue #17/#18) can turn it off. */
+    if (msa_force_enabled())
     {
         static BOOLEAN patched3 = FALSE;
         if (!patched3)
