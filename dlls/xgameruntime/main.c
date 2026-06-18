@@ -428,30 +428,30 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 
                         if (name_lea)
                         {
-                            /* 3. the value-getter lea sits a short distance
-                             *    after the name lea — 0x13 in 1.26.20/.21 but
-                             *    0x14 in 1.26.30 (the serializer shape shifts
-                             *    between versions). Scan a small window for the
-                             *    `(48|4C) 8D 05 disp32` whose target is the bool
-                             *    getter `movzx eax,byte[rcx+disp8]; ret`
-                             *    (0F B6 41 disp8 C3) and overwrite it with
-                             *    `mov eax,1; ret`. Scanning by shape (not a
-                             *    hard-coded offset) keeps this version-robust. */
-                            int off;
-                            for (off = 0x10; off <= 0x20 && !patched3; off++)
+                            /* 3. the value-getter lea is 0x13 bytes after the
+                             *    name lea, same `(48|4C) 8D 05 disp32` shape;
+                             *    overwrite the bool getter `movzx eax,byte
+                             *    [rcx+d8]; ret` (0F B6 41 d8 C3) with `mov eax,1
+                             *    ; ret`.
+                             *
+                             *    DELIBERATELY anchored at +0x13 only. 1.26.30+
+                             *    moved the getter to +0x14, but forcing the flag
+                             *    there makes the game deref a NULL MSA account
+                             *    object at startup and crash (read [NULL+8],
+                             *    issue #17) — XSAPI never populates that object
+                             *    under Wine. So we only patch the +0x13 layout
+                             *    (1.26.20/.21), where it is safe; newer builds
+                             *    keep a (grey) Servers tab rather than crash. */
+                            BYTE *gl = name_lea + 0x13;
+                            if ((gl[0] == 0x48 || gl[0] == 0x4C) &&
+                                gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05)
                             {
-                                BYTE *gl = name_lea + off;
-                                INT32 gdisp;
-                                ULONG_PTR getter_rva;
-                                BYTE *getter;
-                                if (!((gl[0] == 0x48 || gl[0] == 0x4C) &&
-                                      gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05))
-                                    continue;
-                                gdisp = *(INT32 *)(gl + 3);
-                                getter_rva = (ULONG_PTR)(gl + 7 - base) + gdisp;
-                                if (getter_rva + 6 > size) continue;
-                                getter = base + getter_rva;
-                                if (getter[0] == 0x0F && getter[1] == 0xB6 &&
+                                INT32 gdisp = *(INT32 *)(gl + 3);
+                                ULONG_PTR getter_rva =
+                                    (ULONG_PTR)(gl + 7 - base) + gdisp;
+                                BYTE *getter = base + getter_rva;
+                                if (getter_rva + 6 <= size &&
+                                    getter[0] == 0x0F && getter[1] == 0xB6 &&
                                     getter[2] == 0x41 && getter[4] == 0xC3)
                                 {
                                     if (VirtualProtect( getter, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
@@ -460,14 +460,14 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                                         getter[2] = 0x00; getter[3] = 0x00;
                                         getter[4] = 0x00; getter[5] = 0xC3;
                                         VirtualProtect( getter, 6, oldprot, &oldprot );
-                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx (name_lea+0x%x)\n",
-                                             (ULONG_PTR)getter_rva, off );
+                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx\n",
+                                             (ULONG_PTR)getter_rva );
                                         patched3 = TRUE;
                                     }
                                 }
                             }
                             if (!patched3)
-                                ERR( "MSA value-getter not found in window after name_lea\n" );
+                                ERR( "MSA flag patch skipped (not the safe +0x13 layout)\n" );
                         }
                         else
                             ERR( "MSA name-lea xref not found\n" );
