@@ -428,30 +428,30 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 
                         if (name_lea)
                         {
-                            /* 3. the value-getter lea is 0x13 bytes after the
-                             *    name lea, same `(48|4C) 8D 05 disp32` shape;
-                             *    overwrite the bool getter `movzx eax,byte
-                             *    [rcx+d8]; ret` (0F B6 41 d8 C3) with `mov eax,1
-                             *    ; ret`.
-                             *
-                             *    DELIBERATELY anchored at +0x13 only. 1.26.30+
-                             *    moved the getter to +0x14, but forcing the flag
-                             *    there makes the game deref a NULL MSA account
-                             *    object at startup and crash (read [NULL+8],
-                             *    issue #17) — XSAPI never populates that object
-                             *    under Wine. So we only patch the +0x13 layout
-                             *    (1.26.20/.21), where it is safe; newer builds
-                             *    keep a (grey) Servers tab rather than crash. */
-                            BYTE *gl = name_lea + 0x13;
-                            if ((gl[0] == 0x48 || gl[0] == 0x4C) &&
-                                gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05)
+                            /* 3. the value-getter lea sits a short distance
+                             *    after the name lea — 0x13 in 1.26.20/.21 but
+                             *    0x14 in 1.26.30 (the serializer shape shifts
+                             *    between versions). Scan a small window for the
+                             *    `(48|4C) 8D 05 disp32` whose target is the bool
+                             *    getter `movzx eax,byte[rcx+disp8]; ret`
+                             *    (0F B6 41 disp8 C3) and overwrite it with
+                             *    `mov eax,1; ret`. Scanning by shape (not a
+                             *    hard-coded offset) keeps this version-robust. */
+                            int off;
+                            for (off = 0x10; off <= 0x20 && !patched3; off++)
                             {
-                                INT32 gdisp = *(INT32 *)(gl + 3);
-                                ULONG_PTR getter_rva =
-                                    (ULONG_PTR)(gl + 7 - base) + gdisp;
-                                BYTE *getter = base + getter_rva;
-                                if (getter_rva + 6 <= size &&
-                                    getter[0] == 0x0F && getter[1] == 0xB6 &&
+                                BYTE *gl = name_lea + off;
+                                INT32 gdisp;
+                                ULONG_PTR getter_rva;
+                                BYTE *getter;
+                                if (!((gl[0] == 0x48 || gl[0] == 0x4C) &&
+                                      gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05))
+                                    continue;
+                                gdisp = *(INT32 *)(gl + 3);
+                                getter_rva = (ULONG_PTR)(gl + 7 - base) + gdisp;
+                                if (getter_rva + 6 > size) continue;
+                                getter = base + getter_rva;
+                                if (getter[0] == 0x0F && getter[1] == 0xB6 &&
                                     getter[2] == 0x41 && getter[4] == 0xC3)
                                 {
                                     if (VirtualProtect( getter, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
@@ -460,14 +460,14 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                                         getter[2] = 0x00; getter[3] = 0x00;
                                         getter[4] = 0x00; getter[5] = 0xC3;
                                         VirtualProtect( getter, 6, oldprot, &oldprot );
-                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx\n",
-                                             (ULONG_PTR)getter_rva );
+                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx (name_lea+0x%x)\n",
+                                             (ULONG_PTR)getter_rva, off );
                                         patched3 = TRUE;
                                     }
                                 }
                             }
                             if (!patched3)
-                                ERR( "MSA flag patch skipped (not the safe +0x13 layout)\n" );
+                                ERR( "MSA value-getter not found in window after name_lea\n" );
                         }
                         else
                             ERR( "MSA name-lea xref not found\n" );
@@ -542,6 +542,138 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                 }
                 else
                     ERR( "online-server join gate: %d candidate(s) (need exactly 1) - not patched\n", n );
+            }
+        }
+    }
+
+    /* Patch 5: null-guard the sign-in-state lookup so Patch 3 can't crash.
+     * Patch 3 forces isLoggedInWithMicrosoftAccount=TRUE. Where the MSA
+     * account object is populated (most installs) that's all the game needs
+     * and the Servers tab unlocks. But on some installs (a fresh Steam Deck
+     * prefix, issue #17) the backing collection pointer is still NULL when an
+     * early lookup runs, so this routine derefs NULL and page-faults seconds
+     * after boot:
+     *     mov rax,[rax+rdi+0x58]   ; selected collection (NULL there)
+     *     mov rdx,[rax+8]          ; <-- #PF read [NULL+8]
+     *     cmp byte[rdx+0x19],0 ; mov rcx,rax ; jne ...
+     * The routine just looks a key up in one of two collections and returns a
+     * byte; an empty (NULL) collection means "not found" = 0. We splice a
+     * trampoline in after the collection load: it returns 0 when the pointer
+     * is NULL and otherwise runs unchanged - so Patch 3 keeps working where
+     * the object exists (no behaviour change) and never crashes where it
+     * doesn't. Version-robust: the body + `push rsi;push rdi;sub rsp,0x28`
+     * prologue are byte-identical across 1.26.20..40 (verified static). We
+     * anchor on the unique body signature, confirm the prologue, and patch
+     * only when EXACTLY ONE site matches. */
+    {
+        static BOOLEAN patched5 = FALSE;
+        if (!patched5)
+        {
+            HMODULE game = GetModuleHandleA( NULL );
+            MODULEINFO modinfo;
+            if (game && GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
+            {
+                BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
+                SIZE_T size = modinfo.SizeOfImage, i;
+                /* body: mov rax,[rax+rdi+0x58]; mov rdx,[rax+8];
+                 *       cmp byte[rdx+0x19],0; mov rcx,rax; jne */
+                static const BYTE sig[] = {
+                    0x48,0x8b,0x44,0x38,0x58, 0x48,0x8b,0x50,0x08,
+                    0x80,0x7a,0x19,0x00, 0x48,0x89,0xc1, 0x75 };
+                /* prologue 0x20 earlier: push rsi; push rdi; sub rsp,0x28 */
+                static const BYTE prologue[] = { 0x56,0x57,0x48,0x83,0xec,0x28 };
+                BYTE *match = NULL;
+                int n = 0;
+                for (i = 0; i + sizeof(sig) < size; i++)
+                {
+                    if (base[i] == 0x48 && memcmp( base + i, sig, sizeof(sig) ) == 0)
+                    { match = base + i; if (++n > 1) break; }
+                }
+                if (n == 1 && (ULONG_PTR)(match - base) >= 0x20 &&
+                    memcmp( match - 0x20, prologue, sizeof(prologue) ) == 0)
+                {
+                    /* locate the executable section holding the match, then a
+                     * >=28-byte run of 0xCC (inter-function padding) inside it
+                     * for the trampoline. */
+                    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+                    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+                    BYTE *cave = NULL, *sec_base = NULL;
+                    SIZE_T sec_size = 0, s, run = 0, cstart = 0;
+                    ULONG_PTR mrva = (ULONG_PTR)(match - base);
+
+                    if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
+                        nt->Signature == IMAGE_NT_SIGNATURE &&
+                        nt->FileHeader.NumberOfSections > 0 &&
+                        nt->FileHeader.NumberOfSections <= 96)
+                    {
+                        IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
+                        WORD k;
+                        for (k = 0; k < nt->FileHeader.NumberOfSections; k++)
+                        {
+                            ULONG_PTR va = sec[k].VirtualAddress;
+                            ULONG_PTR vsz = sec[k].Misc.VirtualSize;
+                            if (mrva >= va && mrva < va + vsz &&
+                                (sec[k].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                            { sec_base = base + va; sec_size = vsz; break; }
+                        }
+                    }
+                    for (s = 0; sec_base && s < sec_size; s++)
+                    {
+                        if (sec_base[s] == 0xCC)
+                        {
+                            if (run == 0) cstart = s;
+                            if (++run >= 28) { cave = sec_base + cstart; break; }
+                        }
+                        else run = 0;
+                    }
+
+                    if (cave)
+                    {
+                        ULONG_PTR crva = (ULONG_PTR)(cave - base);
+                        INT32 back = (INT32)((mrva + 5) - (crva + 0x0f));
+                        INT32 to_cave = (INT32)(crva - (mrva + 5));
+                        DWORD oldprot;
+                        /* trampoline (24 bytes):
+                         *   48 8b 44 38 58  mov rax,[rax+rdi+0x58]  (relocated)
+                         *   48 85 c0        test rax,rax
+                         *   74 05           jz null_exit
+                         *   E9 rel32        jmp back (match+5)
+                         * null_exit:
+                         *   31 c0           xor eax,eax
+                         *   48 83 c4 28     add rsp,0x28
+                         *   5f              pop rdi
+                         *   5e              pop rsi
+                         *   c3              ret */
+                        if (VirtualProtect( cave, 24, PAGE_EXECUTE_READWRITE, &oldprot ))
+                        {
+                            cave[0]=0x48; cave[1]=0x8b; cave[2]=0x44; cave[3]=0x38; cave[4]=0x58;
+                            cave[5]=0x48; cave[6]=0x85; cave[7]=0xc0;
+                            cave[8]=0x74; cave[9]=0x05;
+                            cave[10]=0xe9;
+                            cave[11]=(BYTE)back; cave[12]=(BYTE)(back>>8);
+                            cave[13]=(BYTE)(back>>16); cave[14]=(BYTE)(back>>24);
+                            cave[15]=0x31; cave[16]=0xc0;
+                            cave[17]=0x48; cave[18]=0x83; cave[19]=0xc4; cave[20]=0x28;
+                            cave[21]=0x5f; cave[22]=0x5e; cave[23]=0xc3;
+                            VirtualProtect( cave, 24, oldprot, &oldprot );
+
+                            if (VirtualProtect( match, 5, PAGE_EXECUTE_READWRITE, &oldprot ))
+                            {
+                                match[0]=0xe9;
+                                match[1]=(BYTE)to_cave; match[2]=(BYTE)(to_cave>>8);
+                                match[3]=(BYTE)(to_cave>>16); match[4]=(BYTE)(to_cave>>24);
+                                VirtualProtect( match, 5, oldprot, &oldprot );
+                                ERR( "patched sign-in lookup null-guard at RVA 0x%lx (cave 0x%lx)\n",
+                                     (ULONG_PTR)mrva, (ULONG_PTR)crva );
+                                patched5 = TRUE;
+                            }
+                        }
+                    }
+                    else
+                        ERR( "sign-in lookup null-guard: no code cave found\n" );
+                }
+                else
+                    ERR( "sign-in lookup null-guard: %d site(s) (need 1) or prologue mismatch - not patched\n", n );
             }
         }
     }
