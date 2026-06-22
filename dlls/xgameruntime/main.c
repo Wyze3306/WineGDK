@@ -132,12 +132,21 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
     return TRUE;
 }
 
-/* Whether to force the in-game isLoggedInWithMicrosoftAccount facet (Patch 3).
- * Default ON. The launcher writes HKLM\Software\Wine\WineGDK\ForceMsaFacet=0
- * to turn it OFF for users whose game crashes on launch: forcing the flag sends
- * the game down a code path that derefs an XSAPI account object which never
- * populates under Wine on some setups (issue #17/#18) — with it off, the game
- * behaves like the pre-patch engine (Servers tab greyed, but it runs). */
+/* Whether to apply the in-game sign-in patches that FORCE the signed-in state:
+ * Patch 1 (isSignedIn -> TRUE), Patch 2 (the XblInitialize gate), Patch 3 (the
+ * isLoggedInWithMicrosoftAccount facet) and Patch 4 (the online-server join
+ * gate). Default ON. The launcher writes HKLM\Software\Wine\WineGDK\ForceMsaFacet=0
+ * to turn it OFF for users whose game crashes: forcing that state sends the game
+ * down code paths that deref XSAPI account/session objects which never populate
+ * under Wine on some setups (issue #17/#18).
+ *
+ * Crucially this gates the WHOLE forcing set, not just Patch 3. Gating Patch 3
+ * alone left ForceMsaFacet=0 in a half-patched state — isSignedIn forced TRUE
+ * (Patch 1) yet the MSA facet FALSE (Patch 3 skipped) and joins forced (Patch 4)
+ * — a combination the game never sees natively, which still page-faults on the
+ * Servers/worlds screens. With the switch off NONE of these apply, so the game
+ * gets genuine pre-patch behaviour (Servers tab greyed, but it runs). The
+ * passive null-guard (Patch 5) is pure safety and stays on regardless. */
 static BOOLEAN msa_force_enabled( void )
 {
     HKEY key;
@@ -157,6 +166,8 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 {
     HRESULT hr;
     static BOOLEAN com_initialized = FALSE;
+    /* Read once: master gate for the state-forcing sign-in patches (1-4). */
+    BOOLEAN force = msa_force_enabled();
 
     TRACE("gdkVer %ld, gsVer %ld, mode %d, options %p\n", gdkVer, gsVer, mode, options);
 
@@ -223,7 +234,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
      * Retries on each InitializeApiImplEx2 call until successful. */
     {
         static BOOLEAN patched = FALSE;
-        if (!patched)
+        if (force && !patched)
         {
             HMODULE game = GetModuleHandleA( NULL );
             if (game)
@@ -331,7 +342,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
      * for the failure-skip branch — backward-jumping JLs are loop tails). */
     {
         static BOOLEAN patched2 = FALSE;
-        if (!patched2)
+        if (force && !patched2)
         {
             HMODULE game2 = GetModuleHandleA( NULL );
             if (game2)
@@ -399,7 +410,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
      * Version-robust: the string + serializer shape are stable; disp8/offsets
      * are read at runtime, never hard-coded. Gated by ForceMsaFacet (default
      * ON) so users it crashes (issue #17/#18) can turn it off. */
-    if (msa_force_enabled())
+    if (force)
     {
         static BOOLEAN patched3 = FALSE;
         if (!patched3)
@@ -519,7 +530,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
      * (never flip an ambiguous match). Covers the whole 1.26.x line (20->40). */
     {
         static BOOLEAN patched4 = FALSE;
-        if (!patched4)
+        if (force && !patched4)
         {
             HMODULE game = GetModuleHandleA( NULL );
             MODULEINFO modinfo;
@@ -619,7 +630,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
                     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
                     BYTE *cave = NULL, *sec_base = NULL;
-                    SIZE_T sec_size = 0, s, run = 0, cstart = 0;
+                    SIZE_T sec_size = 0, s, run = 0, cstart = 0, best = 0, bstart = 0;
                     ULONG_PTR mrva = (ULONG_PTR)(match - base);
 
                     if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
@@ -643,30 +654,69 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                         if (sec_base[s] == 0xCC)
                         {
                             if (run == 0) cstart = s;
-                            if (++run >= 28) { cave = sec_base + cstart; break; }
+                            if (++run > best) { best = run; bstart = cstart; }
+                            if (best >= 42) break;       /* enough for the full guard */
                         }
                         else run = 0;
                     }
+                    if (best >= 24) cave = sec_base + bstart;
 
                     if (cave)
                     {
                         ULONG_PTR crva = (ULONG_PTR)(cave - base);
-                        INT32 back = (INT32)((mrva + 5) - (crva + 0x0f));
                         INT32 to_cave = (INT32)(crva - (mrva + 5));
+                        BOOLEAN full = (best >= 42);
                         DWORD oldprot;
-                        /* trampoline (24 bytes):
+                        /* The lookup walks a CHAIN of pointers:
+                         *   mov rax,[rax+rdi+0x58]   ; the collection
+                         *   mov rdx,[rax+8]          ; its backing data pointer
+                         *   cmp byte[rdx+0x19],0     ; the byte it returns
+                         * On a slow Steam Deck it runs before the collection is
+                         * populated, so any link can be NULL or a garbage /
+                         * non-canonical pointer and the routine page-faults
+                         * (issue #21 rdx==NULL, issue #22 rax non-canonical).
+                         * "Empty/absent" is just a 0 return, so guard the WHOLE
+                         * chain: return 0 unless every link is a sane pointer,
+                         * else run the real lookup unchanged.
+                         *
+                         * Full guard (42 B — needs a big enough cave):
                          *   48 8b 44 38 58  mov rax,[rax+rdi+0x58]  (relocated)
+                         *   48 89 c2        mov rdx,rax
+                         *   48 c1 ea 2f     shr rdx,47          ; canonical?
+                         *   75 13           jnz null_exit       ; non-canonical rax (#22)
                          *   48 85 c0        test rax,rax
-                         *   74 05           jz null_exit
-                         *   E9 rel32        jmp back (match+5)
-                         * null_exit:
-                         *   31 c0           xor eax,eax
-                         *   48 83 c4 28     add rsp,0x28
-                         *   5f              pop rdi
-                         *   5e              pop rsi
-                         *   c3              ret */
-                        if (VirtualProtect( cave, 24, PAGE_EXECUTE_READWRITE, &oldprot ))
+                         *   74 0e           jz  null_exit       ; NULL rax
+                         *   48 8b 50 08     mov rdx,[rax+8]     (relocated)
+                         *   48 85 d2        test rdx,rdx
+                         *   74 05           jz  null_exit       ; NULL data ptr (#21)
+                         *   e9 rel32        jmp match+9 (the cmp)
+                         * null_exit: 31 c0 / 48 83 c4 28 / 5f / 5e / c3
+                         * Fallback (no >=42 B cave): the original 24-byte guard
+                         * (rax!=NULL only) so a stingy binary never regresses. */
+                        if (full && VirtualProtect( cave, 42, PAGE_EXECUTE_READWRITE, &oldprot ))
                         {
+                            INT32 back = (INT32)((mrva + 9) - (crva + 33));
+                            cave[0]=0x48; cave[1]=0x8b; cave[2]=0x44; cave[3]=0x38; cave[4]=0x58;
+                            cave[5]=0x48; cave[6]=0x89; cave[7]=0xc2;
+                            cave[8]=0x48; cave[9]=0xc1; cave[10]=0xea; cave[11]=0x2f;
+                            cave[12]=0x75; cave[13]=0x13;
+                            cave[14]=0x48; cave[15]=0x85; cave[16]=0xc0;
+                            cave[17]=0x74; cave[18]=0x0e;
+                            cave[19]=0x48; cave[20]=0x8b; cave[21]=0x50; cave[22]=0x08;
+                            cave[23]=0x48; cave[24]=0x85; cave[25]=0xd2;
+                            cave[26]=0x74; cave[27]=0x05;
+                            cave[28]=0xe9;
+                            cave[29]=(BYTE)back; cave[30]=(BYTE)(back>>8);
+                            cave[31]=(BYTE)(back>>16); cave[32]=(BYTE)(back>>24);
+                            cave[33]=0x31; cave[34]=0xc0;
+                            cave[35]=0x48; cave[36]=0x83; cave[37]=0xc4; cave[38]=0x28;
+                            cave[39]=0x5f; cave[40]=0x5e; cave[41]=0xc3;
+                            VirtualProtect( cave, 42, oldprot, &oldprot );
+                        }
+                        else if (VirtualProtect( cave, 24, PAGE_EXECUTE_READWRITE, &oldprot ))
+                        {
+                            INT32 back = (INT32)((mrva + 5) - (crva + 0x0f));
+                            full = FALSE;
                             cave[0]=0x48; cave[1]=0x8b; cave[2]=0x44; cave[3]=0x38; cave[4]=0x58;
                             cave[5]=0x48; cave[6]=0x85; cave[7]=0xc0;
                             cave[8]=0x74; cave[9]=0x05;
@@ -677,17 +727,18 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                             cave[17]=0x48; cave[18]=0x83; cave[19]=0xc4; cave[20]=0x28;
                             cave[21]=0x5f; cave[22]=0x5e; cave[23]=0xc3;
                             VirtualProtect( cave, 24, oldprot, &oldprot );
+                        }
+                        else cave = NULL;
 
-                            if (VirtualProtect( match, 5, PAGE_EXECUTE_READWRITE, &oldprot ))
-                            {
-                                match[0]=0xe9;
-                                match[1]=(BYTE)to_cave; match[2]=(BYTE)(to_cave>>8);
-                                match[3]=(BYTE)(to_cave>>16); match[4]=(BYTE)(to_cave>>24);
-                                VirtualProtect( match, 5, oldprot, &oldprot );
-                                ERR( "patched sign-in lookup null-guard at RVA 0x%lx (cave 0x%lx)\n",
-                                     (ULONG_PTR)mrva, (ULONG_PTR)crva );
-                                patched5 = TRUE;
-                            }
+                        if (cave && VirtualProtect( match, 5, PAGE_EXECUTE_READWRITE, &oldprot ))
+                        {
+                            match[0]=0xe9;
+                            match[1]=(BYTE)to_cave; match[2]=(BYTE)(to_cave>>8);
+                            match[3]=(BYTE)(to_cave>>16); match[4]=(BYTE)(to_cave>>24);
+                            VirtualProtect( match, 5, oldprot, &oldprot );
+                            ERR( "patched sign-in lookup null-guard at RVA 0x%lx (cave 0x%lx, %s)\n",
+                                 (ULONG_PTR)mrva, (ULONG_PTR)crva, full ? "full chain" : "rax-only" );
+                            patched5 = TRUE;
                         }
                     }
                     else
