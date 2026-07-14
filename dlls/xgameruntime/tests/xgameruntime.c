@@ -21,7 +21,6 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #define COBJMACROS
-#include <initguid.h>
 #include <windef.h>
 #include <winbase.h>
 #include <winternl.h>
@@ -30,7 +29,7 @@
 #include <unknwn.h>
 #include <xgameerr.h>
 
-#include "provider.h"
+#include "../provider.h"
 #include "wine/test.h"
 #include "xthread.h"
 
@@ -65,11 +64,28 @@ static LONG async_get_result_count;
 static LONG async_cleanup_count;
 static LONG async_cleanup_before_result;
 static LONG async_completion_count;
+static LONG user_change_count;
+
+static const GUID test_clsid_xuser_impl =
+    {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+static const GUID test_iid_xuser_base =
+    {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+static const GUID test_iid_xuser_gamertag =
+    {0xcef4fac0, 0x7676, 0x4a94, {0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74}};
 
 static void CALLBACK XAsyncCompletion_testCallback( XAsyncBlock *asyncBlock )
 {
     (void)asyncBlock;
     InterlockedIncrement( &async_completion_count );
+}
+
+static void CALLBACK user_change_callback( PVOID context, XUserLocalId local_id,
+                                           XUserChangeEvent event )
+{
+    (void)context;
+    (void)local_id;
+    (void)event;
+    InterlockedIncrement( &user_change_count );
 }
 
 #define check_interface(obj, iid, supported) _check_interface(__LINE__, obj, iid, supported)
@@ -229,6 +245,65 @@ static void test_XSystem(void)
     IXSystemImpl_Release( xsystem );
     free( consoleId );
     free( sandboxId );
+}
+
+static void test_XUserChangeRegistration(void)
+{
+    XTaskQueueRegistrationToken first = {0}, second = {0}, unknown = {0xdeadbeef};
+    XUserChangeEventCallback callback = user_change_callback;
+    IXUserBase *user, *again;
+    IXUserGamertag *gamertag;
+    HRESULT hr;
+
+    hr = QueryApiImpl_fun( &test_clsid_xuser_impl, &test_iid_xuser_base, (void **)&user );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    if (FAILED( hr )) return;
+
+    hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, NULL, &first );
+    ok( hr == E_POINTER, "NULL callback returned %#lx.\n", hr );
+    hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, &callback, NULL );
+    ok( hr == E_POINTER, "NULL token returned %#lx.\n", hr );
+
+    user_change_count = 0;
+    hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, &callback, &first );
+    ok( hr == S_OK && first.token, "first registration returned %#lx, token %llu.\n",
+            hr, (unsigned long long)first.token );
+    hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, &callback, &second );
+    ok( hr == S_OK && second.token && second.token != first.token,
+            "second registration returned %#lx, tokens %llu/%llu.\n", hr,
+            (unsigned long long)first.token, (unsigned long long)second.token );
+    ok( !user_change_count, "registration emitted %ld synthetic events.\n",
+            user_change_count );
+
+    ok( IXUserBase_XUserUnregisterForChangeEvent( user, first, FALSE ),
+            "first unregister failed.\n" );
+    ok( !IXUserBase_XUserUnregisterForChangeEvent( user, first, FALSE ),
+            "duplicate unregister succeeded.\n" );
+    ok( IXUserBase_XUserUnregisterForChangeEvent( user, second, TRUE ),
+            "second unregister failed.\n" );
+    ok( !IXUserBase_XUserUnregisterForChangeEvent( user, unknown, TRUE ),
+            "unknown unregister succeeded.\n" );
+
+    hr = IXUserBase_QueryInterface( user, &test_iid_xuser_gamertag,
+                                    (void **)&gamertag );
+    ok( hr == S_OK, "gamertag QueryInterface returned %#lx.\n", hr );
+    if (SUCCEEDED( hr ))
+    {
+        ok( IXUserGamertag_AddRef( gamertag ) == 2,
+                "provider gamertag AddRef is not stable.\n" );
+        ok( IXUserGamertag_Release( gamertag ) == 1,
+                "provider gamertag Release is not stable.\n" );
+        IXUserGamertag_Release( gamertag );
+    }
+    ok( IXUserBase_AddRef( user ) == 2,
+            "provider user AddRef is not stable.\n" );
+    ok( IXUserBase_Release( user ) == 1,
+            "provider user Release is not stable.\n" );
+
+    IXUserBase_Release( user );
+    hr = QueryApiImpl_fun( &test_clsid_xuser_impl, &test_iid_xuser_base, (void **)&again );
+    ok( hr == S_OK, "provider was not reusable after Release, hr %#lx.\n", hr );
+    if (SUCCEEDED( hr )) IXUserBase_Release( again );
 }
 
 static void test_XSystemAnalytics(void)
@@ -423,6 +498,7 @@ START_TEST(xgameruntime)
     test_XSystemAnalytics();
     test_XGameRuntimeFeature();
     test_XThreading();
+    test_XUserChangeRegistration();
 
     RoUninitialize();
 }

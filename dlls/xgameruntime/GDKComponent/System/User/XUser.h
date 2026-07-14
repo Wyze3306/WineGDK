@@ -32,12 +32,15 @@ struct x_user
     IXUserImpl IXUserImpl_iface;
     IXUserGamertag IXUserGamertag_iface;
     LONG ref;
+    BOOLEAN is_provider;
 
     UINT64 xuid;
     XUserLocalId local_id;
     XUserAgeGroup age_group;
 
     time_t oauth_token_expiry;
+    time_t user_token_expiry;
+    time_t xsts_token_expiry;
     HSTRING refresh_token;
     HSTRING oauth_token;
     HSTRING user_token;

@@ -38,16 +38,66 @@ static inline HRESULT GetJsonStringValue( IJsonObject *object, LPCWSTR key, HSTR
     return IJsonObject_GetNamedString( object, key_hstr, value );
 }
 
+static time_t HSTRINGToEpoch( HSTRING value )
+{
+    unsigned long long seconds;
+    UINT32 length;
+    LPSTR text, end;
+
+    if (!value || !WindowsGetStringLen( value ) ||
+        FAILED( HSTRINGToMultiByte( value, &text, &length ) ))
+        return 0;
+    seconds = strtoull( text, &end, 10 );
+    if (end == text || *end || !seconds || seconds > 0x7fffffffffffffffULL)
+        seconds = 0;
+    free( text );
+    return (time_t)seconds;
+}
+
+static BOOLEAN HSTRINGIsReady( HSTRING value )
+{
+    return value && WindowsGetStringLen( value );
+}
+
 static const struct IXUserImplVtbl x_user_vtbl;
 static const struct IXUserGamertagVtbl x_user_gt_vtbl;
 
-/* Change event callback storage */
-static XUserChangeEventCallback g_change_callback;
-static PVOID g_change_context;
-static XTaskQueueHandle g_change_queue;
+struct change_registration
+{
+    struct change_registration *next;
+    UINT64 token;
+};
+
+static SRWLOCK change_registration_lock = SRWLOCK_INIT;
+static struct change_registration *change_registrations;
+static LONG64 next_change_token;
 
 /* Track last signed-in user for FindUserByLocalId/ById */
 static struct x_user *g_signed_in_user;
+
+static struct x_user *signed_in_user_snapshot( void )
+{
+    return InterlockedCompareExchangePointer(
+        (void *volatile *)&g_signed_in_user, NULL, NULL );
+}
+
+static BOOLEAN online_user_ready( const struct x_user *user )
+{
+    time_t now = time( NULL );
+
+    return user->xuid && user->local_id.value &&
+           HSTRINGIsReady( user->refresh_token ) &&
+           HSTRINGIsReady( user->oauth_token ) &&
+           HSTRINGIsReady( user->user_token ) &&
+           HSTRINGIsReady( user->xsts_token ) &&
+           HSTRINGIsReady( user->mp_token ) && user->mp_uhs &&
+           user->mp_rp[0] &&
+           !strcmp( user->mp_rp, "https://multiplayer.minecraft.net/" ) &&
+           user->oauth_token_expiry > now + 60 &&
+           user->user_token_expiry > now + 60 &&
+           user->xsts_token_expiry > now + 60 &&
+           user->mp_expiry > now + 60;
+}
 
 static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
 {
@@ -56,6 +106,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
     LPSTR buffer;
     HRESULT hr;
     DWORD size;
+    BOOLEAN preauth_done = FALSE;
 
     if (!user || !client_id) return E_POINTER;
 
@@ -125,7 +176,6 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
      * $WINEGDK_PREAUTH_DEVICE. If the file has those fields we use them
      * straight and skip RequestUserToken + RequestXstsToken entirely. The
      * Wine path still runs as a fallback for completeness. */
-    BOOLEAN preauth_done = FALSE;
     {
         const char *preauth_path = getenv( "WINEGDK_PREAUTH_DEVICE" );
         if (preauth_path && *preauth_path)
@@ -146,6 +196,9 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         HSTRING uhs_s = NULL, sisu_uhs_s = NULL, sisu_rp_s = NULL;
                         HSTRING mptok = NULL, mp_uhs_s = NULL, mp_rp_s = NULL;
                         HSTRING lictok = NULL, lic_uhs_s = NULL, lic_rp_s = NULL;
+                        HSTRING user_expiry_s = NULL, xbl_expiry_s = NULL;
+                        HSTRING sisu_expiry_s = NULL, mp_expiry_s = NULL;
+                        HSTRING lic_expiry_s = NULL;
                         (void)GetJsonStringValue( root, L"user_token", &utok );
                         (void)GetJsonStringValue( root, L"xbl_token", &xtok );
                         (void)GetJsonStringValue( root, L"sisu_token", &stok );
@@ -161,11 +214,18 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         (void)GetJsonStringValue( root, L"lic_token", &lictok );
                         (void)GetJsonStringValue( root, L"lic_uhs", &lic_uhs_s );
                         (void)GetJsonStringValue( root, L"lic_rp", &lic_rp_s );
+                        (void)GetJsonStringValue( root, L"user_token_expiry_epoch", &user_expiry_s );
+                        (void)GetJsonStringValue( root, L"xbl_token_expiry_epoch", &xbl_expiry_s );
+                        (void)GetJsonStringValue( root, L"sisu_expiry_epoch", &sisu_expiry_s );
+                        (void)GetJsonStringValue( root, L"mp_expiry_epoch", &mp_expiry_s );
+                        (void)GetJsonStringValue( root, L"lic_expiry_epoch", &lic_expiry_s );
                         if (utok && xtok && xuid_s)
                         {
                             LPSTR mb = NULL; UINT32 ml = 0;
                             WindowsDuplicateString( utok, &impl->user_token );
                             WindowsDuplicateString( xtok, &impl->xsts_token );
+                            impl->user_token_expiry = HSTRINGToEpoch( user_expiry_s );
+                            impl->xsts_token_expiry = HSTRINGToEpoch( xbl_expiry_s );
                             /* xuid */
                             if (SUCCEEDED( HSTRINGToMultiByte( xuid_s, &mb, &ml ) ) && mb)
                             { impl->xuid = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
@@ -192,7 +252,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                                 { impl->sisu_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
                                 if (SUCCEEDED( HSTRINGToMultiByte( sisu_rp_s, &mb, &ml ) ) && mb)
                                 { lstrcpynA( impl->sisu_rp, mb, sizeof(impl->sisu_rp) ); free( mb ); mb = NULL; }
-                                impl->sisu_expiry = time( NULL ) + 4 * 3600;
+                                impl->sisu_expiry = HSTRINGToEpoch( sisu_expiry_s );
                             }
                             /* SISU cache for the multiplayer RP (external-server join) */
                             if (mptok && mp_uhs_s && mp_rp_s)
@@ -202,7 +262,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                                 { impl->mp_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
                                 if (SUCCEEDED( HSTRINGToMultiByte( mp_rp_s, &mb, &ml ) ) && mb)
                                 { lstrcpynA( impl->mp_rp, mb, sizeof(impl->mp_rp) ); free( mb ); mb = NULL; }
-                                impl->mp_expiry = time( NULL ) + 4 * 3600;
+                                impl->mp_expiry = HSTRINGToEpoch( mp_expiry_s );
                             }
                             /* SISU cache for the marketplace/licensing RP (in-game Store) */
                             if (lictok && lic_uhs_s && lic_rp_s)
@@ -212,7 +272,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                                 { impl->lic_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
                                 if (SUCCEEDED( HSTRINGToMultiByte( lic_rp_s, &mb, &ml ) ) && mb)
                                 { lstrcpynA( impl->lic_rp, mb, sizeof(impl->lic_rp) ); free( mb ); mb = NULL; }
-                                impl->lic_expiry = time( NULL ) + 4 * 3600;
+                                impl->lic_expiry = HSTRINGToEpoch( lic_expiry_s );
                             }
                             preauth_done = TRUE;
                             ERR( "preauth: loaded user/XSTS tokens for xuid=%llu gtg=%s — skipping Wine HTTP\n",
@@ -233,6 +293,11 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         if (lictok) WindowsDeleteString( lictok );
                         if (lic_uhs_s) WindowsDeleteString( lic_uhs_s );
                         if (lic_rp_s) WindowsDeleteString( lic_rp_s );
+                        if (user_expiry_s) WindowsDeleteString( user_expiry_s );
+                        if (xbl_expiry_s) WindowsDeleteString( xbl_expiry_s );
+                        if (sisu_expiry_s) WindowsDeleteString( sisu_expiry_s );
+                        if (mp_expiry_s) WindowsDeleteString( mp_expiry_s );
+                        if (lic_expiry_s) WindowsDeleteString( lic_expiry_s );
                         IJsonObject_Release( root );
                     }
                 }
@@ -305,7 +370,10 @@ static HRESULT WINAPI x_user_QueryInterface( IXUserImpl *iface, REFIID iid, void
 static ULONG WINAPI x_user_AddRef( IXUserImpl *iface )
 {
     struct x_user *impl = impl_from_IXUserImpl( iface );
-    ULONG ref = InterlockedIncrement( &impl->ref );
+    ULONG ref;
+
+    if (impl->is_provider) return 2;
+    ref = InterlockedIncrement( &impl->ref );
     TRACE( "iface %p increasing refcount to %lu\n", iface, ref );
     return ref;
 }
@@ -313,7 +381,10 @@ static ULONG WINAPI x_user_AddRef( IXUserImpl *iface )
 static ULONG WINAPI x_user_Release( IXUserImpl *iface )
 {
     struct x_user *impl = impl_from_IXUserImpl( iface );
-    ULONG ref = InterlockedDecrement( &impl->ref );
+    ULONG ref;
+
+    if (impl->is_provider) return 1;
+    ref = InterlockedDecrement( &impl->ref );
     TRACE( "iface %p decreasing refcount to %lu\n", iface, ref );
     if (!ref)
     {
@@ -331,16 +402,18 @@ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
 
 static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl *iface, XUserHandle user, XUserHandle *duplicated )
 {
+    struct x_user *signed_in = signed_in_user_snapshot();
+
     TRACE( "iface %p, user %p, duplicated %p\n", iface, user, duplicated );
     if (!duplicated) return E_POINTER;
     if (!user)
     {
         /* Game may pass NULL when getting user from composite interface */
-        if (g_signed_in_user)
+        if (signed_in)
         {
-            TRACE( "NULL user, returning g_signed_in_user %p\n", g_signed_in_user );
-            IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
-            *duplicated = (XUserHandle)g_signed_in_user;
+            TRACE( "NULL user, returning signed-in user %p\n", signed_in );
+            IXUserImpl_AddRef( &signed_in->IXUserImpl_iface );
+            *duplicated = (XUserHandle)signed_in;
             return S_OK;
         }
         return E_POINTER;
@@ -380,7 +453,7 @@ static HRESULT CALLBACK XUserAddProvider( XAsyncOp operation, const XAsyncProvid
 {
     struct XUserAddContext *context;
     IXThreadingImpl *impl;
-    HRESULT hr;
+    HRESULT hr, result = S_OK;
 
     TRACE( "operation %d, providerData %p\n", operation, providerData );
 
@@ -391,7 +464,8 @@ static HRESULT CALLBACK XUserAddProvider( XAsyncOp operation, const XAsyncProvid
     switch (operation)
     {
         case Begin:
-            return impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
+            result = impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
+            break;
 
         case GetResult:
             memcpy( providerData->buffer, &context->user, sizeof( XUserHandle ) );
@@ -415,7 +489,8 @@ static HRESULT CALLBACK XUserAddProvider( XAsyncOp operation, const XAsyncProvid
             break;
     }
 
-    return S_OK;
+    impl->lpVtbl->Release( impl );
+    return result;
 }
 
 static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl *iface, XUserAddOptions options, XAsyncBlock *asyncBlock )
@@ -451,17 +526,18 @@ static HRESULT WINAPI x_user_XUserAddResult( IXUserImpl *iface, XAsyncBlock *asy
     if (!asyncBlock || !user) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_NOTIMPL;
     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserAddAsync, sizeof( XUserHandle ), user, NULL );
+    impl->lpVtbl->Release( impl );
     TRACE( "XUserAddResult returning hr=0x%08lx, user=%p\n", hr, user ? *user : NULL );
 
-    /* Track the signed-in user */
     if (SUCCEEDED( hr ) && *user)
     {
         struct x_user *u = (struct x_user *)*user;
-        if (!g_signed_in_user)
-        {
-            g_signed_in_user = u;
-            IXUserImpl_AddRef( &u->IXUserImpl_iface );
-        }
+
+        WineGDKApplyOnlinePatches( online_user_ready( u ) );
+        IXUserImpl_AddRef( &u->IXUserImpl_iface );
+        if (InterlockedCompareExchangePointer(
+                (void *volatile *)&g_signed_in_user, u, NULL ))
+            IXUserImpl_Release( &u->IXUserImpl_iface );
     }
 
     return hr;
@@ -477,12 +553,14 @@ static HRESULT WINAPI x_user_XUserGetLocalId( IXUserImpl *iface, XUserHandle use
 
 static HRESULT WINAPI x_user_XUserFindUserByLocalId( IXUserImpl *iface, XUserLocalId localId, XUserHandle *user )
 {
+    struct x_user *signed_in = signed_in_user_snapshot();
+
     TRACE( "iface %p, localId %llu, user %p\n", iface, (unsigned long long)localId.value, user );
     if (!user) return E_POINTER;
-    if (g_signed_in_user && g_signed_in_user->local_id.value == localId.value)
+    if (signed_in && signed_in->local_id.value == localId.value)
     {
-        IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
-        *user = (XUserHandle)g_signed_in_user;
+        IXUserImpl_AddRef( &signed_in->IXUserImpl_iface );
+        *user = (XUserHandle)signed_in;
         return S_OK;
     }
     return E_GAMEUSER_NO_DEFAULT_USER;
@@ -499,12 +577,14 @@ static HRESULT WINAPI x_user_XUserGetId( IXUserImpl *iface, XUserHandle user, UI
 
 static HRESULT WINAPI x_user_XUserFindUserById( IXUserImpl *iface, UINT64 userId, XUserHandle *user )
 {
+    struct x_user *signed_in = signed_in_user_snapshot();
+
     TRACE( "iface %p, userId %llu, user %p\n", iface, (unsigned long long)userId, user );
     if (!user) return E_POINTER;
-    if (g_signed_in_user && g_signed_in_user->xuid == userId)
+    if (signed_in && signed_in->xuid == userId)
     {
-        IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
-        *user = (XUserHandle)g_signed_in_user;
+        IXUserImpl_AddRef( &signed_in->IXUserImpl_iface );
+        *user = (XUserHandle)signed_in;
         return S_OK;
     }
     return E_GAMEUSER_NO_DEFAULT_USER;
@@ -546,7 +626,8 @@ static HRESULT WINAPI x_user_XUserGetGamerPictureResultSize( IXUserImpl *iface, 
 
 static HRESULT WINAPI x_user_XUserGetGamerPictureResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, SIZE_T *used )
 {
-    FIXME( "iface %p, asyncBlock %p, size %llu, buffer %p, used %p stub!\n", iface, asyncBlock, size, buffer, used );
+    FIXME( "iface %p, asyncBlock %p, size %llu, buffer %p, used %p stub!\n",
+           iface, asyncBlock, (unsigned long long)size, buffer, used );
     return E_NOTIMPL;
 }
 
@@ -638,6 +719,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
 {
     struct XUserGetTokenAndSignatureContext *context;
     IXThreadingImpl *impl;
+    HRESULT result = S_OK;
 
     TRACE( "operation %d, providerData %p\n", operation, providerData );
 
@@ -648,7 +730,8 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
     switch (operation)
     {
         case Begin:
-            return impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
+            result = impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
+            break;
 
         case GetResult:
         {
@@ -688,6 +771,8 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
             HRESULT dowork_hr;
             LPCSTR url = context->utf16 ? NULL : context->url;
             LPCSTR rp = "http://xboxlive.com";
+            UINT64 token_uhs;
+            time_t now;
 
             if (!user_impl || !user_impl->user_token)
             {
@@ -715,7 +800,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
              * different uhs than the user-only RequestUserToken flow,
              * so when SISU is what minted the token the header must use
              * the SISU one or PlayFab silently rejects → sign-in loops. */
-            UINT64 token_uhs = user_impl->local_id.value;
+            token_uhs = user_impl->local_id.value;
             xsts_token = NULL;
 
             if (DeviceAuth_IsInitialized() && user_impl->oauth_token)
@@ -726,8 +811,10 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                  * token IS a SISU AuthorizationToken for that exact RP
                  * with the matching uhs in impl->local_id.value. Hitting
                  * SISU from Wine would just TCP-RST against GnuTLS. */
-                time_t now = time( NULL );
-                if (user_impl->xsts_token && !strcmp( rp, "http://xboxlive.com" ))
+                now = time( NULL );
+                if (user_impl->xsts_token &&
+                    user_impl->xsts_token_expiry > now + 30 &&
+                    !strcmp( rp, "http://xboxlive.com" ))
                 {
                     HSTRING dup = NULL;
                     if (SUCCEEDED( WindowsDuplicateString( user_impl->xsts_token, &dup ) ))
@@ -929,7 +1016,8 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
             break;
     }
 
-    return S_OK;
+    impl->lpVtbl->Release( impl );
+    return result;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, XUserHandle user, XUserGetTokenAndSignatureOptions options, LPCSTR method, LPCSTR url, SIZE_T count, const XUserGetTokenAndSignatureHttpHeader *headers, SIZE_T size, const void *buffer, XAsyncBlock *asyncBlock )
@@ -938,7 +1026,9 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
     IXThreadingImpl *impl;
     HRESULT hr;
 
-    TRACE( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
+    TRACE( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
+           iface, user, options, method, url, (unsigned long long)count,
+           headers, (unsigned long long)size, buffer, asyncBlock );
 
     if (!user || !method || !url || !asyncBlock) return E_POINTER;
     if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
@@ -974,10 +1064,14 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
 {
     IXThreadingImpl *impl;
+    HRESULT hr;
+
     TRACE( "iface %p, asyncBlock %p, size %p\n", iface, asyncBlock, size );
     if (!asyncBlock || !size) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
-    return impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
+    hr = impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
+    impl->lpVtbl->Release( impl );
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, XUserGetTokenAndSignatureData **ptr, SIZE_T *used )
@@ -988,6 +1082,7 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl *iface,
     if (!asyncBlock || !buffer || !ptr) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureAsync, size, buffer, used );
+    impl->lpVtbl->Release( impl );
     if (SUCCEEDED( hr )) *ptr = (XUserGetTokenAndSignatureData *)buffer;
     return hr;
 }
@@ -998,7 +1093,9 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
     IXThreadingImpl *impl;
     HRESULT hr;
 
-    TRACE( "iface %p, user %p, options %d, method %hs, url %hs, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
+    TRACE( "iface %p, user %p, options %d, method %hs, url %hs, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
+           iface, user, options, method, url, (unsigned long long)count,
+           headers, (unsigned long long)size, buffer, asyncBlock );
 
     if (!user || !method || !url || !asyncBlock) return E_POINTER;
     if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
@@ -1034,10 +1131,14 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16ResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
 {
     IXThreadingImpl *impl;
+    HRESULT hr;
+
     TRACE( "iface %p, asyncBlock %p, size %p\n", iface, asyncBlock, size );
     if (!asyncBlock || !size) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
-    return impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
+    hr = impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
+    impl->lpVtbl->Release( impl );
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, XUserGetTokenAndSignatureUtf16Data **ptr, SIZE_T *used )
@@ -1048,6 +1149,7 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl *i
     if (!asyncBlock || !buffer || !ptr) return E_POINTER;
     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureUtf16Async, size, buffer, used );
+    impl->lpVtbl->Release( impl );
     if (SUCCEEDED( hr )) *ptr = (XUserGetTokenAndSignatureUtf16Data *)buffer;
     return hr;
 }
@@ -1076,49 +1178,51 @@ static HRESULT WINAPI x_user_XUserResolveIssueWithUiUtf16Result( IXUserImpl *ifa
     return E_NOTIMPL;
 }
 
-static void CALLBACK change_event_taskqueue_cb( void *context, BOOL canceled )
-{
-    if (canceled || !g_signed_in_user || !g_change_callback) return;
-
-    TRACE( "firing XUserChangeEvent_SignedInAgain via task queue for local_id=%llu\n",
-           (unsigned long long)g_signed_in_user->local_id.value );
-    g_change_callback( g_change_context, g_signed_in_user->local_id, XUserChangeEvent_SignedInAgain );
-    TRACE( "change event callback returned\n" );
-}
-
 static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl *iface, XTaskQueueHandle queue, PVOID context, XUserChangeEventCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    IXThreadingImpl *impl;
+    struct change_registration *registration;
 
     TRACE( "iface %p, queue %p, context %p, callback %p, token %p\n", iface, queue, context, callback, token );
-    g_change_callback = (XUserChangeEventCallback)(void*)callback;
-    g_change_context = context;
-    g_change_queue = queue;
-    if (token) token->token = 1;
+    /* XUserAddResult reports the initial sign-in. SignedInAgain is only valid
+     * after a retained signed-out handle signs in again. */
+    if (!callback || !token) return E_POINTER;
+    if (!(registration = calloc( 1, sizeof(*registration) )))
+        return E_OUTOFMEMORY;
 
-    /* Fire the change event to notify the game of sign-in */
-    if (g_signed_in_user)
-    {
-        if (queue && SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) ))
-        {
-            TRACE( "submitting change event to task queue %p\n", queue );
-            impl->lpVtbl->XTaskQueueSubmitCallback( impl, queue, Completion, NULL, (XTaskQueueCallback*)change_event_taskqueue_cb );
-            impl->lpVtbl->Release( impl );
-        }
-        else
-        {
-            TRACE( "firing change event directly (no queue)\n" );
-            change_event_taskqueue_cb( NULL, FALSE );
-        }
-    }
+    registration->token = InterlockedIncrement64( &next_change_token );
+    if (!registration->token)
+        registration->token = InterlockedIncrement64( &next_change_token );
+    AcquireSRWLockExclusive( &change_registration_lock );
+    registration->next = change_registrations;
+    change_registrations = registration;
+    ReleaseSRWLockExclusive( &change_registration_lock );
+    token->token = registration->token;
 
     return S_OK;
 }
 
 static BOOLEAN WINAPI x_user_XUserUnregisterForChangeEvent( IXUserImpl *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
-    return FALSE;
+    struct change_registration **cursor, *registration = NULL;
+    BOOLEAN found;
+
+    TRACE( "iface %p, token %llu, wait %d\n", iface,
+           (unsigned long long)token.token, wait );
+    if (!token.token) return FALSE;
+
+    AcquireSRWLockExclusive( &change_registration_lock );
+    for (cursor = &change_registrations; *cursor; cursor = &(*cursor)->next)
+    {
+        if ((*cursor)->token != token.token)
+            continue;
+        registration = *cursor;
+        *cursor = registration->next;
+        break;
+    }
+    ReleaseSRWLockExclusive( &change_registration_lock );
+    found = registration != NULL;
+    free( registration );
+    return found;
 }
 
 static HRESULT WINAPI x_user_XUserGetSignOutDeferral( IXUserImpl *iface, XUserSignOutDeferralHandle *deferral )
@@ -1152,7 +1256,8 @@ static HRESULT WINAPI x_user_XUserGetMsaTokenSilentlyAsync( IXUserImpl *iface, X
 
 static HRESULT WINAPI x_user_XUserGetMsaTokenSilentlyResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, LPSTR token, SIZE_T *used )
 {
-    FIXME( "iface %p, size %llu, token %p, used %p stub!\n", iface, size, token, used );
+    FIXME( "iface %p, size %llu, token %p, used %p stub!\n", iface,
+           (unsigned long long)size, token, used );
     return E_NOTIMPL;
 }
 
@@ -1312,7 +1417,10 @@ static HRESULT WINAPI x_user_gt_QueryInterface( IXUserGamertag *iface, REFIID ii
 static ULONG WINAPI x_user_gt_AddRef( IXUserGamertag *iface )
 {
     struct x_user *impl = impl_from_IXUserGamertag( iface );
-    ULONG ref = InterlockedIncrement( &impl->ref );
+    ULONG ref;
+
+    if (impl->is_provider) return 2;
+    ref = InterlockedIncrement( &impl->ref );
     TRACE( "iface %p increasing refcount to %lu\n", iface, ref );
     return ref;
 }
@@ -1320,7 +1428,10 @@ static ULONG WINAPI x_user_gt_AddRef( IXUserGamertag *iface )
 static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
 {
     struct x_user *impl = impl_from_IXUserGamertag( iface );
-    ULONG ref = InterlockedDecrement( &impl->ref );
+    ULONG ref;
+
+    if (impl->is_provider) return 1;
+    ref = InterlockedDecrement( &impl->ref );
     TRACE( "iface %p decreasing refcount to %lu\n", iface, ref );
     if (!ref)
     {
@@ -1368,7 +1479,8 @@ static const struct IXUserGamertagVtbl x_user_gt_vtbl =
 static struct x_user x_user = {
     {&x_user_vtbl},
     {&x_user_gt_vtbl},
-    0,
+    1,
+    TRUE,
 };
 
 IXUserImpl *x_user_impl = &x_user.IXUserImpl_iface;

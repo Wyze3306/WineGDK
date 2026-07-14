@@ -29,75 +29,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(xgameruntime);
 static HMODULE xgameruntime;
 static HMODULE xgameruntime_threading;
 
-static VOID LoadOtherRuntime( DWORD *asked )
-{
-    HKEY hKey;
-    LPCSTR subKey = "Software\\Wine\\WineGDK";
-    LPCSTR valueName = "LoadOtherRuntimeAsked";
-    DWORD value;
-    DWORD dataSize = sizeof(DWORD);
-    LONG result;
-
-    *asked = 0;
-
-    result = RegCreateKeyExA(
-        HKEY_LOCAL_MACHINE,
-        subKey,
-        0,
-        NULL,
-        REG_OPTION_NON_VOLATILE,
-        KEY_READ | KEY_WRITE,
-        NULL,
-        &hKey,
-        NULL
-    );
-
-    if (result != ERROR_SUCCESS) {
-        return;
-    }
-
-    // Try to read the value
-    result = RegQueryValueExA(
-        hKey,
-        valueName,
-        NULL,
-        NULL,
-        (LPBYTE)&value,
-        &dataSize
-    );
-
-    if ( result == ERROR_FILE_NOT_FOUND ) 
-    {
-        value = 1;
-
-        result = RegSetValueExA(
-            hKey,
-            valueName,
-            0,
-            REG_DWORD,
-            (const BYTE*)&value,
-            sizeof(DWORD)
-        );
-    } else if ( result == ERROR_SUCCESS ) 
-    {
-        *asked = value;
-
-        value = 1;
-
-        result = RegSetValueExA(
-            hKey,
-            valueName,
-            0,
-            REG_DWORD,
-            (const BYTE*)&value,
-            sizeof(DWORD)
-        );
-    }
-
-    RegCloseKey( hKey );
-    return;
-}
-
 HRESULT WINAPI DllCanUnloadNow(void)
 {
     return xgameruntime != NULL ? S_FALSE : S_OK;
@@ -124,26 +55,307 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
     return TRUE;
 }
 
-/* Whether to apply the in-game sign-in patches that force the signed-in state:
- * the XblInitialize gate, the isLoggedInWithMicrosoftAccount facet, and the
- * online-server join gate. Default ON. The launcher writes
- * HKLM\Software\Wine\WineGDK\ForceMsaFacet=0
- * to turn it OFF for users whose game crashes: forcing that state sends the game
- * down code paths that deref XSAPI account/session objects which never populate
- * under Wine on some setups (issue #17/#18).
- *
- * The passive sign-in lookup null guard remains enabled regardless. */
-static BOOLEAN msa_force_enabled( void )
+static BOOLEAN online_patches_enabled( void )
 {
     HKEY key;
-    DWORD val = 1, sz = sizeof(val), type = REG_DWORD;
+    DWORD val = 0, sz = sizeof(val), type = 0;
     LONG r = RegOpenKeyExA( HKEY_LOCAL_MACHINE, "Software\\Wine\\WineGDK", 0,
                             KEY_READ, &key );
     if (r != ERROR_SUCCESS)
-        return TRUE;                         /* key absent → default ON */
+        return FALSE;
     r = RegQueryValueExA( key, "ForceMsaFacet", NULL, &type, (BYTE *)&val, &sz );
     RegCloseKey( key );
-    return !(r == ERROR_SUCCESS && type == REG_DWORD && val == 0);
+    return r == ERROR_SUCCESS && type == REG_DWORD && val != 0;
+}
+
+struct online_patch_sites
+{
+    BYTE *xbl_gate;
+    BYTE *join_gate;
+    SIZE_T xbl_rva;
+    SIZE_T join_rva;
+    INT32 xbl_jump;
+    signed char xbl_local;
+};
+
+struct online_patch_layout
+{
+    DWORD timestamp;
+    SIZE_T image_size;
+    SIZE_T xbl_rva;
+    SIZE_T join_rva;
+};
+
+static const struct online_patch_layout online_patch_layouts[] =
+{
+    {0x6a2af2e1, 0x11a13000, 0x0d7a8d18, 0x0017070c}, /* 1.26.30.5 */
+    {0x6a3c31a7, 0x11a13000, 0x0d7a8b48, 0x0017070c}, /* 1.26.32.2 */
+    {0x6a4e8d9a, 0x11a13000, 0x0d7a9168, 0x0017070c}, /* 1.26.33.1 */
+};
+
+static BOOLEAN executable_image_range( BYTE *base, SIZE_T image_size,
+                                        IMAGE_NT_HEADERS64 *nt, SIZE_T rva,
+                                        SIZE_T length )
+{
+    IMAGE_SECTION_HEADER *section;
+    MEMORY_BASIC_INFORMATION memory;
+    SIZE_T section_table, section_end, region_end;
+    WORD i;
+
+    if (!length || rva >= image_size || length > image_size - rva)
+        return FALSE;
+    section_table = (BYTE *)&nt->OptionalHeader - base +
+                    nt->FileHeader.SizeOfOptionalHeader;
+    if (!nt->FileHeader.NumberOfSections ||
+        nt->FileHeader.NumberOfSections > 96 ||
+        section_table > image_size ||
+        nt->FileHeader.NumberOfSections >
+            (image_size - section_table) / sizeof(*section))
+        return FALSE;
+    section = (IMAGE_SECTION_HEADER *)(base + section_table);
+
+    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        SIZE_T span = max( section[i].Misc.VirtualSize,
+                           section[i].SizeOfRawData );
+        SIZE_T start = section[i].VirtualAddress;
+
+        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+            start >= image_size || span > image_size - start)
+            continue;
+        section_end = start + span;
+        if (rva < start || rva + length > section_end)
+            continue;
+        if (!VirtualQuery( base + rva, &memory, sizeof(memory) ) ||
+            memory.State != MEM_COMMIT ||
+            memory.AllocationBase != base ||
+            (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            return FALSE;
+        region_end = (BYTE *)memory.BaseAddress - base + memory.RegionSize;
+        return region_end >= rva + length;
+    }
+    return FALSE;
+}
+
+static BOOLEAN locate_online_patch_sites( BYTE *base, SIZE_T size,
+                                           struct online_patch_sites *sites )
+{
+    static const BYTE xbl_prefix[] = {0x83, 0x7d, 0xff, 0x00, 0x0f, 0x8c};
+    static const BYTE xbl_suffix[] = {0x0f, 0x57, 0xc0, 0xf3, 0x0f, 0x7f, 0x45};
+    static const BYTE xbl_target[] = {0x48, 0x8d, 0x4d};
+    static const BYTE join_target[] = {0x31, 0xf6, 0x40, 0xb7, 0x01};
+    const struct online_patch_layout *layout = NULL;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS64 *nt;
+    BYTE *xbl_start, *xbl_destination, *join_start, *join_destination;
+    SIZE_T nt_offset, i;
+    INT32 xbl_jump;
+    signed char join_jump;
+    BOOLEAN has_edx_one = FALSE;
+
+    memset( sites, 0, sizeof(*sites) );
+    if (size < sizeof(*dos) || (dos = (IMAGE_DOS_HEADER *)base)->e_magic !=
+        IMAGE_DOS_SIGNATURE)
+        goto unsupported;
+    nt_offset = dos->e_lfanew;
+    if (nt_offset > size || sizeof(*nt) > size - nt_offset)
+        goto unsupported;
+    nt = (IMAGE_NT_HEADERS64 *)(base + nt_offset);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->FileHeader.SizeOfOptionalHeader !=
+            sizeof(IMAGE_OPTIONAL_HEADER64) ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt->OptionalHeader.SizeOfImage != size)
+        goto unsupported;
+    for (i = 0; i < ARRAY_SIZE(online_patch_layouts); ++i)
+    {
+        if (online_patch_layouts[i].timestamp == nt->FileHeader.TimeDateStamp &&
+            online_patch_layouts[i].image_size == size)
+        {
+            layout = &online_patch_layouts[i];
+            break;
+        }
+    }
+    if (!layout)
+        goto unsupported;
+    if (layout->xbl_rva < 4 || layout->join_rva < 7 ||
+        !executable_image_range( base, size, nt, layout->xbl_rva - 4, 18 ) ||
+        !executable_image_range( base, size, nt, layout->join_rva - 7, 0x50 ))
+        goto fingerprint_rejected;
+
+    xbl_start = base + layout->xbl_rva - 4;
+    if (memcmp( xbl_start, xbl_prefix, sizeof(xbl_prefix) ) ||
+        memcmp( xbl_start + 10, xbl_suffix, sizeof(xbl_suffix) ) ||
+        xbl_start[17] != 0xd7)
+        goto fingerprint_rejected;
+    memcpy( &xbl_jump, xbl_start + 6, sizeof(xbl_jump) );
+    if (xbl_jump < 30 || xbl_jump > 0x10000 ||
+        layout->xbl_rva + 6 + xbl_jump > size - 14)
+        goto fingerprint_rejected;
+    xbl_destination = base + layout->xbl_rva + 6 + xbl_jump;
+    if (!executable_image_range( base, size, nt,
+                                 xbl_destination - base, 14 ) ||
+        memcmp( xbl_destination, xbl_target, sizeof(xbl_target) ) ||
+        xbl_destination[4] != 0xe8 || xbl_destination[9] != 0x90 ||
+        xbl_destination[10] != 0x48 || xbl_destination[11] != 0x8b ||
+        xbl_destination[12] != 0xce || xbl_destination[13] != 0xe8)
+        goto fingerprint_rejected;
+
+    join_start = base + layout->join_rva - 7;
+    if (join_start[0] != 0x80 || join_start[1] < 0xb8 ||
+        join_start[1] > 0xbf || join_start[6] != 0x00 ||
+        join_start[7] != 0x75 ||
+        (join_start[9] != 0x48 && join_start[9] != 0x49) ||
+        join_start[10] != 0x8b ||
+        !(join_start[11] <= 0x03 || join_start[11] == 0x06 ||
+          join_start[11] == 0x07) ||
+        memcmp( join_start + 12, "\x48\x8b\x80", 3 ))
+        goto fingerprint_rejected;
+    for (i = 19; i + 5 <= 0x30; ++i)
+    {
+        if (!memcmp( join_start + i, "\xba\x01\x00\x00\x00", 5 ))
+        {
+            has_edx_one = TRUE;
+            break;
+        }
+    }
+    join_jump = (signed char)join_start[8];
+    join_destination = join_start + 9 + join_jump;
+    if (!has_edx_one || join_destination < join_start + 19 ||
+        join_destination > join_start + 0x4b ||
+        memcmp( join_destination, join_target, sizeof(join_target) ) ||
+        !executable_image_range( base, size, nt,
+                                 join_destination - base,
+                                 sizeof(join_target) ))
+        goto fingerprint_rejected;
+    if ((layout->xbl_rva & 7) || (layout->join_rva & 3))
+        goto fingerprint_rejected;
+
+    sites->xbl_gate = base + layout->xbl_rva;
+    sites->join_gate = base + layout->join_rva;
+    sites->xbl_rva = layout->xbl_rva;
+    sites->join_rva = layout->join_rva;
+    sites->xbl_jump = xbl_jump;
+    sites->xbl_local = (signed char)xbl_start[2];
+    return TRUE;
+
+unsupported:
+    ERR( "unsupported Minecraft PE layout for guarded online patches\n" );
+    return FALSE;
+fingerprint_rejected:
+    ERR( "known Minecraft online-patch fingerprint rejected\n" );
+    return FALSE;
+}
+
+void WineGDKApplyOnlinePatches( BOOLEAN user_ready )
+{
+    static const BYTE xbl_replacement[] = {0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00};
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static BOOLEAN applied;
+    struct online_patch_sites sites;
+    MODULEINFO module;
+    HMODULE game;
+    DWORD xbl_protection, join_protection, ignored;
+    LONG expected_join, replacement_join, previous_join;
+    LONG64 expected_xbl, replacement_xbl, previous_xbl;
+    BOOLEAN xbl_writable = FALSE;
+
+    if (!online_patches_enabled())
+        return;
+    if (!user_ready)
+    {
+        ERR( "online patches skipped: XUser multiplayer credentials are incomplete\n" );
+        return;
+    }
+
+    AcquireSRWLockExclusive( &lock );
+    if (applied)
+        goto done;
+
+    game = GetModuleHandleA( NULL );
+    if (!game || !GetModuleInformation( GetCurrentProcess(), game, &module,
+                                         sizeof(module) ) ||
+        !locate_online_patch_sites( module.lpBaseOfDll, module.SizeOfImage,
+                                    &sites ))
+        goto done;
+
+    if (!VirtualProtect( sites.xbl_gate, 8, PAGE_EXECUTE_READWRITE,
+                         &xbl_protection ))
+    {
+        ERR( "could not make XblInitialize gate writable, error %lu\n",
+             GetLastError() );
+        goto done;
+    }
+    xbl_writable = TRUE;
+    if (!VirtualProtect( sites.join_gate, 4, PAGE_EXECUTE_READWRITE,
+                         &join_protection ))
+    {
+        ERR( "could not make online-server gate writable, error %lu\n",
+             GetLastError() );
+        VirtualProtect( sites.xbl_gate, 8, xbl_protection, &ignored );
+        goto done;
+    }
+
+    memcpy( &expected_join, sites.join_gate, sizeof(expected_join) );
+    memcpy( &expected_xbl, sites.xbl_gate, sizeof(expected_xbl) );
+    replacement_join = expected_join;
+    replacement_xbl = expected_xbl;
+    ((BYTE *)&replacement_join)[0] = 0xeb;
+    memcpy( &replacement_xbl, xbl_replacement, sizeof(xbl_replacement) );
+    if (((BYTE *)&expected_join)[0] != 0x75 ||
+        ((BYTE *)&expected_join)[2] != 0x48 ||
+        ((BYTE *)&expected_join)[3] != 0x8b ||
+        ((BYTE *)&expected_xbl)[0] != 0x0f ||
+        ((BYTE *)&expected_xbl)[1] != 0x8c)
+    {
+        ERR( "online patch sites changed before commit\n" );
+        goto restore;
+    }
+
+    previous_join = InterlockedCompareExchange(
+        (LONG volatile *)sites.join_gate, replacement_join, expected_join );
+    if (previous_join != expected_join)
+    {
+        ERR( "online-server gate changed during atomic commit\n" );
+        goto restore;
+    }
+    previous_xbl = InterlockedCompareExchange64(
+        (LONG64 volatile *)sites.xbl_gate, replacement_xbl, expected_xbl );
+    if (previous_xbl != expected_xbl)
+    {
+        ERR( "XblInitialize gate changed during atomic commit\n" );
+        previous_join = InterlockedCompareExchange(
+            (LONG volatile *)sites.join_gate, expected_join, replacement_join );
+        if (previous_join != replacement_join)
+            ERR( "online-server gate rollback failed\n" );
+        goto restore;
+    }
+    if (!FlushInstructionCache( GetCurrentProcess(), sites.join_gate, 4 ) ||
+        !FlushInstructionCache( GetCurrentProcess(), sites.xbl_gate, 8 ))
+    {
+        ERR( "could not flush committed online patch instructions, error %lu\n",
+             GetLastError() );
+    }
+    applied = TRUE;
+
+restore:
+    if (!VirtualProtect( sites.join_gate, 4, join_protection, &ignored ))
+        ERR( "could not restore online-server gate protection, error %lu\n",
+             GetLastError() );
+    if (xbl_writable &&
+        !VirtualProtect( sites.xbl_gate, 8, xbl_protection, &ignored ))
+        ERR( "could not restore XblInitialize gate protection, error %lu\n",
+             GetLastError() );
+    if (applied)
+        ERR( "user ready: committed XblInitialize gate at RVA 0x%llx and "
+             "online-server gate at RVA 0x%llx (local=%d, jump=+%d)\n",
+             (unsigned long long)sites.xbl_rva,
+             (unsigned long long)sites.join_rva,
+             sites.xbl_local, sites.xbl_jump );
+
+done:
+    ReleaseSRWLockExclusive( &lock );
 }
 
 typedef HRESULT (WINAPI *InitializeApiImplEx2_ext)( ULONG gdkVer, ULONG gsVer, CHAR mode, INITIALIZE_OPTIONS *options );
@@ -152,9 +364,6 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 {
     HRESULT hr;
     static BOOLEAN com_initialized = FALSE;
-    /* Read once: master gate for the state-forcing sign-in patches. */
-    BOOLEAN force = msa_force_enabled();
-
     TRACE("gdkVer %ld, gsVer %ld, mode %d, options %p\n", gdkVer, gsVer, mode, options);
 
     /* Initialize COM for the GDK runtime - needed for DllGetClassObject / CoCreateInstance.
@@ -214,439 +423,6 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
         }
     }
 
-    /* NOP the credential check gate that blocks XblInitialize.
-     * The game's XboxLiveServices::signIn checks a credential provider
-     * (call returns into a local at [rbp+disp8]); a JL on that result skips
-     * the entire "user is signed in" success path including XblInitialize.
-     *
-     * Shape we look for: a 4-byte `cmp DWORD PTR [rbp+disp8], 0` (83 7D
-     * disp8 00) followed by the 6-byte long-form JL (0F 8C off32) followed
-     * (after the 6-byte JL) by `xorps xmm0, xmm0` (0F 57 C0).  Three
-     * suffixes after xorps are accepted because compiler output varies
-     * across MC versions:
-     *   - `33 C0`           (xor eax, eax)         ≤ 1.26.12
-     *   - `F3 0F 7F 45 ??`  (movdqu [rbp+disp8], xmm0)  1.26.20+
-     *   - `F3 0F 7F 85 ?? ?? ?? ??` (movdqu [rbp+disp32], xmm0) wide form
-     *
-     * The disp8 of the cmp also changed between versions (was 0xE8 / rbp-24,
-     * now 0xFF / rbp-1), so we no longer pin it.  To stay precise we still
-     * require the JL to target a forward offset of at least +30 (typical
-     * for the failure-skip branch — backward-jumping JLs are loop tails). */
-    {
-        static BOOLEAN patched2 = FALSE;
-        if (force && !patched2)
-        {
-            HMODULE game2 = GetModuleHandleA( NULL );
-            if (game2)
-            {
-                MODULEINFO mi2;
-                if (GetModuleInformation( GetCurrentProcess(), game2, &mi2, sizeof(mi2) ))
-                {
-                    BYTE *base = (BYTE *)mi2.lpBaseOfDll;
-                    SIZE_T size = mi2.SizeOfImage;
-                    static const BYTE xorps[] = { 0x0F, 0x57, 0xC0 };
-                    SIZE_T i;
-                    DWORD op;
-
-                    for (i = 0; i + 16 < size; i++)
-                    {
-                        /* cmp DWORD PTR [rbp+disp8], 0  (83 7D ?? 00) */
-                        if (base[i] != 0x83 || base[i+1] != 0x7D || base[i+3] != 0x00) continue;
-                        /* 6-byte JL long form right after */
-                        if (base[i+4] != 0x0F || base[i+5] != 0x8C) continue;
-                        /* JL must jump forward by >=30 (real gates always
-                         * skip a real chunk of success-path code) */
-                        INT32 jdisp = *(INT32 *)(base + i + 6);
-                        if (jdisp < 30 || jdisp > 0x10000) continue;
-                        /* After the 6-byte JL: xorps xmm0, xmm0 */
-                        if (memcmp( base + i + 10, xorps, sizeof(xorps) ) != 0) continue;
-                        /* And one of the accepted "zero-the-local" suffixes */
-                        BYTE *s = base + i + 13;
-                        BOOLEAN suffix_ok = (s[0] == 0x33 && s[1] == 0xC0) ||                       /* xor eax,eax */
-                                            (s[0] == 0xF3 && s[1] == 0x0F && s[2] == 0x7F && s[3] == 0x45) || /* movdqu [rbp+d8],xmm0 */
-                                            (s[0] == 0xF3 && s[1] == 0x0F && s[2] == 0x7F && s[3] == 0x85);   /* movdqu [rbp+d32],xmm0 */
-                        if (!suffix_ok) continue;
-
-                        /* NOP the JL: 0F 8C xx xx xx xx → 66 0F 1F 44 00 00 */
-                        if (VirtualProtect( base + i + 4, 6, PAGE_EXECUTE_READWRITE, &op ))
-                        {
-                            base[i+4] = 0x66; base[i+5] = 0x0F; base[i+6] = 0x1F;
-                            base[i+7] = 0x44; base[i+8] = 0x00; base[i+9] = 0x00;
-                            VirtualProtect( base + i + 4, 6, op, &op );
-                            ERR( "patched XblInitialize gate at %p (RVA 0x%lx, disp8=%d, jdisp=+%d)\n",
-                                 base + i + 4, (ULONG_PTR)(i + 4),
-                                 (signed char)base[i+2], jdisp );
-                            patched2 = TRUE;
-                        }
-                        break;
-                    }
-                    if (!patched2)
-                        ERR( "XblInitialize gate pattern not found\n" );
-                }
-            }
-        }
-    }
-
-    /* Force the game's isLoggedInWithMicrosoftAccount getter to TRUE.
-     * The UI ("userAccount" facet) reads this bool to decide whether the player
-     * is signed in with an MSA; on Win32/Wine XSAPI's social manager never
-     * finishes so it stays false, which keeps the home-screen "Sign in" button
-     * up and greys the Servers tab's join buttons. The getter is a tiny
-     * `movzx eax, byte ptr [rcx+disp8] ; ret` whose address is the 2nd `lea`
-     * (the value-getter) emitted right after the field-name string in the facet
-     * serializer. We anchor on the immutable string "isLoggedInWithMicrosoftAccount":
-     *   1. find the string in .rdata,
-     *   2. scan .text for the `lea rXX,[rip+d]` that points at it (the name lea),
-     *   3. the getter `lea rax,[rip+d]` sits 0x13 bytes after that name lea,
-     *   4. resolve its target and overwrite the getter with `mov eax,1; ret`.
-     * Version-robust: the string + serializer shape are stable; disp8/offsets
-     * are read at runtime, never hard-coded. Gated by ForceMsaFacet (default
-     * ON) so users it crashes (issue #17/#18) can turn it off. */
-    if (force)
-    {
-        static BOOLEAN patched3 = FALSE;
-        if (!patched3)
-        {
-            HMODULE game3 = GetModuleHandleA( NULL );
-            if (game3)
-            {
-                MODULEINFO mi3;
-                if (GetModuleInformation( GetCurrentProcess(), game3, &mi3, sizeof(mi3) ))
-                {
-                    BYTE *base = (BYTE *)mi3.lpBaseOfDll;
-                    SIZE_T size = mi3.SizeOfImage;
-                    static const char needle[] = "isLoggedInWithMicrosoftAccount";
-                    SIZE_T nlen = sizeof(needle) - 1;
-                    BYTE *str = NULL;
-                    SIZE_T i;
-                    DWORD oldprot;
-
-                    /* 1. locate the field-name string (must be NUL-terminated to
-                     *    avoid matching a longer superset). */
-                    for (i = 0; i + nlen + 1 < size; i++)
-                    {
-                        if (base[i] == 'i' &&
-                            memcmp( base + i, needle, nlen ) == 0 &&
-                            base[i + nlen] == 0)
-                        { str = base + i; break; }
-                    }
-
-                    if (str)
-                    {
-                        ULONG_PTR str_rva = (ULONG_PTR)(str - base);
-                        BYTE *name_lea = NULL;
-
-                        /* 2. find the `lea reg,[rip+disp32]` whose target == str.
-                         *    encoding: (48|4C) 8D modrm(rm=101) disp32, len 7. */
-                        for (i = 0; i + 7 < size; i++)
-                        {
-                            if ((base[i] == 0x48 || base[i] == 0x4C) &&
-                                base[i+1] == 0x8D &&
-                                (base[i+2] & 0xC7) == 0x05)
-                            {
-                                INT32 disp = *(INT32 *)(base + i + 3);
-                                ULONG_PTR tgt = (ULONG_PTR)(i + 7) + disp;
-                                if (tgt == str_rva) { name_lea = base + i; break; }
-                            }
-                        }
-
-                        if (name_lea)
-                        {
-                            /* 3. the value-getter lea sits a short distance
-                             *    after the name lea — 0x13 in 1.26.20/.21 but
-                             *    0x14 in 1.26.30 (the serializer shape shifts
-                             *    between versions). Scan a small window for the
-                             *    `(48|4C) 8D 05 disp32` whose target is the bool
-                             *    getter `movzx eax,byte[rcx+disp8]; ret`
-                             *    (0F B6 41 disp8 C3) and overwrite its exact
-                             *    five-byte body with `xor eax,eax; inc eax; ret`.
-                             *    Scanning by shape (not a
-                             *    hard-coded offset) keeps this version-robust. */
-                            int off;
-                            for (off = 0x10; off <= 0x20 && !patched3; off++)
-                            {
-                                BYTE *gl = name_lea + off;
-                                INT32 gdisp;
-                                ULONG_PTR getter_rva;
-                                BYTE *getter;
-                                if (!((gl[0] == 0x48 || gl[0] == 0x4C) &&
-                                      gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05))
-                                    continue;
-                                gdisp = *(INT32 *)(gl + 3);
-                                getter_rva = (ULONG_PTR)(gl + 7 - base) + gdisp;
-                                if (getter_rva + 5 > size) continue;
-                                getter = base + getter_rva;
-                                if (getter[0] == 0x0F && getter[1] == 0xB6 &&
-                                    getter[2] == 0x41 && getter[4] == 0xC3)
-                                {
-                                    if (VirtualProtect( getter, 5, PAGE_EXECUTE_READWRITE, &oldprot ))
-                                    {
-                                        getter[0] = 0x31; getter[1] = 0xC0;
-                                        getter[2] = 0xFF; getter[3] = 0xC0;
-                                        getter[4] = 0xC3;
-                                        FlushInstructionCache( GetCurrentProcess(), getter, 5 );
-                                        VirtualProtect( getter, 5, oldprot, &oldprot );
-                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx (name_lea+0x%x)\n",
-                                             (ULONG_PTR)getter_rva, off );
-                                        patched3 = TRUE;
-                                    }
-                                }
-                            }
-                            if (!patched3)
-                                ERR( "MSA value-getter not found in window after name_lea\n" );
-                        }
-                        else
-                            ERR( "MSA name-lea xref not found\n" );
-                    }
-                    else
-                        ERR( "isLoggedInWithMicrosoftAccount string not found\n" );
-                }
-            }
-        }
-    }
-
-    /* Unlock joining online Bedrock servers.
-     * The connect dispatcher gates the join on an "online Xbox Live sign-in"
-     * check that wrongly fails for our native login (returns
-     * UserNeedsToBeSignedIn before any packet is sent); flip that branch.
-     *
-     * The gate's exact bytes drift between versions — both the field register
-     * and the first vtable offset change (1.26.20-30: cmp byte[rsi+0x98],0 /
-     * mov rax,[rax+0x278]; 1.26.40: cmp byte[r13+0x98],0 / +0x270). What stays
-     * constant is the SHAPE:
-     *     cmp byte[reg+disp32], 0   ; 80 [B8-BF] dd dd dd dd 00
-     *     jne  <fail>               ; 75 rel8                 <- flip to EB
-     *     mov  rax, [reg]           ; (48|49) 8B (rm 0..3,6,7)
-     *     mov  rax, [rax+disp32]    ; 48 8B 80 dd dd dd dd     (1st vtable call)
-     *     ... mov edx, 1 ...        ; BA 01 00 00 00           (2nd vtable call)
-     * Match that structure with the offsets/registers wildcarded, confirm with
-     * the `mov edx,1` tail, and patch only when EXACTLY ONE such site exists
-     * (never flip an ambiguous match). Covers the whole 1.26.x line (20->40). */
-    {
-        static BOOLEAN patched4 = FALSE;
-        if (force && !patched4)
-        {
-            HMODULE game = GetModuleHandleA( NULL );
-            MODULEINFO modinfo;
-            if (game && GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
-            {
-                BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
-                SIZE_T size = modinfo.SizeOfImage, i, j;
-                BYTE *gate = NULL;
-                int n = 0;
-                for (i = 0; i + 19 < size; i++)
-                {
-                    BYTE rm;
-                    BOOLEAN edx1 = FALSE;
-                    if (base[i] != 0x80) continue;                       /* cmp byte */
-                    if (base[i+1] < 0xB8 || base[i+1] > 0xBF) continue;  /* [reg+disp32] */
-                    if (base[i+6] != 0x00) continue;                     /* ,0 */
-                    if (base[i+7] != 0x75) continue;                     /* jne rel8 */
-                    if (!(base[i+9] == 0x48 || base[i+9] == 0x49) ||
-                        base[i+10] != 0x8B) continue;                    /* mov rax,[reg] */
-                    rm = base[i+11];
-                    if (!(rm <= 0x03 || rm == 0x06 || rm == 0x07)) continue;
-                    if (!(base[i+12] == 0x48 && base[i+13] == 0x8B &&
-                          base[i+14] == 0x80)) continue;                 /* mov rax,[rax+disp32] */
-                    for (j = i + 19; j + 5 <= size && j < i + 0x30; j++)
-                        if (base[j] == 0xBA && base[j+1] == 0x01 && base[j+2] == 0x00 &&
-                            base[j+3] == 0x00 && base[j+4] == 0x00) { edx1 = TRUE; break; }
-                    if (!edx1) continue;                                 /* connect-gate tail */
-                    gate = base + i + 7;                                 /* the jne */
-                    if (++n > 1) break;                                  /* ambiguous -> bail */
-                }
-                if (n == 1)
-                {
-                    DWORD oldprot;
-                    if (VirtualProtect( gate, 1, PAGE_EXECUTE_READWRITE, &oldprot ))
-                    {
-                        *gate = 0xEB;          /* jne -> jmp */
-                        VirtualProtect( gate, 1, oldprot, &oldprot );
-                        ERR( "patched online-server join gate at RVA 0x%lx\n", (ULONG_PTR)(gate - base) );
-                        patched4 = TRUE;
-                    }
-                }
-                else
-                    ERR( "online-server join gate: %d candidate(s) (need exactly 1) - not patched\n", n );
-            }
-        }
-    }
-
-    /* Null-guard the sign-in-state lookup used by MSA facet forcing.
-     * Where the MSA
-     * account object is populated (most installs) that's all the game needs
-     * and the Servers tab unlocks. But on some installs (a fresh Steam Deck
-     * prefix, issue #17) the backing collection pointer is still NULL when an
-     * early lookup runs, so this routine derefs NULL and page-faults seconds
-     * after boot:
-     *     mov rax,[rax+rdi+0x58]   ; selected collection (NULL there)
-     *     mov rdx,[rax+8]          ; <-- #PF read [NULL+8]
-     *     cmp byte[rdx+0x19],0 ; mov rcx,rax ; jne ...
-     * The routine just looks a key up in one of two collections and returns a
-     * byte; an empty (NULL) collection means "not found" = 0. We splice a
-     * trampoline in after the collection load: it returns 0 when the pointer
-     * is NULL and otherwise runs unchanged - so facet forcing keeps working where
-     * the object exists (no behaviour change) and never crashes where it
-     * doesn't. Version-robust: the body + `push rsi;push rdi;sub rsp,0x28`
-     * prologue are byte-identical across 1.26.20..40 (verified static). We
-     * anchor on the unique body signature, confirm the prologue, and patch
-     * only when EXACTLY ONE site matches. */
-    {
-        static BOOLEAN patched5 = FALSE;
-        if (!patched5)
-        {
-            HMODULE game = GetModuleHandleA( NULL );
-            MODULEINFO modinfo;
-            if (game && GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
-            {
-                BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
-                SIZE_T size = modinfo.SizeOfImage, i;
-                /* body: mov rax,[rax+rdi+0x58]; mov rdx,[rax+8];
-                 *       cmp byte[rdx+0x19],0; mov rcx,rax; jne */
-                static const BYTE sig[] = {
-                    0x48,0x8b,0x44,0x38,0x58, 0x48,0x8b,0x50,0x08,
-                    0x80,0x7a,0x19,0x00, 0x48,0x89,0xc1, 0x75 };
-                /* prologue 0x20 earlier: push rsi; push rdi; sub rsp,0x28 */
-                static const BYTE prologue[] = { 0x56,0x57,0x48,0x83,0xec,0x28 };
-                BYTE *match = NULL;
-                int n = 0;
-                for (i = 0; i + sizeof(sig) < size; i++)
-                {
-                    if (base[i] == 0x48 && memcmp( base + i, sig, sizeof(sig) ) == 0)
-                    { match = base + i; if (++n > 1) break; }
-                }
-                if (n == 1 && (ULONG_PTR)(match - base) >= 0x20 &&
-                    memcmp( match - 0x20, prologue, sizeof(prologue) ) == 0)
-                {
-                    /* locate the executable section holding the match, then a
-                     * >=28-byte run of 0xCC (inter-function padding) inside it
-                     * for the trampoline. */
-                    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
-                    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
-                    BYTE *cave = NULL, *sec_base = NULL;
-                    SIZE_T sec_size = 0, s, run = 0, cstart = 0, best = 0, bstart = 0;
-                    ULONG_PTR mrva = (ULONG_PTR)(match - base);
-
-                    if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
-                        nt->Signature == IMAGE_NT_SIGNATURE &&
-                        nt->FileHeader.NumberOfSections > 0 &&
-                        nt->FileHeader.NumberOfSections <= 96)
-                    {
-                        IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
-                        WORD k;
-                        for (k = 0; k < nt->FileHeader.NumberOfSections; k++)
-                        {
-                            ULONG_PTR va = sec[k].VirtualAddress;
-                            ULONG_PTR vsz = sec[k].Misc.VirtualSize;
-                            if (mrva >= va && mrva < va + vsz &&
-                                (sec[k].Characteristics & IMAGE_SCN_MEM_EXECUTE))
-                            { sec_base = base + va; sec_size = vsz; break; }
-                        }
-                    }
-                    for (s = 0; sec_base && s < sec_size; s++)
-                    {
-                        if (sec_base[s] == 0xCC)
-                        {
-                            if (run == 0) cstart = s;
-                            if (++run > best) { best = run; bstart = cstart; }
-                            if (best >= 42) break;       /* enough for the full guard */
-                        }
-                        else run = 0;
-                    }
-                    if (best >= 24) cave = sec_base + bstart;
-
-                    if (cave)
-                    {
-                        ULONG_PTR crva = (ULONG_PTR)(cave - base);
-                        INT32 to_cave = (INT32)(crva - (mrva + 5));
-                        BOOLEAN full = (best >= 42);
-                        DWORD oldprot;
-                        /* The lookup walks a CHAIN of pointers:
-                         *   mov rax,[rax+rdi+0x58]   ; the collection
-                         *   mov rdx,[rax+8]          ; its backing data pointer
-                         *   cmp byte[rdx+0x19],0     ; the byte it returns
-                         * On a slow Steam Deck it runs before the collection is
-                         * populated, so any link can be NULL or a garbage /
-                         * non-canonical pointer and the routine page-faults
-                         * (issue #21 rdx==NULL, issue #22 rax non-canonical,
-                         * issue #25 rdx==-1/non-canonical — the backing data
-                         * pointer was -1, which passed the old rdx!=NULL test
-                         * and faulted on cmp byte[rdx+0x19]).
-                         * "Empty/absent" is just a 0 return, so guard the WHOLE
-                         * chain: return 0 unless every link is a sane pointer,
-                         * else run the real lookup unchanged.
-                         *
-                         * Full guard (42 B — needs a big enough cave):
-                         *   48 8b 44 38 58  mov rax,[rax+rdi+0x58]  (relocated)
-                         *   48 89 c2        mov rdx,rax
-                         *   48 c1 ea 2f     shr rdx,47          ; canonical?
-                         *   75 13           jnz null_exit       ; non-canonical rax (#22)
-                         *   48 85 c0        test rax,rax
-                         *   74 0e           jz  null_exit       ; NULL rax
-                         *   48 8b 50 08     mov rdx,[rax+8]     (relocated)
-                         *   48 85 d2        test rdx,rdx
-                         *   7e 05           jle null_exit       ; NULL or -1/non-canonical data ptr (#21,#25)
-                         *   e9 rel32        jmp match+9 (the cmp)
-                         * null_exit: 31 c0 / 48 83 c4 28 / 5f / 5e / c3
-                         * Fallback (no >=42 B cave): the original 24-byte guard
-                         * (rax!=NULL only) so a stingy binary never regresses. */
-                        if (full && VirtualProtect( cave, 42, PAGE_EXECUTE_READWRITE, &oldprot ))
-                        {
-                            INT32 back = (INT32)((mrva + 9) - (crva + 33));
-                            cave[0]=0x48; cave[1]=0x8b; cave[2]=0x44; cave[3]=0x38; cave[4]=0x58;
-                            cave[5]=0x48; cave[6]=0x89; cave[7]=0xc2;
-                            cave[8]=0x48; cave[9]=0xc1; cave[10]=0xea; cave[11]=0x2f;
-                            cave[12]=0x75; cave[13]=0x13;
-                            cave[14]=0x48; cave[15]=0x85; cave[16]=0xc0;
-                            cave[17]=0x74; cave[18]=0x0e;
-                            cave[19]=0x48; cave[20]=0x8b; cave[21]=0x50; cave[22]=0x08;
-                            cave[23]=0x48; cave[24]=0x85; cave[25]=0xd2;  /* test rdx,rdx */
-                            cave[26]=0x7e; cave[27]=0x05;  /* jle (was jz): also reject -1/non-canonical rdx (#25) */
-                            cave[28]=0xe9;
-                            cave[29]=(BYTE)back; cave[30]=(BYTE)(back>>8);
-                            cave[31]=(BYTE)(back>>16); cave[32]=(BYTE)(back>>24);
-                            cave[33]=0x31; cave[34]=0xc0;
-                            cave[35]=0x48; cave[36]=0x83; cave[37]=0xc4; cave[38]=0x28;
-                            cave[39]=0x5f; cave[40]=0x5e; cave[41]=0xc3;
-                            VirtualProtect( cave, 42, oldprot, &oldprot );
-                        }
-                        else if (VirtualProtect( cave, 24, PAGE_EXECUTE_READWRITE, &oldprot ))
-                        {
-                            INT32 back = (INT32)((mrva + 5) - (crva + 0x0f));
-                            full = FALSE;
-                            cave[0]=0x48; cave[1]=0x8b; cave[2]=0x44; cave[3]=0x38; cave[4]=0x58;
-                            cave[5]=0x48; cave[6]=0x85; cave[7]=0xc0;
-                            cave[8]=0x74; cave[9]=0x05;
-                            cave[10]=0xe9;
-                            cave[11]=(BYTE)back; cave[12]=(BYTE)(back>>8);
-                            cave[13]=(BYTE)(back>>16); cave[14]=(BYTE)(back>>24);
-                            cave[15]=0x31; cave[16]=0xc0;
-                            cave[17]=0x48; cave[18]=0x83; cave[19]=0xc4; cave[20]=0x28;
-                            cave[21]=0x5f; cave[22]=0x5e; cave[23]=0xc3;
-                            VirtualProtect( cave, 24, oldprot, &oldprot );
-                        }
-                        else cave = NULL;
-
-                        if (cave && VirtualProtect( match, 5, PAGE_EXECUTE_READWRITE, &oldprot ))
-                        {
-                            match[0]=0xe9;
-                            match[1]=(BYTE)to_cave; match[2]=(BYTE)(to_cave>>8);
-                            match[3]=(BYTE)(to_cave>>16); match[4]=(BYTE)(to_cave>>24);
-                            VirtualProtect( match, 5, oldprot, &oldprot );
-                            ERR( "patched sign-in lookup null-guard at RVA 0x%lx (cave 0x%lx, %s)\n",
-                                 (ULONG_PTR)mrva, (ULONG_PTR)crva, full ? "full chain" : "rax-only" );
-                            patched5 = TRUE;
-                        }
-                    }
-                    else
-                        ERR( "sign-in lookup null-guard: no code cave found\n" );
-                }
-                else
-                    ERR( "sign-in lookup null-guard: %d site(s) (need 1) or prologue mismatch - not patched\n", n );
-            }
-        }
-    }
-
     return GDKC_InitAPI( gdkVer, gsVer, mode, options );
 }
 
@@ -690,8 +466,6 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
     //
 
     QueryApiImpl_ext func = (QueryApiImpl_ext)GetProcAddress( xgameruntime_threading, "QueryApiImpl" );
-    DWORD asked;
-
     TRACE("runtimeClassId %s, interfaceId %s, out %p\n", debugstr_guid(runtimeClassId), debugstr_guid(interfaceId), out);
 
     if ( IsEqualGUID( runtimeClassId, &CLSID_XSystemImpl ) )
