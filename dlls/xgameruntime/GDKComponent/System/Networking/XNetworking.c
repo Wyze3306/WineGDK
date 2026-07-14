@@ -26,28 +26,40 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 static HRESULT CALLBACK HTTPClientProvider( XAsyncOp operation, const XAsyncProviderData *data )
 {
     HRESULT status;
-    IXThreadingImpl *threadingImpl;
+    IXThreadingImpl *threadingImpl = NULL;
 
     struct UrlSecurityInfoContext *context = (struct UrlSecurityInfoContext *)data->context;
 
-    // Threading module may be obtained from another binary.
     TRACE( "operation %d, data %p\n", operation, data );
-
-    status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
-    if ( FAILED( status ) ) return status;
 
     switch ( operation )
     {
         case Begin:
         {
-            return IXThreadingImpl_XAsyncSchedule( threadingImpl, data->async, 100 );
+            status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
+                    (void **)&threadingImpl );
+            if ( SUCCEEDED( status ) )
+            {
+                status = IXThreadingImpl_XAsyncSchedule( threadingImpl, data->async, 100 );
+                IXThreadingImpl_Release( threadingImpl );
+            }
+            return status;
         }
 
         case DoWork:
         {
-            status = httpclient_ObtainSecurityInformationForUrl( context->url, &context->securityInformationBuffer, &context->securityInformationBufferCount, &context->securityInformation );
+            status = httpclient_ObtainSecurityInformationForUrl( context->url,
+                    &context->securityInformationBuffer,
+                    &context->securityInformationBufferCount );
 
-            IXThreadingImpl_XAsyncComplete( threadingImpl, data->async, status, context->securityInformationBufferCount );
+            {
+                HRESULT queryStatus = QueryApiImpl( &CLSID_XThreadingImpl,
+                        &IID_IXThreadingImpl, (void **)&threadingImpl );
+                if ( FAILED( queryStatus ) ) return queryStatus;
+            }
+            IXThreadingImpl_XAsyncComplete( threadingImpl, data->async, status,
+                    SUCCEEDED( status ) ? context->securityInformationBufferCount : 0 );
+            IXThreadingImpl_Release( threadingImpl );
 
             return status;
         }
@@ -56,7 +68,33 @@ static HRESULT CALLBACK HTTPClientProvider( XAsyncOp operation, const XAsyncProv
         {
             if ( data->buffer && data->bufferSize >= context->securityInformationBufferCount )
             {
-                memcpy( data->buffer, &context->securityInformationBuffer, context->securityInformationBufferCount );
+                XNetworkingSecurityInformation *information;
+                XNetworkingThumbprint *thumbprints;
+                BYTE *bufferEnd, *thumbprintData;
+                SIZE_T i;
+
+                if ( context->securityInformationBufferCount < sizeof(*information) )
+                    return E_FAIL;
+                memcpy( data->buffer, context->securityInformationBuffer,
+                        context->securityInformationBufferCount );
+                information = data->buffer;
+                bufferEnd = (BYTE *)data->buffer + context->securityInformationBufferCount;
+                if ( information->thumbprintCount >
+                        (context->securityInformationBufferCount - sizeof(*information)) /
+                        sizeof(*thumbprints) )
+                    return E_FAIL;
+
+                thumbprints = (XNetworkingThumbprint *)(information + 1);
+                information->thumbprints = thumbprints;
+                thumbprintData = (BYTE *)(thumbprints + information->thumbprintCount);
+                for ( i = 0; i < information->thumbprintCount; i++ )
+                {
+                    if ( thumbprints[i].thumbprintBufferByteCount >
+                            (SIZE_T)(bufferEnd - thumbprintData) )
+                        return E_FAIL;
+                    thumbprints[i].thumbprintBuffer = thumbprintData;
+                    thumbprintData += thumbprints[i].thumbprintBufferByteCount;
+                }
                 return S_OK;
             }
             return E_BOUNDS;
@@ -64,12 +102,20 @@ static HRESULT CALLBACK HTTPClientProvider( XAsyncOp operation, const XAsyncProv
 
         case Cancel:
         {
-            IXThreadingImpl_XAsyncComplete( threadingImpl, data->async, E_ABORT, 0 );
-            return S_OK;
+            status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
+                    (void **)&threadingImpl );
+            if ( SUCCEEDED( status ) )
+            {
+                IXThreadingImpl_XAsyncComplete( threadingImpl, data->async, E_ABORT, 0 );
+                IXThreadingImpl_Release( threadingImpl );
+            }
+            return status;
         }
 
         case Cleanup:
         {
+            free( context->securityInformationBuffer );
+            if ( context->ownsUrl ) free( (void *)context->url );
             free( context );
             return S_OK;
         }
@@ -162,19 +208,16 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyn
      *
      * Delegate to the UTF16 variant after a CP_UTF8→UTF-16 conversion.
      * HTTPClientProvider does the real HTTP probe, completes the
-     * XAsyncBlock, and lets the game proceed.  Ownership: the wide
-     * URL string is leaked here — it lives until the async completes
-     * and HTTPClientProvider's Cleanup branch should free it (we
-     * pass it through UrlSecurityInfoContext->url so the provider
-     * owns the lifecycle alongside its context). */
+     * XAsyncBlock, and lets the game proceed. */
     HRESULT status;
     IXThreadingImpl *threadingImpl;
+    struct UrlSecurityInfoContext *context;
     WCHAR *wurl;
     int wlen;
 
     TRACE( "iface %p, url %s, asyncBlock %p\n", iface, url ? url : "(null)", asyncBlock );
 
-    if (!url) return E_POINTER;
+    if ( !url || !asyncBlock ) return E_POINTER;
 
     wlen = MultiByteToWideChar( CP_UTF8, 0, url, -1, NULL, 0 );
     if (wlen <= 0) return HRESULT_FROM_WIN32( GetLastError() );
@@ -188,13 +231,16 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyn
     status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
     if ( FAILED( status ) ) { free( wurl ); return status; }
 
-    struct UrlSecurityInfoContext *context = (struct UrlSecurityInfoContext *)malloc( sizeof( struct UrlSecurityInfoContext ) );
-    if ( !context ) { free( wurl ); return E_OUTOFMEMORY; }
+    context = calloc( 1, sizeof(*context) );
+    if ( !context )
+    {
+        IXThreadingImpl_Release( threadingImpl );
+        free( wurl );
+        return E_OUTOFMEMORY;
+    }
 
-    /* Zero the context so HTTPClientProvider sees uninitialised fields
-     * as NULL and decides safely. */
-    memset( context, 0, sizeof( *context ) );
     context->url = wurl;
+    context->ownsUrl = TRUE;
 
     status = IXThreadingImpl_XAsyncBegin( threadingImpl, asyncBlock, context, NULL,
                                            "XNetworkingQuerySecurityInformationForUrlAsync", HTTPClientProvider );
@@ -203,6 +249,7 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyn
         free( context );
         free( wurl );
     }
+    IXThreadingImpl_Release( threadingImpl );
     return status;
 }
 
@@ -215,7 +262,10 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyn
 
     status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
     if ( FAILED( status ) ) return status;
-    return IXThreadingImpl_XAsyncGetResultSize( threadingImpl, asyncBlock, securityInformationBufferByteCount );
+    status = IXThreadingImpl_XAsyncGetResultSize( threadingImpl, asyncBlock,
+            securityInformationBufferByteCount );
+    IXThreadingImpl_Release( threadingImpl );
+    return status;
 }
 
 static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyncResult( IXNetworkingImpl *iface, XAsyncBlock *asyncBlock, SIZE_T securityInformationBufferByteCount, SIZE_T *securityInformationBufferByteCountUsed, UINT8 *securityInformationBuffer, XNetworkingSecurityInformation **securityInformation )
@@ -223,8 +273,9 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyn
     HRESULT status;
     IXThreadingImpl *threadingImpl;
 
-    TRACE( "iface %p, asyncBlock %p, bufferByteCount %lld, buffer %p, secInfo %p\n",
-           iface, asyncBlock, securityInformationBufferByteCount, securityInformationBuffer, securityInformation );
+    TRACE( "iface %p, asyncBlock %p, bufferByteCount %llu, buffer %p, secInfo %p\n",
+           iface, asyncBlock, (unsigned long long)securityInformationBufferByteCount,
+           securityInformationBuffer, securityInformation );
 
     status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
     if ( FAILED( status ) ) return status;
@@ -233,6 +284,7 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlAsyn
                                                securityInformationBufferByteCount,
                                                securityInformationBuffer,
                                                securityInformationBufferByteCountUsed );
+    IXThreadingImpl_Release( threadingImpl );
     if ( FAILED( status ) ) return status;
 
     if (securityInformation)
@@ -244,25 +296,45 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlUtf1
 {
     HRESULT status;
     IXThreadingImpl *threadingImpl;
+    struct UrlSecurityInfoContext *context;
+    WCHAR *urlCopy;
+    SIZE_T urlBytes;
 
     TRACE( "iface %p, url %p, asyncBlock %p.\n", iface, url, asyncBlock );
 
-    // Threading module may be obtained from another binary.
+    if ( !url || !asyncBlock ) return E_POINTER;
+
+    urlBytes = (wcslen( url ) + 1) * sizeof(*urlCopy);
+    if (!(urlCopy = malloc( urlBytes ))) return E_OUTOFMEMORY;
+    memcpy( urlCopy, url, urlBytes );
+
     status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
-    if ( FAILED( status ) ) return status;
+    if ( FAILED( status ) )
+    {
+        free( urlCopy );
+        return status;
+    }
 
-    struct UrlSecurityInfoContext *context = (struct UrlSecurityInfoContext *)malloc( sizeof( struct UrlSecurityInfoContext ) );
-    if ( !context ) return E_OUTOFMEMORY;
+    context = calloc( 1, sizeof(*context) );
+    if ( !context )
+    {
+        IXThreadingImpl_Release( threadingImpl );
+        free( urlCopy );
+        return E_OUTOFMEMORY;
+    }
 
-    context->url = url;
+    context->url = urlCopy;
+    context->ownsUrl = TRUE;
 
     status = IXThreadingImpl_XAsyncBegin( threadingImpl, asyncBlock, context, NULL, "XNetworkingQuerySecurityInformationForUrlUtf16Async", HTTPClientProvider );
 
     if ( FAILED( status ) )
     {
+        free( urlCopy );
         free( context );
     }
 
+    IXThreadingImpl_Release( threadingImpl );
     return status;
 }
 
@@ -273,12 +345,11 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlUtf1
 
     TRACE( "iface %p, asyncBlock %p, securityInformationBufferByteCount %p.\n", iface, asyncBlock, securityInformationBufferByteCount );
 
-    // Threading module may be obtained from another binary.
     status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
     if ( FAILED( status ) ) return status;
 
     status = IXThreadingImpl_XAsyncGetResultSize( threadingImpl, asyncBlock, securityInformationBufferByteCount );
-
+    IXThreadingImpl_Release( threadingImpl );
     return status;
 }
 
@@ -287,17 +358,20 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlUtf1
     HRESULT status;
     IXThreadingImpl *threadingImpl;
 
-    TRACE( "iface %p, asyncBlock %p, securityInformationBufferByteCount %lld, securityInformationBufferByteCountUsed %p, securityInformationBuffer %p, securityInformation %p.\n", iface, asyncBlock, securityInformationBufferByteCount, securityInformationBufferByteCountUsed, securityInformationBuffer, securityInformation );
+    TRACE( "iface %p, asyncBlock %p, securityInformationBufferByteCount %llu, securityInformationBufferByteCountUsed %p, securityInformationBuffer %p, securityInformation %p.\n",
+            iface, asyncBlock, (unsigned long long)securityInformationBufferByteCount,
+            securityInformationBufferByteCountUsed, securityInformationBuffer,
+            securityInformation );
     
-    // Threading module may be obtained from another binary.
     status = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void **)&threadingImpl );
     if ( FAILED( status ) ) return status;
 
     status = IXThreadingImpl_XAsyncGetResult( threadingImpl, asyncBlock, NULL, securityInformationBufferByteCount, securityInformationBuffer, securityInformationBufferByteCountUsed );
+    IXThreadingImpl_Release( threadingImpl );
     if ( FAILED( status ) ) return status;
 
-    // Extract the XNetworkingSecurityInformation header from the buffer.
-    *securityInformation = (XNetworkingSecurityInformation *)securityInformationBuffer;
+    if ( securityInformation )
+        *securityInformation = (XNetworkingSecurityInformation *)securityInformationBuffer;
 
     return S_OK;
 }

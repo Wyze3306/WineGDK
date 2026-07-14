@@ -60,6 +60,17 @@ static const SIZE_T XSystemXboxLiveSandboxIdBytes = 7;
 static const SIZE_T XSystemAppSpecificDeviceIdBytes = 45;
 
 static LPSTR testData = NULL;
+static LONG async_do_work_count;
+static LONG async_get_result_count;
+static LONG async_cleanup_count;
+static LONG async_cleanup_before_result;
+static LONG async_completion_count;
+
+static void CALLBACK XAsyncCompletion_testCallback( XAsyncBlock *asyncBlock )
+{
+    (void)asyncBlock;
+    InterlockedIncrement( &async_completion_count );
+}
 
 #define check_interface(obj, iid, supported) _check_interface(__LINE__, obj, iid, supported)
 static void _check_interface(unsigned int line, void *obj, const IID *iid, BOOL supported)
@@ -85,34 +96,45 @@ static inline HRESULT CALLBACK XAsyncProvider_testCallback( XAsyncOp op, const X
     switch ( op )
     {
         case Begin:
-            trace( "Begin invoked\n" );
-            IXThreadingImpl_XAsyncComplete( xthreading, data->async, S_OK, 0 );
-            return S_OK;
+            hr = IXThreadingImpl_XAsyncSchedule( xthreading, data->async, 0 );
+            IXThreadingImpl_Release( xthreading );
+            return hr;
 
         case DoWork:
-            trace( "DoWork invoked\n" );
-            IXThreadingImpl_XAsyncComplete( xthreading, data->async, E_PENDING, 0 );
-            testData = (LPSTR)malloc( testDataSize * sizeof( CHAR ) );
+            InterlockedIncrement( &async_do_work_count );
+            testData = malloc( testDataSize );
+            if ( !testData )
+            {
+                IXThreadingImpl_XAsyncComplete( xthreading, data->async, E_OUTOFMEMORY, 0 );
+                IXThreadingImpl_Release( xthreading );
+                return E_OUTOFMEMORY;
+            }
             strcpy( testData, "foobar" );
             IXThreadingImpl_XAsyncComplete( xthreading, data->async, S_OK, testDataSize );
+            IXThreadingImpl_Release( xthreading );
             return S_OK;
 
         case GetResult:
-            trace( "GetResult invoked\n" );
+            InterlockedIncrement( &async_get_result_count );
+            if ( async_cleanup_count ) InterlockedIncrement( &async_cleanup_before_result );
             memcpy( data->buffer, (void *)testData, testDataSize);
+            IXThreadingImpl_Release( xthreading );
             return S_OK;
 
         case Cancel:
-            trace( "Cancel invoked\n" );
             IXThreadingImpl_XAsyncComplete( xthreading, data->async, E_ABORT, 0 );
+            IXThreadingImpl_Release( xthreading );
             return S_OK;
 
         case Cleanup:
-            trace( "Cleanup invoked\n" );
+            InterlockedIncrement( &async_cleanup_count );
             free( testData );
+            testData = NULL;
+            IXThreadingImpl_Release( xthreading );
             return S_OK;
     }
 
+    IXThreadingImpl_Release( xthreading );
     return S_OK;
 }
 
@@ -296,66 +318,96 @@ static void test_XThreading(void)
     check_interface( xthreading, &IID_IUnknown, TRUE );
     check_interface( xthreading, &IID_IXThreadingImpl, TRUE );
 
-    /**
-     * Microsoft is very vague about how XAsync is used in applications.
-     * This is the best implementation I can get for now.
-     */
-
-    // --- XAsync --- //
     {
-        XAsyncBlock currentBlock;
+        XAsyncBlock currentBlock = {0};
+        XAsyncBlock foreignQueueBlock = {0};
+        XTaskQueueHandle processHandle = NULL;
         XTaskQueueHandle taskHandle;
 
-        currentBlock.callback = NULL;
-        currentBlock.queue = NULL;
+        async_do_work_count = 0;
+        async_get_result_count = 0;
+        async_cleanup_count = 0;
+        async_cleanup_before_result = 0;
+        async_completion_count = 0;
 
-        hr = IXThreadingImpl_XTaskQueueCreate( xthreading, Manual, Manual, &taskHandle );
+        hr = IXThreadingImpl_XTaskQueueCreate( xthreading, ThreadPool, ThreadPool,
+                &taskHandle );
         ok( hr == S_OK, "got hr %#lx.\n", hr );
 
         IXThreadingImpl_XTaskQueueSetCurrentProcessTaskQueue( xthreading, taskHandle );
+        ok( IXThreadingImpl_XTaskQueueGetCurrentProcessTaskQueue( xthreading,
+                &processHandle ), "failed to get process task queue.\n" );
+        IXThreadingImpl_XTaskQueueCloseHandle( xthreading, processHandle );
+        ok( IXThreadingImpl_XTaskQueueGetCurrentProcessTaskQueue( xthreading,
+                &processHandle ), "process task queue did not survive closing a returned handle.\n" );
+        IXThreadingImpl_XTaskQueueCloseHandle( xthreading, processHandle );
+        currentBlock.queue = taskHandle;
+        currentBlock.callback = XAsyncCompletion_testCallback;
 
-        trace( "BEFORE IS %p\n", currentBlock.queue );
-
-        /**
-         * xgameruntime.lib::XAsyncBegin
-         */
         hr = IXThreadingImpl_XAsyncBegin( xthreading, &currentBlock, NULL, NULL, NULL, XAsyncProvider_testCallback );
         ok( hr == S_OK, "got hr %#lx.\n", hr );
+        IXThreadingImpl_XTaskQueueCloseHandle( xthreading, taskHandle );
+        taskHandle = NULL;
 
-        trace( "AFTER IS %p\n", currentBlock.queue );
-        trace( "taskHandle IS %p\n", taskHandle );
-
-        /**
-         * xgameruntime.lib::XAsyncSchedule
-         */
-        //hr = IXThreadingImpl_XAsyncSchedule( xthreading, &currentBlock, 1000 );
-        //ok( hr == S_OK, "got hr %#lx.\n", hr );
-
-        hr = IXThreadingImpl_XTaskQueueDispatch( xthreading, taskHandle, 0, 1000 );
-        ok( hr == S_OK, "got hr %#lx.\n", hr );
-
-        /**
-         * xgameruntime.lib::XAsyncGetStatus
-         */
         hr = IXThreadingImpl_XAsyncGetStatus( xthreading, &currentBlock, TRUE );
         ok( hr == S_OK, "got hr %#lx.\n", hr );
+        ok( async_do_work_count == 1, "got %ld DoWork calls.\n", async_do_work_count );
+        ok( async_completion_count == 1, "got %ld completion callbacks.\n",
+                async_completion_count );
+        ok( async_cleanup_count == 0, "provider cleaned up before GetResult.\n" );
 
-        /**
-         * xgameruntime.lib::XAsyncGetResultSize
-         */
         hr = IXThreadingImpl_XAsyncGetResultSize( xthreading, &currentBlock, &receivedBufferSize );
         ok( hr == S_OK, "got hr %#lx.\n", hr );
-        ok( receivedBufferSize == 7, "unexpected receivedBufferSize %lld.\b", receivedBufferSize );
+        ok( receivedBufferSize == 7, "unexpected receivedBufferSize %llu.\n",
+                (unsigned long long)receivedBufferSize );
 
-        receivedBuffer = (LPSTR)malloc( receivedBufferSize );
-
-        /**
-         * xgameruntime.lib::XAsyncGetResult
-         */
+        receivedBuffer = malloc( receivedBufferSize );
         hr = IXThreadingImpl_XAsyncGetResult( xthreading, &currentBlock, NULL, receivedBufferSize, (PVOID)receivedBuffer, &bufferUsed );
         ok( hr == S_OK, "got hr %#lx.\n", hr );
-        ok( bufferUsed == 7, "unexpected bufferUsed %lld.\b", bufferUsed );
+        ok( bufferUsed == 7, "unexpected bufferUsed %llu.\n", (unsigned long long)bufferUsed );
         ok( strcmp( receivedBuffer, "foobar" ) == 0, "unexpected receivedBuffer %s.\n", debugstr_a( receivedBuffer ) );
+        ok( async_get_result_count == 1, "got %ld GetResult calls.\n", async_get_result_count );
+        ok( async_cleanup_before_result == 0, "provider cleaned up before GetResult.\n" );
+        ok( async_cleanup_count == 1, "got %ld Cleanup calls.\n", async_cleanup_count );
+
+        hr = IXThreadingImpl_XAsyncGetResult( xthreading, &currentBlock, NULL,
+                receivedBufferSize, receivedBuffer, &bufferUsed );
+        ok( hr == E_ILLEGAL_METHOD_CALL, "second GetResult returned %#lx.\n", hr );
+
+        free( receivedBuffer );
+
+        async_do_work_count = 0;
+        async_get_result_count = 0;
+        async_cleanup_count = 0;
+        async_cleanup_before_result = 0;
+        foreignQueueBlock.queue = (XTaskQueueHandle)(ULONG_PTR)1;
+
+        hr = IXThreadingImpl_XAsyncBegin( xthreading, &foreignQueueBlock, NULL,
+                NULL, NULL, XAsyncProvider_testCallback );
+        ok( hr == S_OK, "foreign queue XAsyncBegin returned %#lx.\n", hr );
+        hr = IXThreadingImpl_XAsyncGetStatus( xthreading, &foreignQueueBlock, TRUE );
+        ok( hr == S_OK, "foreign queue XAsyncGetStatus returned %#lx.\n", hr );
+        hr = IXThreadingImpl_XAsyncGetResultSize( xthreading, &foreignQueueBlock,
+                &receivedBufferSize );
+        ok( hr == S_OK && receivedBufferSize == 7,
+                "foreign queue result size returned %#lx, size %llu.\n", hr,
+                (unsigned long long)receivedBufferSize );
+        receivedBuffer = malloc( receivedBufferSize );
+        hr = IXThreadingImpl_XAsyncGetResult( xthreading, &foreignQueueBlock,
+                NULL, receivedBufferSize, receivedBuffer, &bufferUsed );
+        ok( hr == S_OK, "foreign queue XAsyncGetResult returned %#lx.\n", hr );
+        ok( !strcmp( receivedBuffer, "foobar" ), "unexpected foreign queue result %s.\n",
+                debugstr_a( receivedBuffer ) );
+        ok( async_cleanup_count == 1, "foreign queue got %ld Cleanup calls.\n",
+                async_cleanup_count );
+        free( receivedBuffer );
+
+        IXThreadingImpl_XTaskQueueSetCurrentProcessTaskQueue( xthreading, NULL );
+        memset( &foreignQueueBlock, 0, sizeof(foreignQueueBlock) );
+        hr = IXThreadingImpl_XAsyncBegin( xthreading, &foreignQueueBlock, NULL,
+                NULL, NULL, XAsyncProvider_testCallback );
+        ok( hr == HRESULT_FROM_WIN32( ERROR_NO_TASK_QUEUE ),
+                "disabled process queue XAsyncBegin returned %#lx.\n", hr );
     }
 }
 

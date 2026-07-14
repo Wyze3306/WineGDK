@@ -29,6 +29,6 @@
 #include <schannel.h>
 #include <winhttp.h>
 
-HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffer, SIZE_T *outBufferByteCount, XNetworkingSecurityInformation **securityInformation );
+HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffer, SIZE_T *outBufferByteCount );
 
 #endif

@@ -31,8 +31,17 @@ static VOID CALLBACK WaitCallback( PTP_CALLBACK_INSTANCE instance , void* contex
 {
     if ( context != NULL )
     {
-        struct x_wait_timer *impl = impl_from_IXWaitTimer( (IXWaitTimer *)context );
-        impl->callback(impl->context);
+        IXWaitTimer *iface = context;
+        struct x_wait_timer *impl = impl_from_IXWaitTimer( iface );
+        WaitTimerCallback *callback;
+        void *callback_context;
+
+        iface->lpVtbl->AddRef( iface );
+        callback = impl->callback;
+        callback_context = impl->context;
+        DisassociateCurrentThreadFromCallback( instance );
+        callback( callback_context );
+        iface->lpVtbl->Release( iface );
     }
 
     return;
@@ -70,6 +79,7 @@ static ULONG WINAPI x_wait_timer_Release( IXWaitTimer *iface )
     struct x_wait_timer *impl = impl_from_IXWaitTimer( iface );
     ULONG ref = InterlockedDecrement( &impl->ref );
     TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
+    if ( !ref ) free( impl );
     return ref;
 }
 
@@ -95,13 +105,15 @@ static VOID WINAPI x_wait_timer_Terminate( IXWaitTimer *iface )
 
     TRACE( "iface %p.\n", iface );
 
-    if ( !impl->timer )
+    if ( impl->timer )
     {
         SetThreadpoolTimer( impl->timer, NULL, 0, 0 );
         WaitForThreadpoolTimerCallbacks( impl->timer, TRUE );
         CloseThreadpoolTimer( impl->timer );
         impl->timer = NULL;
     }
+
+    iface->lpVtbl->Release( iface );
 
     return;
 }
@@ -110,12 +122,14 @@ static VOID WINAPI x_wait_timer_Start( IXWaitTimer *iface, UINT64 absoluteTime )
 {
     LARGE_INTEGER li;
     FILETIME ft;
+    ULONGLONG now;
 
     struct x_wait_timer *impl = impl_from_IXWaitTimer( iface );
 
     TRACE( "iface %p.\n", iface );
 
-    li.QuadPart = (LONGLONG)absoluteTime;
+    QueryUnbiasedInterruptTime( &now );
+    li.QuadPart = absoluteTime > now ? -(LONGLONG)(absoluteTime - now) : -1;
     ft.dwHighDateTime = li.HighPart;
     ft.dwLowDateTime = li.LowPart;
 
@@ -137,22 +151,17 @@ static VOID WINAPI x_wait_timer_Cancel( IXWaitTimer *iface )
 
 static UINT64 WINAPI x_wait_timer_GetAbsoluteTime( IXWaitTimer *iface, UINT32 msFromNow )
 {
-    FILETIME ft;
-    ULARGE_INTEGER li;
+    ULONGLONG now;
     UINT64 hundredNanosFromNow;
 
     TRACE( "iface %p, msFromNow %d.\n", iface, msFromNow );
 
-    GetSystemTimeAsFileTime( &ft );
+    QueryUnbiasedInterruptTime( &now );
 
     hundredNanosFromNow = msFromNow;
     hundredNanosFromNow *= 10000ULL;
 
-    li.HighPart = ft.dwHighDateTime;
-    li.LowPart = ft.dwLowDateTime;
-    li.QuadPart += hundredNanosFromNow;
-
-    return li.QuadPart;
+    return now + hundredNanosFromNow;
 }
 
 static const struct IXWaitTimerVtbl x_wait_timer_vtbl =

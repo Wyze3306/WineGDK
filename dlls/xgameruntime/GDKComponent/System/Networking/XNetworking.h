@@ -38,7 +38,7 @@ struct UrlSecurityInfoContext
     BYTE *securityInformationBuffer;
     SIZE_T securityInformationBufferCount;
     LPCWSTR url;
-    XNetworkingSecurityInformation *securityInformation;
+    BOOLEAN ownsUrl;
 };
 
 

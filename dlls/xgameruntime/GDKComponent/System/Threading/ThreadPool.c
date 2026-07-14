@@ -71,7 +71,7 @@ const struct IActionStatusVtbl ThreadPoolActionStatus_vtbl =
 static void CALLBACK TPCallback( PTP_CALLBACK_INSTANCE instance, void* context, PTP_WORK work ) 
 {
     struct thread_pool *impl = impl_from_IThreadPool( (IThreadPool *)context );
-    struct ThreadPoolActionStatus *status;
+    struct ThreadPoolActionStatus status = {0};
 
     // ActionStatus offers a way for the call to
     // provide the threadpool of its status. It
@@ -92,19 +92,16 @@ static void CALLBACK TPCallback( PTP_CALLBACK_INSTANCE instance, void* context, 
     // in an async call.  This guides the thread pool
     // to allow more threads to be created if needed.
 
-    //ActionStatusImpl status(pthis, instance);
-    if (!(status = calloc( 1, sizeof(*status) ))) return;
-
-    status->IActionStatus_iface.lpVtbl = &ThreadPoolActionStatus_vtbl;
-    status->owner = (IThreadPool *)context;
-    status->instance = instance;
+    status.IActionStatus_iface.lpVtbl = &ThreadPoolActionStatus_vtbl;
+    status.owner = (IThreadPool *)context;
+    status.instance = instance;
 
     impl->IThreadPool_iface.lpVtbl->AddRef( &impl->IThreadPool_iface );
-    impl->callback( impl->context, status );
+    impl->callback( impl->context, &status );
 
-    if ( !status->IsComplete )
+    if ( !status.IsComplete )
     {
-        status->IActionStatus_iface.lpVtbl->Complete( &status->IActionStatus_iface );
+        status.IActionStatus_iface.lpVtbl->Complete( &status.IActionStatus_iface );
     }
 
     impl->IThreadPool_iface.lpVtbl->Release( &impl->IThreadPool_iface ); // May delete this
@@ -134,8 +131,6 @@ static ULONG WINAPI thread_pool_AddRef( IThreadPool *iface )
     struct thread_pool *impl = impl_from_IThreadPool( iface );
     ULONG ref = InterlockedIncrement( &impl->ref );
     TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
-    if ( !ref )
-        free( impl );
     return ref;
 }
 
@@ -144,6 +139,7 @@ static ULONG WINAPI thread_pool_Release( IThreadPool *iface )
     struct thread_pool *impl = impl_from_IThreadPool( iface );
     ULONG ref = InterlockedDecrement( &impl->ref );
     TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
+    if ( !ref ) free( impl );
     return ref;
 }
 
@@ -169,7 +165,7 @@ static VOID WINAPI thread_pool_Terminate( IThreadPool *iface )
 
     TRACE( "iface %p.\n", iface );
 
-    if ( !impl->work )
+    if ( impl->work )
     {
         WaitForThreadpoolWorkCallbacks( impl->work, FALSE );
         CloseThreadpoolWork( impl->work );

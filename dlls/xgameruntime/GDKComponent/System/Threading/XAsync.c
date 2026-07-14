@@ -21,7 +21,6 @@
 
 #include "XAsync.h"
 #include "XTaskQueue.h"
-#include "wine/exception.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -92,6 +91,19 @@ static ULONG WINAPI async_state_Release( IAsyncState *iface )
     struct async_state *impl = impl_from_IAsyncState( iface );
     ULONG ref = InterlockedDecrement( &impl->ref );
     TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
+
+    if ( !ref )
+    {
+        LONG cleanup = InterlockedExchange( &impl->providerCleanup,
+                CleanupLocation_CleanedUp );
+
+        if ( cleanup != CleanupLocation_CleanedUp && impl->providerCallback )
+            impl->providerCallback( Cleanup, &impl->providerData );
+        XTaskQueueCloseHandle( impl->queue );
+        DeleteCriticalSection( &impl->cs );
+        impl->signature = 0;
+        free( impl );
+    }
     return ref;
 }
 
@@ -141,17 +153,16 @@ static ULONG WINAPI x_async_block_guard_Release( IXAsyncBlockInternalGuard *ifac
 static IAsyncState* WINAPI x_async_block_guard_GetState( IXAsyncBlockInternalGuard *iface )
 {
     struct x_async_block_guard *impl = impl_from_IXAsyncBlockInternalGuard( iface );
-    struct async_state *state = impl_from_IAsyncState( impl->internal->state );
+    struct async_state *state;
 
     TRACE( "iface %p, state is %p.\n", iface, impl->internal->state );
 
-    if ( impl->internal->state != NULL && state->signature != ASYNC_STATE_SIG )
-    {
-        return NULL;
-    }
+    if ( !impl->internal->state ) return NULL;
 
-    if ( impl->internal->state != NULL )
-        impl->internal->state->lpVtbl->AddRef( impl->internal->state );
+    state = impl_from_IAsyncState( impl->internal->state );
+    if ( state->signature != ASYNC_STATE_SIG ) return NULL;
+
+    impl->internal->state->lpVtbl->AddRef( impl->internal->state );
 
     return impl->internal->state;
 }
@@ -159,14 +170,19 @@ static IAsyncState* WINAPI x_async_block_guard_GetState( IXAsyncBlockInternalGua
 static IAsyncState* WINAPI x_async_block_guard_ExtractState( IXAsyncBlockInternalGuard *iface, BOOLEAN resultsRetrieved )
 {    
     struct x_async_block_guard *impl = impl_from_IXAsyncBlockInternalGuard( iface );
-    struct async_state *state = impl_from_IAsyncState( impl->internal->state );
+    struct async_state *state;
+    IAsyncState *result;
 
     TRACE( "iface %p, resultsRetrieved %d.\n", iface, resultsRetrieved );
 
-    if ( impl->internal->state != NULL && state->signature != ASYNC_STATE_SIG )
-    {
-        return NULL;
-    }
+    if ( !impl->internal->state ) return NULL;
+
+    state = impl_from_IAsyncState( impl->internal->state );
+    if ( state->signature != ASYNC_STATE_SIG ) return NULL;
+
+    result = impl->internal->state;
+    impl->internal->state = NULL;
+    impl->userInternal->state = NULL;
 
     if ( resultsRetrieved )
     {
@@ -179,7 +195,7 @@ static IAsyncState* WINAPI x_async_block_guard_ExtractState( IXAsyncBlockInterna
         impl->userInternal->signature = 0;
     }
 
-    return impl->internal->state;
+    return result;
 }
 
 static HRESULT WINAPI x_async_block_guard_GetStatus( IXAsyncBlockInternalGuard *iface )
@@ -225,6 +241,7 @@ static AsyncBlockInternal* x_async_block_guard_DoLock( XAsyncBlock* asyncBlock )
 {
     AsyncBlockInternal* lockedResult;
     AsyncBlockInternal* stateAsyncBlockInternal;
+    IAsyncState *stateIface;
 
     struct async_state *state = NULL;
 
@@ -243,19 +260,16 @@ static AsyncBlockInternal* x_async_block_guard_DoLock( XAsyncBlock* asyncBlock )
     }
 
     TRACE( "sig=0x%lx lock=%ld status=0x%lx\n", lockedResult->signature, lockedResult->lock, lockedResult->status );
-    /* Try to acquire lock. If already held (reentrant call on same thread), proceed without locking */
-    if (InterlockedCompareExchange( &lockedResult->lock, 1, 0 ) != 0)
-    {
-        /* Lock already held - this is a reentrant call. Proceed without acquiring. */
-        TRACE( "lock already held, proceeding (reentrant)\n" );
-    }
+    while (InterlockedCompareExchange( &lockedResult->lock, 1, 0 )) SwitchToThread();
 
-    state = impl_from_IAsyncState( lockedResult->state );
-
-    if ( lockedResult->state == NULL || asyncBlock == &state->providerAsyncBlock )
+    if ( lockedResult->state == NULL )
         return lockedResult;
 
-    lockedResult->state->lpVtbl->AddRef( lockedResult->state );
+    state = impl_from_IAsyncState( lockedResult->state );
+    if ( asyncBlock == &state->providerAsyncBlock ) return lockedResult;
+
+    stateIface = lockedResult->state;
+    stateIface->lpVtbl->AddRef( stateIface );
 
     InterlockedExchange( &lockedResult->lock, 0 );
 
@@ -263,7 +277,7 @@ static AsyncBlockInternal* x_async_block_guard_DoLock( XAsyncBlock* asyncBlock )
     if ( stateAsyncBlockInternal == NULL )
     {
         while (InterlockedCompareExchange( &lockedResult->lock, 1, 0 )) SwitchToThread();
-        lockedResult->state->lpVtbl->Release( lockedResult->state );
+        stateIface->lpVtbl->Release( stateIface );
         return lockedResult;
     }
 
@@ -273,11 +287,11 @@ static AsyncBlockInternal* x_async_block_guard_DoLock( XAsyncBlock* asyncBlock )
     {
         InterlockedExchange( &stateAsyncBlockInternal->lock, 0 );
         while (InterlockedCompareExchange( &lockedResult->lock, 1, 0 )) SwitchToThread();
-        lockedResult->state->lpVtbl->Release( lockedResult->state );
+        stateIface->lpVtbl->Release( stateIface );
         return lockedResult;
     }
 
-    lockedResult->state->lpVtbl->Release( lockedResult->state );
+    stateIface->lpVtbl->Release( stateIface );
     return stateAsyncBlockInternal;
 }
 
@@ -323,19 +337,29 @@ static VOID InitInternalGuardFromBlock( IXAsyncBlockInternalGuard *iface, XAsync
         impl->userInternal = impl->internal;
     }
 
-    // If user internal != internal, we grab its lock.  Note that
-    // lock ordering here is critical.  It must always be 
-    // state lock, then user lock.  If state is not available, then
-    // it is just user lock.
-
-    /*
     if ( impl->userInternal != impl->internal )
-    {
-        TRACE("got here!\n");
         while (InterlockedCompareExchange( &impl->userInternal->lock, 1, 0 )) SwitchToThread();
-    }*/
 
     return;
+}
+
+static void UnlockInternalGuard( struct x_async_block_guard *impl )
+{
+    if ( !impl ) return;
+
+    if ( impl->locked )
+    {
+        if ( impl->userInternal != impl->internal )
+            InterlockedExchange( &impl->userInternal->lock, 0 );
+        InterlockedExchange( &impl->internal->lock, 0 );
+        impl->locked = FALSE;
+    }
+}
+
+static void ReleaseInternalGuard( struct x_async_block_guard *impl )
+{
+    UnlockInternalGuard( impl );
+    free( impl );
 }
 
 static HRESULT AllocStateNoCompletion( XAsyncBlock* asyncBlock, AsyncBlockInternal* internal, size_t contextSize )
@@ -344,7 +368,8 @@ static HRESULT AllocStateNoCompletion( XAsyncBlock* asyncBlock, AsyncBlockIntern
 
     XTaskQueueHandle queue;
 
-    TRACE( "asyncBlock %p, internal %p, contextSize %lld.\n", asyncBlock, internal, contextSize );
+    TRACE( "asyncBlock %p, internal %p, contextSize %llu.\n", asyncBlock, internal,
+            (unsigned long long)contextSize );
 
     if (!(stateImpl = calloc( 1, sizeof(*stateImpl) ))) return E_OUTOFMEMORY;
 
@@ -369,34 +394,33 @@ static HRESULT AllocStateNoCompletion( XAsyncBlock* asyncBlock, AsyncBlockIntern
 
     queue = asyncBlock->queue;
 
-    /* Check if the queue is one of ours (Wine XTaskQueue) or from the native DLL.
-     * Native DLL queues have incompatible internal structures. When async operations
-     * go through our Wine XAsync (not the native DLL's), we must use our own queue. */
     if ( queue != NULL )
     {
-        /* Validate the queue by checking if headQueue looks like a valid COM object.
-         * Our XTaskQueue has headQueue pointing to a struct with a vtable.
-         * Native DLL queues have different layout - accessing headQueue would crash. */
-        __TRY
+        if ( XTaskQueueIsHandleOwned( queue ) )
         {
-            queue->headQueue->lpVtbl->AddRef( queue->headQueue );
-            stateImpl->queue = queue;
+            HRESULT qhr = XTaskQueueDuplicateHandle( queue, &stateImpl->queue );
+            if ( FAILED( qhr ) )
+            {
+                DeleteCriticalSection( &stateImpl->cs );
+                free( stateImpl );
+                return qhr;
+            }
         }
-        __EXCEPT_ALL
+        else
         {
             WARN( "asyncBlock queue %p is not a Wine XTaskQueue, using process queue\n", queue );
             queue = NULL;
         }
-        __ENDTRY
     }
 
     if ( queue == NULL )
     {
-        /* Create our own Wine task queue - don't use the native DLL's process queue
-         * as it has an incompatible internal structure */
-        HRESULT qhr = XTaskQueueCreate( ThreadPool, ThreadPool, &stateImpl->queue );
-        if (FAILED( qhr ))
+        if ( !XTaskQueueGetCurrentProcessQueue( &stateImpl->queue ) )
+        {
+            DeleteCriticalSection( &stateImpl->cs );
+            free( stateImpl );
             return HRESULT_FROM_WIN32( ERROR_NO_TASK_QUEUE );
+        }
     }
 
     stateImpl->userAsyncBlock = asyncBlock;
@@ -420,7 +444,8 @@ static HRESULT AllocState( XAsyncBlock* asyncBlock, SIZE_T contextSize )
     HRESULT hr;
     AsyncBlockInternal* internal;
 
-    TRACE( "asyncBlock %p, contextSize %lld.\n", asyncBlock, contextSize );
+    TRACE( "asyncBlock %p, contextSize %llu.\n", asyncBlock,
+            (unsigned long long)contextSize );
 
     if ( !asyncBlock )
         return E_INVALIDARG;
@@ -467,8 +492,9 @@ static void CleanupProviderForLocation( IAsyncState *state, ProviderCleanupLocat
     struct async_state *stateImpl = impl_from_IAsyncState( state );
 
     TRACE( "state %p, location %d.\n", state, location );
-    
-    if ( InterlockedCompareExchange( &stateImpl->providerCleanup, 0, 0 ) == InterlockedCompareExchange( &stateImpl->providerCleanup, location, CleanupLocation_CleanedUp ) )
+
+    if ( InterlockedCompareExchange( &stateImpl->providerCleanup,
+            CleanupLocation_CleanedUp, location ) == location )
     {
         stateImpl->providerCallback( Cleanup, &stateImpl->providerData );
     }
@@ -480,11 +506,10 @@ static BOOLEAN TrySetProviderCleanup( IAsyncState* state, ProviderCleanupLocatio
 {
     struct async_state *stateImpl = impl_from_IAsyncState( state );
 
-    ProviderCleanupLocation expected = CleanupLocation_Destructor;
-
     TRACE( "state %p, location %d.\n", state, location );
 
-    return InterlockedCompareExchange( &stateImpl->providerCleanup, 0, 0 ) == InterlockedCompareExchange( &stateImpl->providerCleanup, expected, location );
+    return InterlockedCompareExchange( &stateImpl->providerCleanup, location,
+            CleanupLocation_Destructor ) == CleanupLocation_Destructor;
 }
 
 static VOID RevertProviderCleanup( IAsyncState* state, _In_ ProviderCleanupLocation expected )
@@ -493,35 +518,22 @@ static VOID RevertProviderCleanup( IAsyncState* state, _In_ ProviderCleanupLocat
 
     TRACE( "state %p, expected %d.\n", state, expected );
     
-    InterlockedCompareExchange( &stateImpl->providerCleanup, expected, CleanupLocation_Destructor );
+    InterlockedCompareExchange( &stateImpl->providerCleanup,
+            CleanupLocation_Destructor, expected );
 
     return;
 }
 
 static void SignalWait( IAsyncState* state )
 {
-    BOOLEAN newlySatisfied;
-
     struct async_state *stateImpl = impl_from_IAsyncState( state );
 
     TRACE( "state %p.\n", state );
 
     EnterCriticalSection( &stateImpl->cs );
-    newlySatisfied = !stateImpl->waitSatisfied;
     stateImpl->waitSatisfied = TRUE;
     WakeAllConditionVariable( &stateImpl->cv );
     LeaveCriticalSection( &stateImpl->cs );
-
-
-    // We should only come in here once, but we don't want
-    // to underflow task queue resumes and we already know
-    // from above if we're first marking this wait as
-    // satisfied, so use it.
-
-    if ( newlySatisfied )
-    {
-        XTaskQueueResumeTermination( stateImpl->queue );
-    }
 }
 
 static void CALLBACK CompletionCallback( void* context, BOOL canceled )
@@ -544,6 +556,7 @@ static void CALLBACK CompletionCallback( void* context, BOOL canceled )
     }
 
     SignalWait( state );
+    state->lpVtbl->Release( state );
 }
 
 static HRESULT SignalCompletion( IAsyncState *state )
@@ -559,9 +572,10 @@ static HRESULT SignalCompletion( IAsyncState *state )
         state->lpVtbl->AddRef( state );
         hr = XTaskQueueSubmitDelayedCallback( stateImpl->queue, Completion, 0, (PVOID)state, CompletionCallback );
 
-        if ( SUCCEEDED( hr ) )
+        if ( FAILED( hr ) )
         {
             state->lpVtbl->Release( state );
+            SignalWait( state );
         }
     }
     else
@@ -591,15 +605,19 @@ static void CALLBACK WorkerCallback( PVOID context, BOOL canceled )
     HRESULT callStatus;
     IAsyncState *state = (IAsyncState *)context;
 
-    struct x_async_block_guard *impl;
+    struct x_async_block_guard guard = {0};
+    struct x_async_block_guard *impl = &guard;
     struct async_state *stateImpl = impl_from_IAsyncState( state );
 
     TRACE( "context %p, canceled %d.\n", context, canceled );
 
     if ( !stateImpl->valid )
+    {
+        state->lpVtbl->Release( state );
         return;
+    }
 
-    stateImpl->workScheduled = FALSE;
+    InterlockedExchange( &stateImpl->workScheduled, FALSE );
 
     // If the queue is canceling callbacks, simply cancel this work. Since no
     // new work for this call will be scheduled, if the call didn't cancel
@@ -608,8 +626,6 @@ static void CALLBACK WorkerCallback( PVOID context, BOOL canceled )
     if ( canceled )
     {
         XAsyncCancel( stateImpl->userAsyncBlock );
-
-        if (!(impl = calloc( 1, sizeof(*impl) ))) return;
 
         impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
         impl->ref = 1;
@@ -620,31 +636,25 @@ static void CALLBACK WorkerCallback( PVOID context, BOOL canceled )
             callStatus = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetStatus( &impl->IXAsyncBlockInternalGuard_iface );
         }
 
+        UnlockInternalGuard( impl );
+
         if ( callStatus != E_ABORT )
-        {
             XAsyncComplete( stateImpl->userAsyncBlock, E_ABORT, 0 );
-        }
-
-        if ( impl->locked )
-        {
-            InterlockedExchange( &impl->internal->lock, 0 );
-            if ( impl->userInternal != impl->internal )
-            {
-                InterlockedExchange( &impl->userInternal->lock, 0 );
-            }
-        }
-
-        free( impl );
     }
     else
     {
+        AsyncBlockInternal *providerInternal =
+            (AsyncBlockInternal *)stateImpl->providerAsyncBlock.internal;
+
         callStatus = stateImpl->providerCallback( DoWork, &stateImpl->providerData );
 
         // Work routine can return E_PENDING if there is more work to do.  Otherwise
         // it either needs to be a failure or it should have called XAsyncComplete, which
         // would have set a new value into the status.
 
-        if ( callStatus != E_PENDING )
+        if ( callStatus != E_PENDING &&
+             InterlockedCompareExchange( (LONG *)&providerInternal->status,
+                                         0, 0 ) == E_PENDING )
         {
             if ( SUCCEEDED( callStatus ) )
             {
@@ -659,18 +669,20 @@ static void CALLBACK WorkerCallback( PVOID context, BOOL canceled )
     // will change the provider cleanup to be "AfterWork", which is here.  Cleanup
     // the provider if we need to.
     CleanupProviderForLocation( state, CleanupLocation_AfterDoWork );
+    state->lpVtbl->Release( state );
 }
 
 HRESULT XAsyncGetStatus( XAsyncBlock* asyncBlock, BOOLEAN wait )
 {
     HRESULT result = E_PENDING;
-    IAsyncState *state;
+    IAsyncState *state = NULL;
 
     struct x_async_block_guard *impl;
     struct async_state *stateImpl = NULL;
 
     TRACE( "asyncBlock %p, wait %d.\n", asyncBlock, wait );
 
+    if ( !asyncBlock ) return E_INVALIDARG;
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
@@ -681,8 +693,10 @@ HRESULT XAsyncGetStatus( XAsyncBlock* asyncBlock, BOOLEAN wait )
         InitInternalGuardFromBlock( &impl->IXAsyncBlockInternalGuard_iface, asyncBlock );
         result = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetStatus( &impl->IXAsyncBlockInternalGuard_iface );
         state = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetState( &impl->IXAsyncBlockInternalGuard_iface );
-        stateImpl = impl_from_IAsyncState( state );
+        if ( state ) stateImpl = impl_from_IAsyncState( state );
     }
+
+    ReleaseInternalGuard( impl );
 
     // If we are being asked to wait, always check the wait state before
     // looking at the hresult.  Our wait waits until the completion runs
@@ -693,30 +707,21 @@ HRESULT XAsyncGetStatus( XAsyncBlock* asyncBlock, BOOLEAN wait )
         if ( state == NULL )
         {
             if ( result == E_PENDING )
-                return E_INVALIDARG;
+                result = E_INVALIDARG;
         }
         else
         {
             EnterCriticalSection( &stateImpl->cs );
 
-            if ( !stateImpl->waitSatisfied )
-            {
+            while ( !stateImpl->waitSatisfied )
                 SleepConditionVariableCS( &stateImpl->cv, &stateImpl->cs, INFINITE );
-            }
-            result = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetStatus( &impl->IXAsyncBlockInternalGuard_iface );    
+            LeaveCriticalSection( &stateImpl->cs );
+            result = InterlockedCompareExchange(
+                    (LONG *)&((AsyncBlockInternal *)asyncBlock->internal)->status, 0, 0 );
         }
     }
 
-    if ( impl->locked )
-    {
-        InterlockedExchange( &impl->internal->lock, 0 );
-        if ( impl->userInternal != impl->internal )
-        {
-            InterlockedExchange( &impl->userInternal->lock, 0 );
-        }
-    }
-
-    free( impl );
+    if ( state ) state->lpVtbl->Release( state );
 
     return result;
 }
@@ -724,13 +729,14 @@ HRESULT XAsyncGetStatus( XAsyncBlock* asyncBlock, BOOLEAN wait )
 HRESULT XAsyncGetResultSize( XAsyncBlock* asyncBlock, SIZE_T* bufferSize )
 {
     HRESULT result = E_PENDING;
-    IAsyncState *state;
+    IAsyncState *state = NULL;
 
     struct x_async_block_guard *impl;
     struct async_state *stateImpl = NULL;
 
     TRACE( "asyncBlock %p, bufferSize %p.\n", asyncBlock, bufferSize );
 
+    if ( !asyncBlock || !bufferSize ) return E_INVALIDARG;
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
@@ -742,70 +748,99 @@ HRESULT XAsyncGetResultSize( XAsyncBlock* asyncBlock, SIZE_T* bufferSize )
         InitInternalGuardFromBlock( &impl->IXAsyncBlockInternalGuard_iface, asyncBlock );
         result = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetStatus( &impl->IXAsyncBlockInternalGuard_iface );
         state = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetState( &impl->IXAsyncBlockInternalGuard_iface );
-        stateImpl = impl_from_IAsyncState( state );
+        if ( state ) stateImpl = impl_from_IAsyncState( state );
     }
 
     *bufferSize = state == NULL ? 0 : stateImpl->providerData.bufferSize;
-
-    //destructor
-    if ( impl->locked )
-    {
-        InterlockedExchange( &impl->internal->lock, 0 );
-        if ( impl->userInternal != impl->internal )
-        {
-            InterlockedExchange( &impl->userInternal->lock, 0 );
-        }
-    }
-
-    free( impl );
+    ReleaseInternalGuard( impl );
+    if ( state ) state->lpVtbl->Release( state );
 
     return result;
 }
 
 HRESULT XAsyncGetResult( XAsyncBlock* asyncBlock, const PVOID identity, SIZE_T bufferSize, PVOID buffer, SIZE_T* bufferUsed )
 {
-    AsyncBlockInternal *internal;
-    struct async_state *stateImpl;
+    IAsyncState *state = NULL;
+    IAsyncState *detached = NULL;
+    struct x_async_block_guard *impl;
+    struct async_state *stateImpl = NULL;
+    BOOLEAN resultsRetrieved;
     HRESULT hr;
 
     TRACE( "asyncBlock %p, identity %p, bufferSize %llu, buffer %p\n",
            asyncBlock, identity, (unsigned long long)bufferSize, buffer );
 
-    if (!asyncBlock) return E_POINTER;
+    if ( !asyncBlock ) return E_POINTER;
 
-    internal = (AsyncBlockInternal *)asyncBlock->internal;
-    if (!internal || !internal->state) return E_INVALIDARG;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
+    impl->ref = 1;
+    InitInternalGuardFromBlock( &impl->IXAsyncBlockInternalGuard_iface, asyncBlock );
 
-    stateImpl = CONTAINING_RECORD( internal->state, struct async_state, IAsyncState_iface );
+    hr = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetStatus(
+            &impl->IXAsyncBlockInternalGuard_iface );
+    resultsRetrieved = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetResultsRetrieved(
+            &impl->IXAsyncBlockInternalGuard_iface );
+    state = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetState(
+            &impl->IXAsyncBlockInternalGuard_iface );
+    ReleaseInternalGuard( impl );
 
-    if (identity && stateImpl->identity != identity)
-        return E_INVALIDARG;
-
-    hr = internal->status;
-    if (hr == E_PENDING) return E_PENDING;
-    if (FAILED( hr )) return hr;
-
-    if (buffer && bufferSize > 0)
+    if ( SUCCEEDED( hr ) )
     {
-        stateImpl->providerData.buffer = buffer;
-        stateImpl->providerData.bufferSize = bufferSize;
-        stateImpl->providerCallback( GetResult, &stateImpl->providerData );
+        if ( resultsRetrieved ) hr = E_ILLEGAL_METHOD_CALL;
+        else if ( !state )
+        {
+            if ( bufferUsed ) *bufferUsed = 0;
+        }
+        else
+        {
+            stateImpl = impl_from_IAsyncState( state );
+
+            if ( stateImpl->identity != identity ) hr = E_INVALIDARG;
+            else if ( !stateImpl->providerData.bufferSize )
+                hr = HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );
+            else if ( !buffer ) hr = E_INVALIDARG;
+            else if ( bufferSize < stateImpl->providerData.bufferSize )
+                hr = E_NOT_SUFFICIENT_BUFFER;
+            else
+            {
+                if ( bufferUsed ) *bufferUsed = stateImpl->providerData.bufferSize;
+                stateImpl->providerData.buffer = buffer;
+                stateImpl->providerData.bufferSize = bufferSize;
+                hr = stateImpl->providerCallback( GetResult,
+                        &stateImpl->providerData );
+            }
+        }
     }
 
-    if (bufferUsed) *bufferUsed = stateImpl->providerData.bufferSize;
+    if ( hr != E_PENDING && state )
+    {
+        struct x_async_block_guard guard = {0};
 
+        guard.IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
+        guard.ref = 1;
+        InitInternalGuardFromBlock( &guard.IXAsyncBlockInternalGuard_iface,
+                asyncBlock );
+        detached = guard.IXAsyncBlockInternalGuard_iface.lpVtbl->ExtractState(
+                &guard.IXAsyncBlockInternalGuard_iface, TRUE );
+        UnlockInternalGuard( &guard );
+        if ( detached ) CleanupState( detached );
+    }
+
+    if ( state ) state->lpVtbl->Release( state );
     return hr;
 }
 
 VOID XAsyncCancel( XAsyncBlock* asyncBlock )
 {
-    IAsyncState *state;
+    IAsyncState *state = NULL;
 
     struct x_async_block_guard *impl;
     struct async_state *stateImpl = NULL;
 
     TRACE( "asyncBlock %p.\n", asyncBlock );
 
+    if ( !asyncBlock ) return;
     if (!(impl = calloc( 1, sizeof(*impl) ))) return;
 
     impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
@@ -815,8 +850,10 @@ VOID XAsyncCancel( XAsyncBlock* asyncBlock )
     {
         InitInternalGuardFromBlock( &impl->IXAsyncBlockInternalGuard_iface, asyncBlock );
         state = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetState( &impl->IXAsyncBlockInternalGuard_iface );
-        stateImpl = impl_from_IAsyncState( state );
+        if ( state ) stateImpl = impl_from_IAsyncState( state );
     }
+
+    ReleaseInternalGuard( impl );
 
     if ( state != NULL )
     {
@@ -835,18 +872,8 @@ VOID XAsyncCancel( XAsyncBlock* asyncBlock )
             stateImpl->providerCallback( Cancel, &stateImpl->providerData );
             RevertProviderCleanup( state, CleanupLocation_InCancel );
         }
+        state->lpVtbl->Release( state );
     }
-
-    if ( impl->locked )
-    {
-        InterlockedExchange( &impl->internal->lock, 0 );
-        if ( impl->userInternal != impl->internal )
-        {
-            InterlockedExchange( &impl->userInternal->lock, 0 );
-        }
-    }
-
-    free( impl );
 }
 
 HRESULT XAsyncRun( XAsyncBlock* asyncBlock, XAsyncWork* work )
@@ -863,17 +890,32 @@ HRESULT XAsyncRun( XAsyncBlock* asyncBlock, XAsyncWork* work )
 HRESULT XAsyncBegin( XAsyncBlock* asyncBlock, PVOID context, PVOID identity, LPCSTR identityName, XAsyncProviderCallback* provider )
 {
     HRESULT hr;
-    IAsyncState *state;
+    IAsyncState *state = NULL;
 
     struct x_async_block_guard *impl;
     struct async_state *stateImpl = NULL;
 
     TRACE( "asyncBlock %p, context %p, identity %p, identityName %s, provider %p.\n", asyncBlock, context, identity, identityName, provider );
 
+    if ( !provider ) return E_INVALIDARG;
+
     hr = AllocState( asyncBlock, 0 );
     if ( FAILED( hr ) ) return hr;
 
-    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    if (!(impl = calloc( 1, sizeof(*impl) )))
+    {
+        AsyncBlockInternal *internal = (AsyncBlockInternal *)asyncBlock->internal;
+        struct async_state *allocated = impl_from_IAsyncState( internal->state );
+        AsyncBlockInternal *providerInternal =
+                (AsyncBlockInternal *)allocated->providerAsyncBlock.internal;
+
+        internal->state = NULL;
+        internal->signature = 0;
+        providerInternal->state = NULL;
+        providerInternal->signature = 0;
+        allocated->IAsyncState_iface.lpVtbl->Release( &allocated->IAsyncState_iface );
+        return E_OUTOFMEMORY;
+    }
 
     impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
     impl->ref = 1;
@@ -882,7 +924,13 @@ HRESULT XAsyncBegin( XAsyncBlock* asyncBlock, PVOID context, PVOID identity, LPC
     {
         InitInternalGuardFromBlock( &impl->IXAsyncBlockInternalGuard_iface, asyncBlock );
         state = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetState( &impl->IXAsyncBlockInternalGuard_iface );
-        stateImpl = impl_from_IAsyncState( state );
+        if ( state ) stateImpl = impl_from_IAsyncState( state );
+    }
+
+    if ( !state )
+    {
+        ReleaseInternalGuard( impl );
+        return E_INVALIDARG;
     }
 
     stateImpl->providerCallback = provider;
@@ -890,21 +938,12 @@ HRESULT XAsyncBegin( XAsyncBlock* asyncBlock, PVOID context, PVOID identity, LPC
     stateImpl->identityName = identityName;
     stateImpl->providerData.context = context;
 
-    /* Release the lock before calling provider Begin, which may call XAsyncSchedule
-     * and try to acquire the same lock on the same thread */
-    if ( impl->locked )
-    {
-        InterlockedExchange( &impl->internal->lock, 0 );
-        if ( impl->userInternal != impl->internal )
-            InterlockedExchange( &impl->userInternal->lock, 0 );
-        impl->locked = FALSE;
-    }
+    ReleaseInternalGuard( impl );
 
     hr = stateImpl->providerCallback( Begin, &stateImpl->providerData );
-    if ( FAILED( hr ) )
-    {
-        XAsyncComplete( asyncBlock, hr, 0 );
-    }
+    if ( FAILED( hr ) ) XAsyncComplete( asyncBlock, hr, 0 );
+
+    state->lpVtbl->Release( state );
 
     return S_OK;
 }
@@ -914,13 +953,14 @@ HRESULT XAsyncSchedule( XAsyncBlock* asyncBlock, UINT32 delayInMs )
     HRESULT hr;
     HRESULT exitingStatus;
     BOOLEAN priorScheduled;
-    IAsyncState *state;
+    IAsyncState *state = NULL;
 
     struct x_async_block_guard *impl;
     struct async_state *stateImpl = NULL;
 
     TRACE( "asyncBlock %p, delayInMs %d.\n", asyncBlock, delayInMs );
 
+    if ( !asyncBlock ) return E_INVALIDARG;
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
@@ -931,55 +971,63 @@ HRESULT XAsyncSchedule( XAsyncBlock* asyncBlock, UINT32 delayInMs )
         InitInternalGuardFromBlock( &impl->IXAsyncBlockInternalGuard_iface, asyncBlock );
         state = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetState( &impl->IXAsyncBlockInternalGuard_iface );
         exitingStatus = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetStatus( &impl->IXAsyncBlockInternalGuard_iface );
-        stateImpl = impl_from_IAsyncState( state );
+        if ( state ) stateImpl = impl_from_IAsyncState( state );
     }
 
     if ( FAILED( exitingStatus ) && exitingStatus != E_PENDING )
+    {
+        ReleaseInternalGuard( impl );
+        if ( state ) state->lpVtbl->Release( state );
         return exitingStatus;
+    }
 
     if ( state == NULL )
+    {
+        ReleaseInternalGuard( impl );
         return E_INVALIDARG;
+    }
 
-    priorScheduled = FALSE;
-    InterlockedCompareExchange( &stateImpl->workScheduled, priorScheduled, TRUE );
+    priorScheduled = InterlockedCompareExchange(
+        &stateImpl->workScheduled, TRUE, FALSE );
 
     if ( priorScheduled )
     {
+        ReleaseInternalGuard( impl );
+        state->lpVtbl->Release( state );
         return E_UNEXPECTED;
     }
 
-    state->lpVtbl->AddRef( state );
+    ReleaseInternalGuard( impl );
 
     TRACE( "submitting to queue %p, Work port, delay %d\n", stateImpl->queue, delayInMs );
     hr = XTaskQueueSubmitDelayedCallback( stateImpl->queue, Work, delayInMs, (PVOID)state, WorkerCallback );
     TRACE( "XTaskQueueSubmitDelayedCallback returned 0x%08lx\n", hr );
 
-    state->lpVtbl->Release( state );
-
-    free( impl );
+    if ( FAILED( hr ) )
+    {
+        InterlockedExchange( &stateImpl->workScheduled, FALSE );
+        state->lpVtbl->Release( state );
+    }
 
     return hr;
 }
 
 VOID XAsyncComplete( XAsyncBlock* asyncBlock, HRESULT result, SIZE_T requiredBufferSize )
 {
-    // E_PENDING is special -- if you still have work to do don't complete.
     HRESULT hr;
     BOOLEAN completedNow;
-    BOOLEAN doCleanup;
-    IAsyncState *state;
+    BOOLEAN doCleanup = FALSE;
+    BOOLEAN stateReferenced = FALSE;
+    IAsyncState *state = NULL;
 
-    struct x_async_block_guard *impl;
+    struct x_async_block_guard guard = {0};
+    struct x_async_block_guard *impl = &guard;
     struct async_state *stateImpl = NULL;
 
-    TRACE( "asyncBlock %p, result %#lx, requiredBufferSize %lld.\n", asyncBlock, result, requiredBufferSize );
+    TRACE( "asyncBlock %p, result %#lx, requiredBufferSize %llu.\n", asyncBlock,
+            result, (unsigned long long)requiredBufferSize );
 
-    if ( result == E_PENDING )
-    {
-        return;
-    }
-
-    if (!(impl = calloc( 1, sizeof(*impl) ))) return;
+    if ( result == E_PENDING || !asyncBlock ) return;
 
     impl->IXAsyncBlockInternalGuard_iface.lpVtbl = &x_async_block_guard_vtbl;
     impl->ref = 1;
@@ -998,26 +1046,30 @@ VOID XAsyncComplete( XAsyncBlock* asyncBlock, HRESULT result, SIZE_T requiredBuf
     else
     {
         state = impl->IXAsyncBlockInternalGuard_iface.lpVtbl->GetState( &impl->IXAsyncBlockInternalGuard_iface );
+        stateReferenced = state != NULL;
     }
 
     if ( !state )
     {
         WARN( "called from an invalid block!\n" );
+        UnlockInternalGuard( impl );
         return;
     }
 
     stateImpl = impl_from_IAsyncState( state );
 
-    if ( completedNow )
-    {
-        stateImpl->providerData.bufferSize = requiredBufferSize;
-    }
+    if ( completedNow ) stateImpl->providerData.bufferSize = requiredBufferSize;
+
+    if ( doCleanup )
+        TrySetProviderCleanup( state, CleanupLocation_AfterDoWork );
+
+    UnlockInternalGuard( impl );
 
     // Only signal / adjust needed buffer size if we were first to complete.
     if ( completedNow )
     {
         hr = SignalCompletion( state );
-        if ( FAILED( hr ) ) return;
+        if ( FAILED( hr ) ) WARN( "failed to queue completion callback, hr %#lx\n", hr );
     }
 
     // At this point asyncBlock may be unsafe to touch. As we've cleaned up
@@ -1026,8 +1078,7 @@ VOID XAsyncComplete( XAsyncBlock* asyncBlock, HRESULT result, SIZE_T requiredBuf
     // so it doesn't have to wait for the task queue to process it.
 
     if ( doCleanup )
-    {
-        TrySetProviderCleanup( state, CleanupLocation_AfterDoWork );
         CleanupState( state );
-    }
+
+    if ( stateReferenced ) state->lpVtbl->Release( state );
 }

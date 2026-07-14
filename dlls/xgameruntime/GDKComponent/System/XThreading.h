@@ -29,7 +29,6 @@
 struct x_threading
 {
     IXThreadingImpl IXThreadingImpl_iface;
-    XTaskQueueHandle currentProcessTaskQueue;
     BOOLEAN isTimeSensitiveThread;
     LONG ref;
 };

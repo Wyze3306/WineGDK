@@ -23,18 +23,32 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
-static HRESULT httpclient_SendRequest( URL_COMPONENTS uc, HINTERNET *inetRequest )
+struct httpclient_request
+{
+    HINTERNET session;
+    HINTERNET connect;
+    HINTERNET request;
+};
+
+static void httpclient_CloseRequest( struct httpclient_request *client )
+{
+    if ( client->request ) WinHttpCloseHandle( client->request );
+    if ( client->connect ) WinHttpCloseHandle( client->connect );
+    if ( client->session ) WinHttpCloseHandle( client->session );
+    memset( client, 0, sizeof(*client) );
+}
+
+static HRESULT httpclient_SendRequest( URL_COMPONENTS uc, struct httpclient_request *client )
 {
     DWORD reqFlags;
     LPWSTR hostName = NULL;
     LPWSTR urlPath = NULL;
     HRESULT status = S_OK;
-    HINTERNET inetSession = NULL;
-    HINTERNET inetConnect = NULL;
 
-    if (inetRequest) *inetRequest = NULL;
+    if ( !client ) return E_POINTER;
+    memset( client, 0, sizeof(*client) );
 
-    TRACE( "uc %p, inetRequest %p\n", &uc, inetRequest );
+    TRACE( "uc %p, client %p\n", &uc, client );
 
     hostName = HeapAlloc( GetProcessHeap(), 0, (uc.dwHostNameLength + 1) * sizeof(WCHAR) );
     if ( !hostName ) 
@@ -65,29 +79,32 @@ static HRESULT httpclient_SendRequest( URL_COMPONENTS uc, HINTERNET *inetRequest
         urlPath[uc.dwUrlPathLength] = L'\0';
     }
 
-    inetSession = WinHttpOpen( L"curl/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0 );
-    if ( !inetSession )
+    client->session = WinHttpOpen( L"curl/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0 );
+    if ( !client->session )
     {
         status = HRESULT_FROM_WIN32( GetLastError() );
         goto _CLEANUP;
     }
 
-    inetConnect = WinHttpConnect( inetSession, hostName, uc.nPort, 0 );
-    if ( !inetConnect )
+    client->connect = WinHttpConnect( client->session, hostName, uc.nPort, 0 );
+    if ( !client->connect )
     {
         status = HRESULT_FROM_WIN32( GetLastError() );
         goto _CLEANUP;
     }
 
     reqFlags = ( uc.nScheme == INTERNET_SCHEME_HTTPS ) ? WINHTTP_FLAG_SECURE : 0;
-    *inetRequest = WinHttpOpenRequest( inetConnect, L"GET",urlPath, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags );
-    if ( !*inetRequest )
+    client->request = WinHttpOpenRequest( client->connect, L"GET", urlPath, NULL,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags );
+    if ( !client->request )
     {
         status = HRESULT_FROM_WIN32( GetLastError() );
         goto _CLEANUP;
     }
 
-    if ( !WinHttpSendRequest( *inetRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0 ) )
+    if ( !WinHttpSendRequest( client->request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0 ) )
     {
         status = HRESULT_FROM_WIN32( GetLastError() );
         goto _CLEANUP;
@@ -111,17 +128,11 @@ static HRESULT httpclient_SendRequest( URL_COMPONENTS uc, HINTERNET *inetRequest
      *
      * Make the response read best-effort: log a failure and carry on so the
      * caller can still pull the certificate it needs. */
-    if ( !WinHttpReceiveResponse( *inetRequest, NULL ) )
+    if ( !WinHttpReceiveResponse( client->request, NULL ) )
         WARN( "WinHttpReceiveResponse failed (%#lx) — proceeding with cert only\n", GetLastError() );
 
 _CLEANUP:
-    if ( FAILED( status ) )
-    {
-        if ( *inetRequest ) WinHttpCloseHandle( *inetRequest );
-        *inetRequest = NULL;
-    }
-    if ( inetSession ) WinHttpCloseHandle( inetSession );
-    if ( inetConnect ) WinHttpCloseHandle( inetConnect );
+    if ( FAILED( status ) ) httpclient_CloseRequest( client );
     if ( hostName ) HeapFree( GetProcessHeap(), 0, hostName );
     if ( urlPath ) HeapFree( GetProcessHeap(), 0, urlPath );
     return status;
@@ -131,9 +142,13 @@ static HRESULT httpclient_ObtainSecurityProtocolFlags( HINTERNET inetRequest, UI
 {
     DWORD secInfoSize = sizeof( WINHTTP_SECURITY_INFO );
     HRESULT status = S_OK;
-    PWINHTTP_SECURITY_INFO securityInfo = ( PWINHTTP_SECURITY_INFO )CoTaskMemAlloc( secInfoSize );
+    PWINHTTP_SECURITY_INFO securityInfo;
 
     TRACE( "inetRequest %p, flags %p\n", inetRequest, flags );
+
+    if ( !flags ) return E_POINTER;
+    securityInfo = CoTaskMemAlloc( secInfoSize );
+    if ( !securityInfo ) return E_OUTOFMEMORY;
 
     if ( !WinHttpQueryOption( inetRequest, WINHTTP_OPTION_SECURITY_INFO, securityInfo, &secInfoSize ) )
     {
@@ -155,6 +170,9 @@ static HRESULT httpclient_ObtainServerCertificate( HINTERNET inetRequest, PCERT_
 
     TRACE( "inetRequest %p, context %p\n", inetRequest, context );
 
+    if ( !context ) return E_POINTER;
+    *context = NULL;
+
     if ( !WinHttpQueryOption( inetRequest, WINHTTP_OPTION_SERVER_CERT_CONTEXT, context, &certContextSize ) )
     {
         status = HRESULT_FROM_WIN32( GetLastError() );
@@ -169,12 +187,16 @@ static HRESULT httpclient_ObtainThumbprints( HINTERNET inetRequest, SIZE_T *thum
 {
     SIZE_T idx = 0;
     HRESULT status = S_OK;
-    PCERT_CONTEXT certContext;
+    PCERT_CONTEXT certContext = NULL;
     CERT_CHAIN_PARA chainPara = { .cbSize = sizeof(CERT_CHAIN_PARA) };
-    PCCERT_CHAIN_CONTEXT chainContext;
-    XNetworkingThumbprint *thumbprints;
+    PCCERT_CHAIN_CONTEXT chainContext = NULL;
+    XNetworkingThumbprint *thumbprints = NULL;
 
     TRACE( "inetRequest %p, thumbprintCount %p, out %p\n", inetRequest, thumbprintCount, out );
+
+    if ( !thumbprintCount || !out ) return E_POINTER;
+    *thumbprintCount = 0;
+    *out = NULL;
 
     status = httpclient_ObtainServerCertificate( inetRequest, &certContext );
     if ( FAILED( status ) ) goto _CLEANUP;
@@ -236,22 +258,28 @@ static HRESULT httpclient_ObtainThumbprints( HINTERNET inetRequest, SIZE_T *thum
         TRY_ADD_THUMBPRINT_FROM_CERT( certContext, ThumbprintType_Leaf );
     }
 
-    if (idx > 0) 
+    if ( idx > 0 )
     {
-        *out = ( XNetworkingThumbprint* )realloc( thumbprints, idx * sizeof(XNetworkingThumbprint) );
+        *out = thumbprints;
         *thumbprintCount = idx;
+        thumbprints = NULL;
     }
 
 #undef TRY_ADD_THUMBPRINT_FROM_CERT
 
 _CLEANUP:
+    if ( thumbprints )
+    {
+        for ( idx = 0; idx < 3; idx++ ) free( thumbprints[idx].thumbprintBuffer );
+        free( thumbprints );
+    }
     if ( chainContext ) CertFreeCertificateChain( chainContext );
     if ( certContext ) CertFreeCertificateContext( certContext );
 
     return status;
 }
 
-HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffer, SIZE_T *outBufferByteCount, XNetworkingSecurityInformation **securityInformation )
+HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffer, SIZE_T *outBufferByteCount )
 {
     LPBYTE buffer = NULL;
     LPBYTE bufferLoc = NULL;
@@ -259,13 +287,17 @@ HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffe
     SIZE_T totalBufferSize;
     SIZE_T thumbprintBytes = 0;
     HRESULT status = S_OK;
-    HINTERNET inetRequest;
+    struct httpclient_request client = {0};
     URL_COMPONENTS uc = { .dwStructSize = sizeof(URL_COMPONENTS), 
         .dwSchemeLength = (DWORD)-1, .dwHostNameLength = (DWORD)-1, .dwUrlPathLength = (DWORD)-1, .dwExtraInfoLength = (DWORD)-1 };
     XNetworkingSecurityInformation *information = NULL;
     LPWSTR httpUrl = NULL;
 
-    FIXME( "url %s, securityInformation %p\n", debugstr_w( url ), securityInformation );
+    TRACE( "url %s\n", debugstr_w( url ) );
+
+    if ( !url || !outBuffer || !outBufferByteCount ) return E_POINTER;
+    *outBuffer = NULL;
+    *outBufferByteCount = 0;
 
     /* Minecraft asks for the pinning info of its Real-Time-Activity WebSocket
      * endpoint (wss://signal-*.franchise.minecraft-services.net/...). Wine's
@@ -294,6 +326,11 @@ HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffe
                 wcscpy_s( httpUrl, n, ( rest == url + 6 ) ? L"https://" : L"http://" );
                 wcscat_s( httpUrl, n, rest );
             }
+            else
+            {
+                status = E_OUTOFMEMORY;
+                goto _CLEANUP;
+            }
         }
     }
 
@@ -303,16 +340,23 @@ HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffe
         goto _CLEANUP;
     }
 
-    status = httpclient_SendRequest( uc, &inetRequest );
+    status = httpclient_SendRequest( uc, &client );
     if ( FAILED( status ) ) goto _CLEANUP;
 
-    information = (XNetworkingSecurityInformation *)malloc( sizeof(*information) );
+    information = calloc( 1, sizeof(*information) );
+    if ( !information )
+    {
+        status = E_OUTOFMEMORY;
+        goto _CLEANUP;
+    }
 
-    status = httpclient_ObtainThumbprints( inetRequest, &information->thumbprintCount, &information->thumbprints );
+    status = httpclient_ObtainThumbprints( client.request, &information->thumbprintCount,
+            &information->thumbprints );
     if ( FAILED( status ) ) goto _CLEANUP;
 
     // TODO: Security Protocol Flags are not supported by wine's WinHTTP
-    status = httpclient_ObtainSecurityProtocolFlags( inetRequest, &information->enabledHttpSecurityProtocolFlags );
+    status = httpclient_ObtainSecurityProtocolFlags( client.request,
+            &information->enabledHttpSecurityProtocolFlags );
     if ( FAILED( status ) )
     {
         information->enabledHttpSecurityProtocolFlags = WINHTTP_FLAG_SECURE_PROTOCOL_ALL | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
@@ -331,22 +375,23 @@ HRESULT httpclient_ObtainSecurityInformationForUrl( LPCWSTR url, BYTE **outBuffe
         goto _CLEANUP;
     }
 
-    bufferLoc = buffer;
-
-    memcpy( bufferLoc, information, sizeof(XNetworkingSecurityInformation) );
-    bufferLoc += sizeof(XNetworkingSecurityInformation);
-
-    memcpy( bufferLoc, information->thumbprints, (information->thumbprintCount * sizeof(XNetworkingThumbprint)) );
-    bufferLoc += (information->thumbprintCount * sizeof(XNetworkingThumbprint));
-
-    for ( iterator = 0; iterator < information->thumbprintCount; iterator++ )
     {
-        // guard against empty thumbprints
-        if ( information->thumbprints[iterator].thumbprintBuffer && information->thumbprints[iterator].thumbprintBufferByteCount > 0 )
+        XNetworkingSecurityInformation *packed = (XNetworkingSecurityInformation *)buffer;
+        XNetworkingThumbprint *packedThumbprints = (XNetworkingThumbprint *)(buffer + sizeof(*packed));
+
+        packed->enabledHttpSecurityProtocolFlags = information->enabledHttpSecurityProtocolFlags;
+        packed->thumbprintCount = information->thumbprintCount;
+        packed->thumbprints = packedThumbprints;
+        bufferLoc = (BYTE *)(packedThumbprints + information->thumbprintCount);
+
+        for ( iterator = 0; iterator < information->thumbprintCount; iterator++ )
         {
-            memcpy( bufferLoc,
-                    information->thumbprints[iterator].thumbprintBuffer,
-                    (size_t)information->thumbprints[iterator].thumbprintBufferByteCount );
+            packedThumbprints[iterator].thumbprintType = information->thumbprints[iterator].thumbprintType;
+            packedThumbprints[iterator].thumbprintBufferByteCount =
+                    information->thumbprints[iterator].thumbprintBufferByteCount;
+            packedThumbprints[iterator].thumbprintBuffer = bufferLoc;
+            memcpy( bufferLoc, information->thumbprints[iterator].thumbprintBuffer,
+                    information->thumbprints[iterator].thumbprintBufferByteCount );
             bufferLoc += information->thumbprints[iterator].thumbprintBufferByteCount;
         }
     }
@@ -359,7 +404,14 @@ _CLEANUP:
     {
         free( buffer );
     }
-    if ( inetRequest ) WinHttpCloseHandle( inetRequest );
+    httpclient_CloseRequest( &client );
     if ( httpUrl ) HeapFree( GetProcessHeap(), 0, httpUrl );
+    if ( information )
+    {
+        for ( iterator = 0; iterator < information->thumbprintCount; iterator++ )
+            free( information->thumbprints[iterator].thumbprintBuffer );
+        free( information->thumbprints );
+        free( information );
+    }
     return status;
 }

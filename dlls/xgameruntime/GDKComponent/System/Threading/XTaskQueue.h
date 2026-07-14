@@ -442,6 +442,7 @@ typedef struct XTaskQueueObject
 {
     UINT32 signature;
     IXTaskQueue *headQueue;
+    struct XTaskQueueObject *registryNext;
 } XTaskQueueObject;
 
 // Backwards decleration of XTaskQueuePortObject
@@ -472,6 +473,8 @@ struct x_task_queue_port
     CONDITION_VARIABLE cv;
     CONDITION_VARIABLE cvAny;
     CRITICAL_SECTION cs;
+    CRITICAL_SECTION queueCs;
+    CRITICAL_SECTION terminationCs;
     XQueue *queueList_tail, *queueList_head;
     XQueue *pendingQueueList_tail, *pendingQueueList_head;
     XTerminateForPort *terminateList_tail, *terminateList_head;
@@ -480,6 +483,8 @@ struct x_task_queue_port
     IThreadPool *threadPool;
     LONG64 timerDue;
     LONG nextId;
+    LONG immediateDispatching;
+    LONG serializedDispatching;
     BOOLEAN signaled;
     BOOL suspended;
     LONG ref;
@@ -530,6 +535,9 @@ VOID XTaskQueueCloseHandle( XTaskQueueHandle queue );
 HRESULT XTaskQueueTerminate( XTaskQueueHandle queue, BOOLEAN wait, PVOID callbackContext, XTaskQueueTerminatedCallback* callback );
 HRESULT XTaskQueueSubmitDelayedCallback( XTaskQueueHandle queue, XTaskQueuePort port, UINT32 delayMs, PVOID callbackContext, XTaskQueueCallback* callback );
 HRESULT XTaskQueueDuplicateHandle( XTaskQueueHandle queue, XTaskQueueHandle* duplicatedHandle );
+BOOLEAN XTaskQueueIsHandleOwned( XTaskQueueHandle queue );
+BOOLEAN XTaskQueueGetCurrentProcessQueue( XTaskQueueHandle *queue );
+VOID XTaskQueueSetCurrentProcessQueue( XTaskQueueHandle queue );
 HRESULT XTaskQueueRegisterMonitor( XTaskQueueHandle queue, PVOID callbackContext, XTaskQueueMonitorCallback* callback, XTaskQueueRegistrationToken* token );
 VOID XTaskQueueResumeTermination( XTaskQueueHandle queue );
 

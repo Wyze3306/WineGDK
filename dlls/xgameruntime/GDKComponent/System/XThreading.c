@@ -23,6 +23,50 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
+static SRWLOCK process_task_queue_lock = SRWLOCK_INIT;
+static XTaskQueueHandle current_process_task_queue;
+static BOOLEAN process_task_queue_initialized;
+
+BOOLEAN XTaskQueueGetCurrentProcessQueue( XTaskQueueHandle *queue )
+{
+    HRESULT hr = E_FAIL;
+
+    if ( !queue ) return FALSE;
+    *queue = NULL;
+
+    AcquireSRWLockExclusive( &process_task_queue_lock );
+    if ( !process_task_queue_initialized )
+    {
+        process_task_queue_initialized = TRUE;
+        XTaskQueueCreate( ThreadPool, ThreadPool, &current_process_task_queue );
+    }
+    if ( current_process_task_queue )
+        hr = XTaskQueueDuplicateHandle( current_process_task_queue, queue );
+    ReleaseSRWLockExclusive( &process_task_queue_lock );
+
+    return SUCCEEDED( hr );
+}
+
+VOID XTaskQueueSetCurrentProcessQueue( XTaskQueueHandle queue )
+{
+    XTaskQueueHandle duplicate = NULL;
+    XTaskQueueHandle previous;
+
+    if ( queue && FAILED( XTaskQueueDuplicateHandle( queue, &duplicate ) ) )
+    {
+        WARN( "ignoring invalid process task queue %p\n", queue );
+        return;
+    }
+
+    AcquireSRWLockExclusive( &process_task_queue_lock );
+    previous = current_process_task_queue;
+    current_process_task_queue = duplicate;
+    process_task_queue_initialized = TRUE;
+    ReleaseSRWLockExclusive( &process_task_queue_lock );
+
+    XTaskQueueCloseHandle( previous );
+}
+
 static inline struct x_threading *impl_from_IXThreadingImpl( IXThreadingImpl *iface )
 {
     return CONTAINING_RECORD( iface, struct x_threading, IXThreadingImpl_iface );
@@ -112,48 +156,17 @@ static HRESULT WINAPI x_threading_XAsyncSchedule( IXThreadingImpl* iface, XAsync
 
 static VOID WINAPI x_threading_XAsyncComplete( IXThreadingImpl* iface, XAsyncBlock* asyncBlock, HRESULT result, SIZE_T requiredBufferSize )
 {
-    TRACE( "iface %p, asyncBlock %p, result %#lx, requiredBufferSize %lld.\n", iface, asyncBlock, result, requiredBufferSize );
+    TRACE( "iface %p, asyncBlock %p, result %#lx, requiredBufferSize %llu.\n",
+            iface, asyncBlock, result, (unsigned long long)requiredBufferSize );
     XAsyncComplete( asyncBlock, result, requiredBufferSize );
     return;
 }
 
 static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl* iface, XAsyncBlock* asyncBlock, const PVOID identity, SIZE_T bufferSize, PVOID buffer, SIZE_T* bufferUsed )
 {
-    AsyncBlockInternal *internal;
-    struct async_state *stateImpl;
-    HRESULT hr;
-
     TRACE( "iface %p, asyncBlock %p, identity %p, bufferSize %llu, buffer %p, bufferUsed %p\n",
            iface, asyncBlock, identity, (unsigned long long)bufferSize, buffer, bufferUsed );
-
-    if (!asyncBlock) return E_POINTER;
-
-    internal = (AsyncBlockInternal *)asyncBlock->internal;
-    if (!internal || !internal->state) return E_INVALIDARG;
-
-    stateImpl = CONTAINING_RECORD( internal->state, struct async_state, IAsyncState_iface );
-
-    if (identity && stateImpl->identity != identity)
-    {
-        WARN( "identity mismatch: expected %p, got %p (%s)\n", identity, stateImpl->identity, stateImpl->identityName );
-        return E_INVALIDARG;
-    }
-
-    hr = internal->status;
-    TRACE( "internal->status = 0x%08lx, identity match: %d\n", hr, stateImpl->identity == identity );
-    if (hr == E_PENDING) return E_PENDING;
-    if (FAILED( hr )) return hr;
-
-    if (buffer && bufferSize > 0)
-    {
-        stateImpl->providerData.buffer = buffer;
-        stateImpl->providerData.bufferSize = bufferSize;
-        stateImpl->providerCallback( GetResult, &stateImpl->providerData );
-    }
-
-    if (bufferUsed) *bufferUsed = stateImpl->providerData.bufferSize;
-
-    return hr;
+    return XAsyncGetResult( asyncBlock, identity, bufferSize, buffer, bufferUsed );
 }
 
 
@@ -240,32 +253,14 @@ static VOID WINAPI x_threading_XTaskQueueUnregisterMonitor( IXThreadingImpl* ifa
 
 static BOOLEAN WINAPI x_threading_XTaskQueueGetCurrentProcessTaskQueue( IXThreadingImpl* iface, XTaskQueueHandle* queue )
 {
-    struct x_threading *impl = impl_from_IXThreadingImpl( iface );
     TRACE( "iface %p, queue %p.\n", iface, queue );
-
-    /* Create a default process task queue if none exists.
-     * XSAPI's XblInitialize checks this and bails with 0x800701AB
-     * if it returns FALSE and the XblInitArgs->queue is NULL. */
-    if ( !impl->currentProcessTaskQueue )
-    {
-        TRACE( "creating default process task queue\n" );
-        XTaskQueueCreate( ThreadPool, ThreadPool, &impl->currentProcessTaskQueue );
-    }
-
-    if ( impl->currentProcessTaskQueue )
-    {
-        *queue = impl->currentProcessTaskQueue;
-        return TRUE;
-    }
-    return FALSE;
+    return XTaskQueueGetCurrentProcessQueue( queue );
 }
 
 static VOID WINAPI x_threading_XTaskQueueSetCurrentProcessTaskQueue( IXThreadingImpl* iface, XTaskQueueHandle queue )
 {
-    struct x_threading *impl = impl_from_IXThreadingImpl( iface );
     TRACE( "iface %p, queue %p.\n", iface, queue );
-    impl->currentProcessTaskQueue = queue;
-    /* no-op return */
+    XTaskQueueSetCurrentProcessQueue( queue );
 }
 
 static HRESULT WINAPI x_threading_XThreadSetTimeSensitive( IXThreadingImpl* iface, BOOLEAN isTimeSensitiveThread )
@@ -331,7 +326,6 @@ static const struct IXThreadingImplVtbl x_threading_vtbl =
 static struct x_threading x_threading =
 {
     {&x_threading_vtbl},
-    NULL,
     0,
     0,
 };

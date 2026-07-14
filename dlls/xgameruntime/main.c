@@ -111,16 +111,8 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
     {
         case DLL_PROCESS_ATTACH:
         {
-            HMODULE game;
-            DWORD oldprot;
-
             DisableThreadLibraryCalls(hinst);
             xgameruntime_threading = LoadLibraryA("xgameruntime.dll.threading");
-
-            /* Patch the game's isSignedIn checker to always return TRUE.
-             * The function at RVA 0x1433680 checks user->isConnected(XboxLive)
-             * which is never set because XSAPI social manager doesn't initialize
-             * on Win32/Wine. Patching to 'mov eax,1; ret' bypasses this. */
             break;
         }
         case DLL_PROCESS_DETACH:
@@ -132,21 +124,15 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
     return TRUE;
 }
 
-/* Whether to apply the in-game sign-in patches that FORCE the signed-in state:
- * Patch 1 (isSignedIn -> TRUE), Patch 2 (the XblInitialize gate), Patch 3 (the
- * isLoggedInWithMicrosoftAccount facet) and Patch 4 (the online-server join
- * gate). Default ON. The launcher writes HKLM\Software\Wine\WineGDK\ForceMsaFacet=0
+/* Whether to apply the in-game sign-in patches that force the signed-in state:
+ * the XblInitialize gate, the isLoggedInWithMicrosoftAccount facet, and the
+ * online-server join gate. Default ON. The launcher writes
+ * HKLM\Software\Wine\WineGDK\ForceMsaFacet=0
  * to turn it OFF for users whose game crashes: forcing that state sends the game
  * down code paths that deref XSAPI account/session objects which never populate
  * under Wine on some setups (issue #17/#18).
  *
- * Crucially this gates the WHOLE forcing set, not just Patch 3. Gating Patch 3
- * alone left ForceMsaFacet=0 in a half-patched state — isSignedIn forced TRUE
- * (Patch 1) yet the MSA facet FALSE (Patch 3 skipped) and joins forced (Patch 4)
- * — a combination the game never sees natively, which still page-faults on the
- * Servers/worlds screens. With the switch off NONE of these apply, so the game
- * gets genuine pre-patch behaviour (Servers tab greyed, but it runs). The
- * passive null-guard (Patch 5) is pure safety and stays on regardless. */
+ * The passive sign-in lookup null guard remains enabled regardless. */
 static BOOLEAN msa_force_enabled( void )
 {
     HKEY key;
@@ -166,7 +152,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
 {
     HRESULT hr;
     static BOOLEAN com_initialized = FALSE;
-    /* Read once: master gate for the state-forcing sign-in patches (1-4). */
+    /* Read once: master gate for the state-forcing sign-in patches. */
     BOOLEAN force = msa_force_enabled();
 
     TRACE("gdkVer %ld, gsVer %ld, mode %d, options %p\n", gdkVer, gsVer, mode, options);
@@ -228,101 +214,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
         }
     }
 
-    /* Patch the game's isSignedIn checker to always return TRUE.
-     * Scans for the function's unique byte pattern so it works across versions.
-     * Called here (not DLL_PROCESS_ATTACH) to ensure the game binary is loaded.
-     * Retries on each InitializeApiImplEx2 call until successful. */
-    {
-        static BOOLEAN patched = FALSE;
-        if (force && !patched)
-        {
-            HMODULE game = GetModuleHandleA( NULL );
-            if (game)
-            {
-                MODULEINFO modinfo;
-                if (GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
-                {
-                    BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
-                    SIZE_T size = modinfo.SizeOfImage;
-                    BYTE *addr = NULL;
-                    SIZE_T i;
-                    DWORD oldprot;
-
-                    /* Function prologue pattern:
-                     *   48 89 5C 24 10   mov [rsp+10h], rbx
-                     *   48 89 74 24 18   mov [rsp+18h], rsi
-                     *   57               push rdi
-                     *   48 83 EC 30      sub rsp, 30h
-                     * Then within ~30 bytes: 48 8B 49 XX (mov rcx,[rcx+disp8]) = mUserManager
-                     *   v1.26.12 had disp8=0x50, v1.26.20 has disp8=0x38 — accept any.
-                     * Then within ~80 bytes: BA 01 00 00 00 (mov edx,1) = NetworkType::XboxLive */
-                    static const BYTE prologue[] = {
-                        0x48, 0x89, 0x5C, 0x24, 0x10,
-                        0x48, 0x89, 0x74, 0x24, 0x18,
-                        0x57,
-                        0x48, 0x83, 0xEC, 0x30
-                    };
-                    SIZE_T best_score = 0;
-
-                    for (i = 0; i + sizeof(prologue) + 80 < size; i++)
-                    {
-                        SIZE_T j;
-                        BOOLEAN found_usermgr = FALSE, found_xboxlive = FALSE;
-                        SIZE_T score = 0;
-
-                        if (memcmp( base + i, prologue, sizeof(prologue) ) != 0)
-                            continue;
-
-                        /* Verify: mov rcx,[rcx+disp8] within next 30 bytes (any disp8) */
-                        for (j = i + sizeof(prologue); j < i + sizeof(prologue) + 30 && j + 4 < size; j++)
-                            if (base[j]==0x48 && base[j+1]==0x8B && base[j+2]==0x49)
-                                { found_usermgr = TRUE; break; }
-
-                        if (!found_usermgr) continue;
-
-                        /* Verify: mov edx,1 within next 80 bytes */
-                        for (j = i + sizeof(prologue); j < i + sizeof(prologue) + 80 && j + 5 < size; j++)
-                            if (base[j]==0xBA && base[j+1]==0x01 && base[j+2]==0x00 && base[j+3]==0x00 && base[j+4]==0x00)
-                                { found_xboxlive = TRUE; break; }
-
-                        if (!found_xboxlive) continue;
-
-                        /* Tighten the match: prefer functions that ALSO have
-                         * `call <near>` (E8 ...) within +90 — isSignedIn calls
-                         * the user-manager's isConnected.  This rules out any
-                         * inline/stub function that happens to share the
-                         * prologue but doesn't dispatch. */
-                        for (j = i + sizeof(prologue); j < i + sizeof(prologue) + 90 && j < size; j++)
-                            if (base[j] == 0xE8) { score++; break; }
-
-                        if (!score) continue;
-                        addr = base + i;
-                        best_score = score;
-                        break;
-                    }
-
-                    if (addr && VirtualProtect( addr, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
-                    {
-                        addr[0] = 0xB8; /* mov eax, 1 */
-                        addr[1] = 0x01;
-                        addr[2] = 0x00;
-                        addr[3] = 0x00;
-                        addr[4] = 0x00;
-                        addr[5] = 0xC3; /* ret */
-                        VirtualProtect( addr, 6, oldprot, &oldprot );
-                        ERR( "patched isSignedIn at %p (RVA 0x%lx)\n", addr, (ULONG_PTR)(addr - base) );
-                        patched = TRUE;
-                    }
-                    else if (!addr)
-                    {
-                        ERR( "isSignedIn pattern not found in %zu bytes\n", size );
-                    }
-                }
-            }
-        }
-    }
-
-    /* Patch 2: NOP the credential check gate that blocks XblInitialize.
+    /* NOP the credential check gate that blocks XblInitialize.
      * The game's XboxLiveServices::signIn checks a credential provider
      * (call returns into a local at [rbp+disp8]); a JL on that result skips
      * the entire "user is signed in" success path including XblInitialize.
@@ -395,7 +287,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
         }
     }
 
-    /* Patch 3: force the game's isLoggedInWithMicrosoftAccount getter to TRUE.
+    /* Force the game's isLoggedInWithMicrosoftAccount getter to TRUE.
      * The UI ("userAccount" facet) reads this bool to decide whether the player
      * is signed in with an MSA; on Win32/Wine XSAPI's social manager never
      * finishes so it stays false, which keeps the home-screen "Sign in" button
@@ -466,8 +358,9 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                              *    between versions). Scan a small window for the
                              *    `(48|4C) 8D 05 disp32` whose target is the bool
                              *    getter `movzx eax,byte[rcx+disp8]; ret`
-                             *    (0F B6 41 disp8 C3) and overwrite it with
-                             *    `mov eax,1; ret`. Scanning by shape (not a
+                             *    (0F B6 41 disp8 C3) and overwrite its exact
+                             *    five-byte body with `xor eax,eax; inc eax; ret`.
+                             *    Scanning by shape (not a
                              *    hard-coded offset) keeps this version-robust. */
                             int off;
                             for (off = 0x10; off <= 0x20 && !patched3; off++)
@@ -481,17 +374,18 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
                                     continue;
                                 gdisp = *(INT32 *)(gl + 3);
                                 getter_rva = (ULONG_PTR)(gl + 7 - base) + gdisp;
-                                if (getter_rva + 6 > size) continue;
+                                if (getter_rva + 5 > size) continue;
                                 getter = base + getter_rva;
                                 if (getter[0] == 0x0F && getter[1] == 0xB6 &&
                                     getter[2] == 0x41 && getter[4] == 0xC3)
                                 {
-                                    if (VirtualProtect( getter, 6, PAGE_EXECUTE_READWRITE, &oldprot ))
+                                    if (VirtualProtect( getter, 5, PAGE_EXECUTE_READWRITE, &oldprot ))
                                     {
-                                        getter[0] = 0xB8; getter[1] = 0x01;
-                                        getter[2] = 0x00; getter[3] = 0x00;
-                                        getter[4] = 0x00; getter[5] = 0xC3;
-                                        VirtualProtect( getter, 6, oldprot, &oldprot );
+                                        getter[0] = 0x31; getter[1] = 0xC0;
+                                        getter[2] = 0xFF; getter[3] = 0xC0;
+                                        getter[4] = 0xC3;
+                                        FlushInstructionCache( GetCurrentProcess(), getter, 5 );
+                                        VirtualProtect( getter, 5, oldprot, &oldprot );
                                         ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx (name_lea+0x%x)\n",
                                              (ULONG_PTR)getter_rva, off );
                                         patched3 = TRUE;
@@ -511,7 +405,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
         }
     }
 
-    /* Patch 4: unlock joining online Bedrock servers.
+    /* Unlock joining online Bedrock servers.
      * The connect dispatcher gates the join on an "online Xbox Live sign-in"
      * check that wrongly fails for our native login (returns
      * UserNeedsToBeSignedIn before any packet is sent); flip that branch.
@@ -578,8 +472,8 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
         }
     }
 
-    /* Patch 5: null-guard the sign-in-state lookup so Patch 3 can't crash.
-     * Patch 3 forces isLoggedInWithMicrosoftAccount=TRUE. Where the MSA
+    /* Null-guard the sign-in-state lookup used by MSA facet forcing.
+     * Where the MSA
      * account object is populated (most installs) that's all the game needs
      * and the Servers tab unlocks. But on some installs (a fresh Steam Deck
      * prefix, issue #17) the backing collection pointer is still NULL when an
@@ -591,7 +485,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
      * The routine just looks a key up in one of two collections and returns a
      * byte; an empty (NULL) collection means "not found" = 0. We splice a
      * trampoline in after the collection load: it returns 0 when the pointer
-     * is NULL and otherwise runs unchanged - so Patch 3 keeps working where
+     * is NULL and otherwise runs unchanged - so facet forcing keeps working where
      * the object exists (no behaviour change) and never crashes where it
      * doesn't. Version-robust: the body + `push rsi;push rdi;sub rsp,0x28`
      * prologue are byte-identical across 1.26.20..40 (verified static). We
@@ -969,4 +863,3 @@ HRESULT WINAPI XErrorReport( HRESULT status, LPCSTR message )
     TRACE("stub!\n");
     return E_NOTIMPL;
 }
-

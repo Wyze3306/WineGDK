@@ -3,4 +3,5 @@ IMPORTS = user32 advapi32 combase
 
 SOURCES = \
     provider.idl \
+	taskqueue.c \
 	xgameruntime.c
