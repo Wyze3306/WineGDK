@@ -39,8 +39,7 @@ static VOID CALLBACK WaitCallback( PTP_CALLBACK_INSTANCE instance , void* contex
         iface->lpVtbl->AddRef( iface );
         callback = impl->callback;
         callback_context = impl->context;
-        DisassociateCurrentThreadFromCallback( instance );
-        callback( callback_context );
+        callback( callback_context, instance );
         iface->lpVtbl->Release( iface );
     }
 

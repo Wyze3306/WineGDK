@@ -69,6 +69,16 @@ struct event_context
     LONG canceled;
 };
 
+struct close_context
+{
+    IXThreadingImpl *threading;
+    XTaskQueueHandle queue;
+    HANDLE event;
+    LONG calls;
+    LONG canceled;
+    LONG closed;
+};
+
 struct termination_context
 {
     LONG calls;
@@ -165,6 +175,17 @@ static void CALLBACK event_callback( void *context, BOOL canceled )
 
     if ( canceled ) InterlockedIncrement( &impl->canceled );
     InterlockedIncrement( &impl->calls );
+    SetEvent( impl->event );
+}
+
+static void CALLBACK delayed_close_callback( void *context, BOOL canceled )
+{
+    struct close_context *impl = context;
+
+    if ( canceled ) InterlockedIncrement( &impl->canceled );
+    InterlockedIncrement( &impl->calls );
+    IXThreadingImpl_XTaskQueueCloseHandle( impl->threading, impl->queue );
+    InterlockedExchange( &impl->closed, 1 );
     SetEvent( impl->event );
 }
 
@@ -402,6 +423,38 @@ static void test_delayed_immediate_close( IXThreadingImpl *threading )
     CloseHandle( context.event );
 }
 
+static void test_delayed_callback_closes_queue( IXThreadingImpl *threading )
+{
+    struct close_context context = {0};
+    DWORD wait;
+    HRESULT hr;
+
+    context.threading = threading;
+    context.event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( context.event != NULL, "CreateEventW failed, error %lu.\n", GetLastError() );
+
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, Immediate, Manual, &context.queue );
+    ok( hr == S_OK, "XTaskQueueCreate failed, hr %#lx.\n", hr );
+    if ( FAILED( hr ) )
+    {
+        CloseHandle( context.event );
+        return;
+    }
+
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, context.queue,
+            Work, 20, &context, delayed_close_callback );
+    ok( hr == S_OK, "immediate delayed submission failed, hr %#lx.\n", hr );
+
+    wait = WaitForSingleObject( context.event, 2000 );
+    ok( wait == WAIT_OBJECT_0, "delayed close callback did not run, wait %#lx.\n", wait );
+    ok( context.calls == 1, "got %ld delayed close callbacks.\n", context.calls );
+    ok( !context.canceled, "delayed close callback was canceled.\n" );
+
+    if ( !InterlockedCompareExchange( &context.closed, 0, 0 ) )
+        IXThreadingImpl_XTaskQueueCloseHandle( threading, context.queue );
+    CloseHandle( context.event );
+}
+
 static void test_termination( IXThreadingImpl *threading )
 {
     struct termination_context context = {0};
@@ -461,6 +514,7 @@ START_TEST(taskqueue)
     test_concurrent_delayed_queue( threading );
     test_blocking_dispatch( threading );
     test_delayed_immediate_close( threading );
+    test_delayed_callback_closes_queue( threading );
     test_termination( threading );
 
     IXThreadingImpl_Release( threading );

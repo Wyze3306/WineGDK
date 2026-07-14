@@ -24,7 +24,7 @@
 
 #include "../../../private.h"
 
-typedef void CALLBACK WaitTimerCallback(void* context);
+typedef void CALLBACK WaitTimerCallback(void* context, PTP_CALLBACK_INSTANCE instance);
 
 typedef struct IXWaitTimer IXWaitTimer;
 

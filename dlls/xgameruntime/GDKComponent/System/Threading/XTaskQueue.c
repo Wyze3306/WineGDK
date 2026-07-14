@@ -76,10 +76,22 @@ BOOLEAN XTaskQueueIsHandleOwned( XTaskQueueHandle queue )
     return found;
 }
 
-static void CALLBACK x_task_queue_port_WaitTimerOperation( void *context )
+static void CALLBACK x_task_queue_port_WaitTimerOperation( void *context,
+        PTP_CALLBACK_INSTANCE instance )
 {
     IXTaskQueuePort* port = (IXTaskQueuePort *)context;
-    port->lpVtbl->AddRef( port );
+    struct x_task_queue_port *impl = CONTAINING_RECORD( port,
+            struct x_task_queue_port, IXTaskQueuePort_iface );
+    BOOLEAN has_pending;
+
+    EnterCriticalSection( &impl->queueCs );
+    has_pending = impl->pendingQueueList_head != NULL;
+    if ( has_pending ) port->lpVtbl->AddRef( port );
+    LeaveCriticalSection( &impl->queueCs );
+
+    if ( !has_pending ) return;
+
+    DisassociateCurrentThreadFromCallback( instance );
     port->lpVtbl->SubmitPendingCallback( port );
     port->lpVtbl->Release( port );
 }
@@ -2306,4 +2318,6 @@ VOID XTaskQueueResumeTermination( XTaskQueueHandle queue )
     queuePort = portContext->lpVtbl->get_Port( portContext );
 
     queuePort->lpVtbl->ResumeTermination( queuePort, portContext );
+    queuePort->lpVtbl->Release( queuePort );
+    portContext->lpVtbl->Release( portContext );
 }
