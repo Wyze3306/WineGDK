@@ -678,7 +678,7 @@ HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUse
         return hr;
     }
 
-    TRACE( "XSTS response size=%llu, first 200 chars: %.200s\n", (unsigned long long)size, buffer );
+    TRACE( "XSTS response size=%llu\n", (unsigned long long)size );
 
     hr = ParseJsonObject( buffer, size, &object );
     free( buffer );
@@ -907,7 +907,7 @@ HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
 
     /* Sign the SISU request — Microsoft rejects unsigned /authorize. */
     if (FAILED( hr = DeviceAuth_SignRequest( "POST", "/authorize", "",
-                                              body, strlen( body ),
+                                              0, NULL, body, strlen( body ),
                                               &sig_header ) ))
     {
         WARN( "RequestSisuAuthorize: SignRequest failed 0x%08lx\n", hr );
@@ -934,24 +934,6 @@ HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
         }
     }
     TRACE( "RequestSisuAuthorize response size=%llu\n", (unsigned long long)response_size );
-    /* Dump the full response in WARN so it lands even without +gdkc tracing
-     * — we need to see whether AuthorizationToken is actually in the body
-     * or just TitleToken/UserToken (Microsoft sometimes returns the latter
-     * with a 200 when the device or proof key isn't trusted for the title).
-     * Logged in chunks because WINE's debug helpers truncate long strings. */
-    {
-        SIZE_T off;
-        for (off = 0; off < response_size; off += 800)
-        {
-            SIZE_T n = response_size - off;
-            if (n > 800) n = 800;
-            WARN( "RequestSisuAuthorize response[%llu..%llu]: %.*s\n",
-                  (unsigned long long)off,
-                  (unsigned long long)(off + n),
-                  (int)n, response + off );
-        }
-    }
-
     if (FAILED( hr = ParseJsonObject( response, response_size, &root ) ))
     {
         WARN( "RequestSisuAuthorize: ParseJsonObject failed 0x%08lx\n", hr );
@@ -991,8 +973,7 @@ HRESULT RequestSisuAuthorize( LPCSTR client_id, HSTRING oauth_token,
             errno = 0;
             *uhs = strtoull( uhs_mb, NULL, 10 );
             if (errno == ERANGE) { *uhs = 0; errno = 0; }
-            TRACE( "RequestSisuAuthorize: AuthorizationToken uhs=%llu\n",
-                   (unsigned long long)*uhs );
+            TRACE( "RequestSisuAuthorize: AuthorizationToken user hash extracted\n" );
         }
         else WARN( "RequestSisuAuthorize: could not extract AuthorizationToken uhs\n" );
         if (uhs_mb) free( uhs_mb );

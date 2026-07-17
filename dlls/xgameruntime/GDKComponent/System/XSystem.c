@@ -83,19 +83,23 @@ static HRESULT WINAPI x_system_XSystemGetConsoleId( IXSystemImpl *iface, INT32 c
 
 static HRESULT WINAPI x_system_XSystemGetXboxLiveSandboxId( IXSystemImpl *iface, INT32 sandboxIdSize, LPSTR sandboxId, SIZE_T *sandboxIdUsed )
 {    
+    static LONG reported_ready;
     // Always assume RETAIL environment for Wine
     LPCSTR Id = "RETAIL";
 
     TRACE( "iface %p, sandboxIdSize %d, sandboxId %p, sandboxIdUsed %p\n", iface, sandboxIdSize, sandboxId, sandboxIdUsed );
 
-    if ( !sandboxId || !sandboxIdUsed )
+    if ( !sandboxId )
         return E_POINTER;
 
     if ( sandboxIdSize < XSystemXboxLiveSandboxIdMaxBytes )
         return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
 
     strcpy_s( sandboxId, sandboxIdSize, Id );
-    *sandboxIdUsed = strlen( Id ) + 1;
+    if (sandboxIdUsed)
+        *sandboxIdUsed = strlen( Id ) + 1;
+    if (!InterlockedExchange( &reported_ready, 1 ))
+        TRACE( "native Xbox app configuration ready: RETAIL sandbox returned with optional size output support.\n" );
     return S_OK;
 }
 

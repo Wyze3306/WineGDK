@@ -66,6 +66,22 @@ HRESULT WINAPI GDKC_InitAPI(
         return E_GAMERUNTIME_VERSION_MISMATCH;
     }
 
+    /* INITIALIZE_OPTIONS is an opaque ABI-owned structure here.  Do not
+     * inspect it: older and newer Gaming Runtime versions use different
+     * layouts.  The packaged game's identity is discovered from the
+     * executable location instead. */
+    status = WineGDKLoadGameConfig();
+    if (status == E_GAME_MISSING_GAME_CONFIG)
+    {
+        WARN("continuing without MicrosoftGame.Config; XGameGetXboxTitleId will report ERROR_NOT_FOUND\n");
+        status = S_OK;
+    }
+    else if (FAILED( status ))
+    {
+        ERR("MicrosoftGame.Config initialization failed, hr %#lx\n", status);
+        return status;
+    }
+
     return status;
 
     // TODO: Game Specific Initialization

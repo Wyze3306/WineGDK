@@ -24,6 +24,7 @@
 #include "XUser.h"
 #include "DeviceAuth.h"
 #include "winhttp.h"
+#include <ctype.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -36,6 +37,67 @@ static inline HRESULT GetJsonStringValue( IJsonObject *object, LPCWSTR key, HSTR
     if (FAILED( hr = WindowsCreateStringReference( key, wcslen( key ), &key_hdr, &key_hstr ) ))
         return hr;
     return IJsonObject_GetNamedString( object, key_hstr, value );
+}
+
+static inline HRESULT GetOptionalJsonStringValue( IJsonObject *object, LPCWSTR key,
+                                                   HSTRING *value, BOOLEAN *present )
+{
+    IJsonValue *json_value = NULL;
+    HSTRING_HEADER key_hdr;
+    HSTRING key_hstr;
+    HRESULT hr;
+
+    if (!object || !key || !value || !present) return E_POINTER;
+    *value = NULL;
+    *present = FALSE;
+    if (FAILED( hr = WindowsCreateStringReference( key, wcslen( key ),
+                                                    &key_hdr, &key_hstr ) ))
+        return hr;
+    if (FAILED( hr = IJsonObject_GetNamedValue( object, key_hstr,
+                                                &json_value ) ))
+        return hr;
+
+    /* A value with the wrong JSON type is still present.  GetNamedString will
+     * fail below and the caller will consequently treat the claim as empty,
+     * rather than falling back to legacy allow-all behaviour. */
+    *present = TRUE;
+    IJsonValue_Release( json_value );
+    return IJsonObject_GetNamedString( object, key_hstr, value );
+}
+
+static BOOLEAN XblPrivilegeClaimContains( HSTRING claim,
+                                          XUserPrivilege requested_privilege )
+{
+    BOOLEAN found = FALSE;
+    const WCHAR *text;
+    UINT32 length, i = 0;
+    UINT64 requested = (UINT32)requested_privilege;
+
+    if ((INT32)requested_privilege < 0 || !claim) return FALSE;
+    text = WindowsGetStringRawBuffer( claim, &length );
+    if (!text || !length) return FALSE;
+
+    /* The launcher stores a canonical sequence of unsigned decimal uint32
+     * values separated by one ASCII space.  Validate the complete claim before
+     * returning a match so a partially malformed claim always fails closed. */
+    while (i < length)
+    {
+        UINT64 value = 0;
+
+        if (text[i] < L'0' || text[i] > L'9') return FALSE;
+        do
+        {
+            UINT32 digit = text[i] - L'0';
+            if (value > (0xffffffffULL - digit) / 10) return FALSE;
+            value = value * 10 + digit;
+            ++i;
+        } while (i < length && text[i] >= L'0' && text[i] <= L'9');
+
+        if (value == requested) found = TRUE;
+        if (i == length) break;
+        if (text[i] != L' ' || ++i == length) return FALSE;
+    }
+    return found;
 }
 
 static time_t HSTRINGToEpoch( HSTRING value )
@@ -52,11 +114,6 @@ static time_t HSTRINGToEpoch( HSTRING value )
         seconds = 0;
     free( text );
     return (time_t)seconds;
-}
-
-static BOOLEAN HSTRINGIsReady( HSTRING value )
-{
-    return value && WindowsGetStringLen( value );
 }
 
 static const struct IXUserImplVtbl x_user_vtbl;
@@ -79,24 +136,6 @@ static struct x_user *signed_in_user_snapshot( void )
 {
     return InterlockedCompareExchangePointer(
         (void *volatile *)&g_signed_in_user, NULL, NULL );
-}
-
-static BOOLEAN online_user_ready( const struct x_user *user )
-{
-    time_t now = time( NULL );
-
-    return user->xuid && user->local_id.value &&
-           HSTRINGIsReady( user->refresh_token ) &&
-           HSTRINGIsReady( user->oauth_token ) &&
-           HSTRINGIsReady( user->user_token ) &&
-           HSTRINGIsReady( user->xsts_token ) &&
-           HSTRINGIsReady( user->mp_token ) && user->mp_uhs &&
-           user->mp_rp[0] &&
-           !strcmp( user->mp_rp, "https://multiplayer.minecraft.net/" ) &&
-           user->oauth_token_expiry > now + 60 &&
-           user->user_token_expiry > now + 60 &&
-           user->xsts_token_expiry > now + 60 &&
-           user->mp_expiry > now + 60;
 }
 
 static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
@@ -192,25 +231,39 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                     if (SUCCEEDED( ParseJsonObject( buf, sz, &root ) ) && root)
                     {
                         HSTRING utok = NULL, xtok = NULL, stok = NULL;
-                        HSTRING gtg = NULL, xuid_s = NULL, agg_s = NULL;
+                        HSTRING gtg = NULL, mgt = NULL, mgs = NULL, umg = NULL;
+                        HSTRING xuid_s = NULL, agg_s = NULL;
+                        HSTRING privileges_s = NULL;
                         HSTRING uhs_s = NULL, sisu_uhs_s = NULL, sisu_rp_s = NULL;
                         HSTRING mptok = NULL, mp_uhs_s = NULL, mp_rp_s = NULL;
+                        HSTRING realmstok = NULL, realms_uhs_s = NULL, realms_rp_s = NULL;
                         HSTRING lictok = NULL, lic_uhs_s = NULL, lic_rp_s = NULL;
                         HSTRING user_expiry_s = NULL, xbl_expiry_s = NULL;
                         HSTRING sisu_expiry_s = NULL, mp_expiry_s = NULL;
-                        HSTRING lic_expiry_s = NULL;
+                        HSTRING realms_expiry_s = NULL, lic_expiry_s = NULL;
+                        BOOLEAN privileges_present = FALSE;
+                        HRESULT privileges_hr;
                         (void)GetJsonStringValue( root, L"user_token", &utok );
                         (void)GetJsonStringValue( root, L"xbl_token", &xtok );
                         (void)GetJsonStringValue( root, L"sisu_token", &stok );
                         (void)GetJsonStringValue( root, L"xbl_gamertag", &gtg );
+                        (void)GetJsonStringValue( root, L"xbl_modern_gamertag", &mgt );
+                        (void)GetJsonStringValue( root, L"xbl_modern_gamertag_suffix", &mgs );
+                        (void)GetJsonStringValue( root, L"xbl_unique_modern_gamertag", &umg );
                         (void)GetJsonStringValue( root, L"xbl_xuid", &xuid_s );
                         (void)GetJsonStringValue( root, L"xbl_age_group", &agg_s );
                         (void)GetJsonStringValue( root, L"xbl_uhs", &uhs_s );
+                        privileges_hr = GetOptionalJsonStringValue(
+                            root, L"xbl_privileges", &privileges_s,
+                            &privileges_present );
                         (void)GetJsonStringValue( root, L"sisu_uhs", &sisu_uhs_s );
                         (void)GetJsonStringValue( root, L"sisu_rp", &sisu_rp_s );
                         (void)GetJsonStringValue( root, L"mp_token", &mptok );
                         (void)GetJsonStringValue( root, L"mp_uhs", &mp_uhs_s );
                         (void)GetJsonStringValue( root, L"mp_rp", &mp_rp_s );
+                        (void)GetJsonStringValue( root, L"realms_token", &realmstok );
+                        (void)GetJsonStringValue( root, L"realms_uhs", &realms_uhs_s );
+                        (void)GetJsonStringValue( root, L"realms_rp", &realms_rp_s );
                         (void)GetJsonStringValue( root, L"lic_token", &lictok );
                         (void)GetJsonStringValue( root, L"lic_uhs", &lic_uhs_s );
                         (void)GetJsonStringValue( root, L"lic_rp", &lic_rp_s );
@@ -218,6 +271,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         (void)GetJsonStringValue( root, L"xbl_token_expiry_epoch", &xbl_expiry_s );
                         (void)GetJsonStringValue( root, L"sisu_expiry_epoch", &sisu_expiry_s );
                         (void)GetJsonStringValue( root, L"mp_expiry_epoch", &mp_expiry_s );
+                        (void)GetJsonStringValue( root, L"realms_expiry_epoch", &realms_expiry_s );
                         (void)GetJsonStringValue( root, L"lic_expiry_epoch", &lic_expiry_s );
                         if (utok && xtok && xuid_s)
                         {
@@ -231,7 +285,24 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                             { impl->xuid = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
                             /* gamertag */
                             if (gtg && SUCCEEDED( HSTRINGToMultiByte( gtg, &mb, &ml ) ) && mb)
-                            { lstrcpynA( impl->gamertag, mb, sizeof(impl->gamertag) ); free( mb ); mb = NULL; }
+                            {
+                                lstrcpynA( impl->gamertag, mb,
+                                           sizeof(impl->gamertag) );
+                                /* GDK requires an empty suffix for accounts
+                                 * without modern components.  Modern and
+                                 * unique-modern fall back to the classic tag. */
+                                lstrcpynA( impl->modern_gamertag, mb,
+                                           sizeof(impl->modern_gamertag) );
+                                lstrcpynA( impl->unique_modern_gamertag, mb,
+                                           sizeof(impl->unique_modern_gamertag) );
+                                free( mb ); mb = NULL;
+                            }
+                            if (mgt && SUCCEEDED( HSTRINGToMultiByte( mgt, &mb, &ml ) ) && mb)
+                            { lstrcpynA( impl->modern_gamertag, mb, sizeof(impl->modern_gamertag) ); free( mb ); mb = NULL; }
+                            if (mgs && SUCCEEDED( HSTRINGToMultiByte( mgs, &mb, &ml ) ) && mb)
+                            { lstrcpynA( impl->modern_gamertag_suffix, mb, sizeof(impl->modern_gamertag_suffix) ); free( mb ); mb = NULL; }
+                            if (umg && SUCCEEDED( HSTRINGToMultiByte( umg, &mb, &ml ) ) && mb)
+                            { lstrcpynA( impl->unique_modern_gamertag, mb, sizeof(impl->unique_modern_gamertag) ); free( mb ); mb = NULL; }
                             /* age group: "Adult" → 3, "Teen" → 2, "Child" → 1 */
                             if (agg_s && SUCCEEDED( HSTRINGToMultiByte( agg_s, &mb, &ml ) ) && mb)
                             {
@@ -239,6 +310,15 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                                 else if (!lstrcmpiA( mb, "Teen" )) impl->age_group = XUserAgeGroup_Teen;
                                 else impl->age_group = XUserAgeGroup_Child;
                                 free( mb ); mb = NULL;
+                            }
+                            impl->xbl_privileges_present = privileges_present;
+                            if (SUCCEEDED( privileges_hr ) && privileges_s &&
+                                FAILED( WindowsDuplicateString(
+                                    privileges_s, &impl->xbl_privileges ) ))
+                            {
+                                /* Keep presence true and fail closed if the
+                                 * optional claim cannot be retained. */
+                                WARN( "could not retain the Xbox privilege claim\n" );
                             }
                             /* local_id uses the xboxlive-RP uhs */
                             if (uhs_s && SUCCEEDED( HSTRINGToMultiByte( uhs_s, &mb, &ml ) ) && mb)
@@ -264,6 +344,16 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                                 { lstrcpynA( impl->mp_rp, mb, sizeof(impl->mp_rp) ); free( mb ); mb = NULL; }
                                 impl->mp_expiry = HSTRINGToEpoch( mp_expiry_s );
                             }
+                            /* SISU cache for the Bedrock Realms RP */
+                            if (realmstok && realms_uhs_s && realms_rp_s)
+                            {
+                                WindowsDuplicateString( realmstok, &impl->realms_token );
+                                if (SUCCEEDED( HSTRINGToMultiByte( realms_uhs_s, &mb, &ml ) ) && mb)
+                                { impl->realms_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+                                if (SUCCEEDED( HSTRINGToMultiByte( realms_rp_s, &mb, &ml ) ) && mb)
+                                { lstrcpynA( impl->realms_rp, mb, sizeof(impl->realms_rp) ); free( mb ); mb = NULL; }
+                                impl->realms_expiry = HSTRINGToEpoch( realms_expiry_s );
+                            }
                             /* SISU cache for the marketplace/licensing RP (in-game Store) */
                             if (lictok && lic_uhs_s && lic_rp_s)
                             {
@@ -275,21 +365,27 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                                 impl->lic_expiry = HSTRINGToEpoch( lic_expiry_s );
                             }
                             preauth_done = TRUE;
-                            ERR( "preauth: loaded user/XSTS tokens for xuid=%llu gtg=%s — skipping Wine HTTP\n",
-                                 (unsigned long long)impl->xuid, impl->gamertag );
+                            ERR( "preauth: loaded user/XSTS credentials — skipping Wine HTTP\n" );
                         }
                         if (utok) WindowsDeleteString( utok );
                         if (xtok) WindowsDeleteString( xtok );
                         if (stok) WindowsDeleteString( stok );
                         if (gtg) WindowsDeleteString( gtg );
+                        if (mgt) WindowsDeleteString( mgt );
+                        if (mgs) WindowsDeleteString( mgs );
+                        if (umg) WindowsDeleteString( umg );
                         if (xuid_s) WindowsDeleteString( xuid_s );
                         if (agg_s) WindowsDeleteString( agg_s );
+                        if (privileges_s) WindowsDeleteString( privileges_s );
                         if (uhs_s) WindowsDeleteString( uhs_s );
                         if (sisu_uhs_s) WindowsDeleteString( sisu_uhs_s );
                         if (sisu_rp_s) WindowsDeleteString( sisu_rp_s );
                         if (mptok) WindowsDeleteString( mptok );
                         if (mp_uhs_s) WindowsDeleteString( mp_uhs_s );
                         if (mp_rp_s) WindowsDeleteString( mp_rp_s );
+                        if (realmstok) WindowsDeleteString( realmstok );
+                        if (realms_uhs_s) WindowsDeleteString( realms_uhs_s );
+                        if (realms_rp_s) WindowsDeleteString( realms_rp_s );
                         if (lictok) WindowsDeleteString( lictok );
                         if (lic_uhs_s) WindowsDeleteString( lic_uhs_s );
                         if (lic_rp_s) WindowsDeleteString( lic_rp_s );
@@ -297,6 +393,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         if (xbl_expiry_s) WindowsDeleteString( xbl_expiry_s );
                         if (sisu_expiry_s) WindowsDeleteString( sisu_expiry_s );
                         if (mp_expiry_s) WindowsDeleteString( mp_expiry_s );
+                        if (realms_expiry_s) WindowsDeleteString( realms_expiry_s );
                         if (lic_expiry_s) WindowsDeleteString( lic_expiry_s );
                         IJsonObject_Release( root );
                     }
@@ -392,8 +489,10 @@ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
         WindowsDeleteString( impl->oauth_token );
         WindowsDeleteString( impl->user_token );
         WindowsDeleteString( impl->xsts_token );
+        if (impl->xbl_privileges) WindowsDeleteString( impl->xbl_privileges );
         if (impl->sisu_token) WindowsDeleteString( impl->sisu_token );
         if (impl->mp_token) WindowsDeleteString( impl->mp_token );
+        if (impl->realms_token) WindowsDeleteString( impl->realms_token );
         if (impl->lic_token) WindowsDeleteString( impl->lic_token );
         free( impl );
     }
@@ -438,8 +537,10 @@ static INT32 WINAPI x_user_XUserCompare( IXUserImpl *iface, XUserHandle user1, X
 
 static HRESULT WINAPI x_user_XUserGetMaxUsers( IXUserImpl *iface, UINT32 *maxUsers )
 {
-    FIXME( "iface %p, maxUsers %p stub!\n", iface, maxUsers );
-    return E_NOTIMPL;
+    TRACE( "iface %p, maxUsers %p\n", iface, maxUsers );
+    if (!maxUsers) return E_POINTER;
+    *maxUsers = 1;
+    return S_OK;
 }
 
 struct XUserAddContext
@@ -533,7 +634,6 @@ static HRESULT WINAPI x_user_XUserAddResult( IXUserImpl *iface, XAsyncBlock *asy
     {
         struct x_user *u = (struct x_user *)*user;
 
-        WineGDKApplyOnlinePatches( online_user_ready( u ) );
         IXUserImpl_AddRef( &u->IXUserImpl_iface );
         if (InterlockedCompareExchangePointer(
                 (void *volatile *)&g_signed_in_user, u, NULL ))
@@ -571,7 +671,7 @@ static HRESULT WINAPI x_user_XUserGetId( IXUserImpl *iface, XUserHandle user, UI
     TRACE( "iface %p, user %p, userId %p\n", iface, user, userId );
     if (!user || !userId) return E_POINTER;
     *userId = ((struct x_user*)user)->xuid;
-    TRACE( "returning xuid=%llu, gamertag=%s\n", (unsigned long long)*userId, ((struct x_user*)user)->gamertag );
+    TRACE( "returning the signed-in user id\n" );
     return S_OK;
 }
 
@@ -642,10 +742,22 @@ static HRESULT WINAPI x_user_XUserGetAgeGroup( IXUserImpl *iface, XUserHandle us
 
 static HRESULT WINAPI x_user_XUserCheckPrivilege( IXUserImpl *iface, XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege, BOOLEAN *hasPrivilege, XUserPrivilegeDenyReason *reason )
 {
+    struct x_user *impl = (struct x_user *)user;
+    BOOLEAN allowed;
+
     TRACE( "iface %p, user %p, options %d, privilege %d, hasPrivilege %p, reason %p\n", iface, user, options, privilege, hasPrivilege, reason );
-    if (!user) return E_POINTER;
-    if (hasPrivilege) *hasPrivilege = TRUE;
-    if (reason) *reason = XUserPrivilegeDenyReason_None;
+    if (!user || !hasPrivilege) return E_POINTER;
+    if ((UINT32)options & ~XUserPrivilegeOptions_AllUsers)
+        return E_INVALIDARG;
+
+    /* Caches created before xbl_privileges existed retain the historical
+     * permissive behaviour.  Once a claim is present, including an explicit
+     * empty claim, its contents are authoritative. */
+    allowed = !impl->xbl_privileges_present ||
+              XblPrivilegeClaimContains( impl->xbl_privileges, privilege );
+    *hasPrivilege = allowed;
+    if (reason) *reason = allowed ? XUserPrivilegeDenyReason_None :
+                                    XUserPrivilegeDenyReason_Unknown;
     return S_OK;
 }
 
@@ -673,25 +785,181 @@ static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiResult( IXUserImpl *ifac
  *   - Joining an external Bedrock server -> the multiplayer RP
  * Order matters: the licensing hosts end in xboxlive.com, so they are matched
  * before the generic xboxlive.com fallback. */
+static BOOLEAN ascii_equal_nocase_n( LPCSTR left, SIZE_T left_len, LPCSTR right )
+{
+    SIZE_T right_len = strlen( right );
+
+    if (left_len != right_len) return FALSE;
+    for (SIZE_T i = 0; i < left_len; ++i)
+        if (tolower( (unsigned char)left[i] ) != tolower( (unsigned char)right[i] ))
+            return FALSE;
+    return TRUE;
+}
+
+static BOOLEAN url_host_matches( LPCSTR url, LPCSTR expected, BOOLEAN allow_subdomains )
+{
+    LPCSTR authority, authority_end, host, host_end, at, colon;
+    SIZE_T host_len, expected_len;
+
+    if (!url || !(authority = strstr( url, "://" ))) return FALSE;
+    authority += 3;
+    authority_end = strpbrk( authority, "/?#" );
+    if (!authority_end) authority_end = authority + strlen( authority );
+    host = authority;
+
+    /* Credentials are not valid for the GDK endpoints, but excluding them
+     * keeps host-based RP selection correct for any syntactically valid URL. */
+    at = memchr( authority, '@', authority_end - authority );
+    if (at) host = at + 1;
+
+    host_end = authority_end;
+    if (host < host_end && *host == '[')
+    {
+        LPCSTR close = memchr( host, ']', host_end - host );
+        if (close) host_end = close + 1;
+    }
+    else if ((colon = memchr( host, ':', host_end - host )))
+    {
+        host_end = colon;
+    }
+
+    host_len = host_end - host;
+    if (ascii_equal_nocase_n( host, host_len, expected )) return TRUE;
+    if (!allow_subdomains) return FALSE;
+
+    expected_len = strlen( expected );
+    return host_len > expected_len && host[host_len - expected_len - 1] == '.' &&
+           ascii_equal_nocase_n( host + host_len - expected_len, expected_len, expected );
+}
+
 static LPCSTR resolve_relying_party_for_url( LPCSTR url )
 {
     if (!url) return "http://xboxlive.com";
 
-    if (strstr( url, "collections.mp.microsoft.com" ) ||
-        strstr( url, "purchase.mp.microsoft.com" ) ||
-        strstr( url, "displaycatalog.mp.microsoft.com" ) ||
-        strstr( url, "inventory.xboxlive.com" ) ||
-        strstr( url, "licensing.xboxlive.com" ))
+    if (url_host_matches( url, "collections.mp.microsoft.com", FALSE ) ||
+        url_host_matches( url, "purchase.mp.microsoft.com", FALSE ) ||
+        url_host_matches( url, "displaycatalog.mp.microsoft.com", FALSE ) ||
+        url_host_matches( url, "inventory.xboxlive.com", FALSE ) ||
+        url_host_matches( url, "licensing.xboxlive.com", FALSE ))
         return "http://licensing.xboxlive.com";
 
-    if (strstr( url, "playfab" ))
+    if (url_host_matches( url, "playfabapi.com", TRUE ))
         return "https://b980a380.minecraft.playfabapi.com/";
 
-    if (strstr( url, "multiplayer.minecraft" ))
+    if (url_host_matches( url, "multiplayer.minecraft.net", TRUE ))
         return "https://multiplayer.minecraft.net/";
+
+    if (url_host_matches( url, "pocket.realms.minecraft.net", FALSE ) ||
+        url_host_matches( url, "bedrock.frontend.realms.minecraft-services.net", FALSE ) ||
+        url_host_matches( url, "bedrock.frontendlegacy.realms.minecraft-services.net", FALSE ))
+        return "https://pocket.realms.minecraft.net/";
 
     /* Friends/Social/Profile and any other Xbox Live edge. */
     return "http://xboxlive.com";
+}
+
+#define TOKEN_REQUEST_LOG_LIMIT 64
+
+static LONG token_request_sequence;
+
+static LONG log_token_request( LPCSTR method, LPCSTR url,
+                               XUserGetTokenAndSignatureOptions options )
+{
+    LONG sequence = InterlockedIncrement( &token_request_sequence );
+    LPCSTR method_kind = !lstrcmpiA( method, "GET" ) ? "GET" :
+                          !lstrcmpiA( method, "POST" ) ? "POST" : "OTHER";
+
+    if (sequence <= TOKEN_REQUEST_LOG_LIMIT)
+        TRACE( "native Xbox request auth #%ld queued: method=%s, rp=%s, force_refresh=%u.\n",
+               sequence, method_kind, resolve_relying_party_for_url( url ),
+               !!(options & XUserGetTokenAndSignatureOptions_ForceRefresh) );
+    else if (sequence == TOKEN_REQUEST_LOG_LIMIT + 1)
+        TRACE( "native Xbox request auth log limit reached; suppressing later requests.\n" );
+    return sequence;
+}
+
+static HRESULT duplicate_string( LPCSTR source, LPSTR *destination )
+{
+    SIZE_T length;
+
+    if (!source || !destination) return E_POINTER;
+    *destination = NULL;
+    length = strlen( source );
+    if (!(*destination = malloc( length + 1 ))) return E_OUTOFMEMORY;
+    memcpy( *destination, source, length + 1 );
+    return S_OK;
+}
+
+static HRESULT utf16_to_utf8( LPCWSTR source, LPSTR *destination )
+{
+    int length;
+
+    if (!source || !destination) return E_POINTER;
+    *destination = NULL;
+    if (!(length = WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, source, -1,
+                                        NULL, 0, NULL, NULL )))
+        return HRESULT_FROM_WIN32( GetLastError() );
+    if (!(*destination = malloc( length ))) return E_OUTOFMEMORY;
+    if (!WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, source, -1,
+                              *destination, length, NULL, NULL ))
+    {
+        HRESULT hr = HRESULT_FROM_WIN32( GetLastError() );
+        free( *destination );
+        *destination = NULL;
+        return hr;
+    }
+    return S_OK;
+}
+
+static HRESULT utf8_to_utf16( LPCSTR source, LPWSTR *destination, SIZE_T *count )
+{
+    int length;
+
+    if (!source || !destination || !count) return E_POINTER;
+    *destination = NULL;
+    *count = 0;
+    if (!(length = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, source, -1,
+                                        NULL, 0 )))
+        return HRESULT_FROM_WIN32( GetLastError() );
+    if ((SIZE_T)length > ~(SIZE_T)0 / sizeof(WCHAR))
+        return HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW );
+    if (!(*destination = malloc( (SIZE_T)length * sizeof(WCHAR) )))
+        return E_OUTOFMEMORY;
+    if (!MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, source, -1,
+                              *destination, length ))
+    {
+        HRESULT hr = HRESULT_FROM_WIN32( GetLastError() );
+        free( *destination );
+        *destination = NULL;
+        return hr;
+    }
+    *count = length;
+    return S_OK;
+}
+
+static HRESULT request_target_from_url( LPCSTR url, LPSTR *target )
+{
+    LPCSTR authority, start, end;
+    SIZE_T length, prefix = 0;
+
+    if (!url || !target) return E_POINTER;
+    *target = NULL;
+    if (!(authority = strstr( url, "://" ))) return E_INVALIDARG;
+    authority += 3;
+    if (!*authority) return E_INVALIDARG;
+    start = strpbrk( authority, "/?#" );
+    if (!start || *start == '#') return duplicate_string( "/", target );
+    if (*start == '?') prefix = 1;
+    end = strchr( start, '#' );
+    if (!end) end = start + strlen( start );
+    length = end - start;
+    if (length > ~(SIZE_T)0 - prefix - 1)
+        return HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW );
+    if (!(*target = malloc( prefix + length + 1 ))) return E_OUTOFMEMORY;
+    if (prefix) (*target)[0] = '/';
+    memcpy( *target + prefix, start, length );
+    (*target)[prefix + length] = 0;
+    return S_OK;
 }
 
 struct XUserGetTokenAndSignatureContext
@@ -699,21 +967,46 @@ struct XUserGetTokenAndSignatureContext
     BOOLEAN utf16;
     XUserHandle user;
     XUserGetTokenAndSignatureOptions options;
-    LPCSTR method;
-    LPCWSTR method_utf16;
-    LPCSTR url;
-    LPCWSTR url_utf16;
+    LPSTR method;
+    LPSTR url;
+    LPSTR request_target;
     SIZE_T count;
-    XUserGetTokenAndSignatureHttpHeader *headers;
-    XUserGetTokenAndSignatureUtf16HttpHeader *headers_utf16;
+    struct DeviceAuthRequestHeader *headers;
     SIZE_T size;
-    const void *buffer;
+    BYTE *buffer;
     LPSTR result_token;
     SIZE_T result_token_len;
     LPSTR result_signature;
     SIZE_T result_signature_len;
+    LPWSTR result_token_utf16;
+    SIZE_T result_token_utf16_count;
+    LPWSTR result_signature_utf16;
+    SIZE_T result_signature_utf16_count;
     SIZE_T result_size;
+    LONG diagnostic_sequence;
 };
+
+static void free_token_and_signature_context( struct XUserGetTokenAndSignatureContext *context )
+{
+    if (!context) return;
+    if (context->user)
+        IXUserImpl_Release( &((struct x_user *)context->user)->IXUserImpl_iface );
+    free( context->method );
+    free( context->url );
+    free( context->request_target );
+    for (SIZE_T i = 0; context->headers && i < context->count; ++i)
+    {
+        free( (void *)context->headers[i].name );
+        free( (void *)context->headers[i].value );
+    }
+    free( context->headers );
+    free( context->buffer );
+    free( context->result_token );
+    free( context->result_signature );
+    free( context->result_token_utf16 );
+    free( context->result_signature_utf16 );
+    free( context );
+}
 
 static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, const XAsyncProviderData *providerData )
 {
@@ -735,28 +1028,44 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
 
         case GetResult:
         {
-            XUserGetTokenAndSignatureData *data = (XUserGetTokenAndSignatureData *)providerData->buffer;
-            LPSTR strings = (LPSTR)(data + 1);
-            if (context->result_token && context->result_token_len > 0)
+            if (!context->utf16)
             {
-                memcpy( strings, context->result_token, context->result_token_len );
-                strings[context->result_token_len] = '\0';
-                data->token = strings;
-                data->tokenSize = context->result_token_len;
+                XUserGetTokenAndSignatureData *data = providerData->buffer;
+                LPSTR strings = (LPSTR)(data + 1), signature = NULL;
 
+                memset( data, 0, sizeof(*data) );
+                memcpy( strings, context->result_token, context->result_token_len + 1 );
+                data->token = strings;
+                data->tokenSize = context->result_token_len + 1;
                 if (context->result_signature && context->result_signature_len > 0)
                 {
-                    LPSTR sig_pos = strings + context->result_token_len + 1;
-                    memcpy( sig_pos, context->result_signature, context->result_signature_len );
-                    sig_pos[context->result_signature_len] = '\0';
-                    data->signature = sig_pos;
-                    data->signatureSize = context->result_signature_len;
+                    signature = strings + context->result_token_len + 1;
+                    memcpy( signature, context->result_signature,
+                            context->result_signature_len + 1 );
+                    data->signature = signature;
+                    data->signatureSize = context->result_signature_len + 1;
                 }
-                else
+            }
+            else
+            {
+                XUserGetTokenAndSignatureUtf16Data *data = providerData->buffer;
+                LPWSTR strings = (LPWSTR)(data + 1), signature = NULL;
+
+                memset( data, 0, sizeof(*data) );
+                memcpy( strings, context->result_token_utf16,
+                        context->result_token_utf16_count * sizeof(WCHAR) );
+                data->token = strings;
+                /* The GDK ABI documents these counts as byte sizes, despite
+                 * the Count suffix.  Like the ANSI structure, the reported
+                 * buffer size includes its terminating NUL. */
+                data->tokenCount = context->result_token_utf16_count * sizeof(WCHAR);
+                if (context->result_signature_utf16_count)
                 {
-                    strings[context->result_token_len + 1] = '\0';
-                    data->signature = strings + context->result_token_len + 1;
-                    data->signatureSize = 0;
+                    signature = strings + context->result_token_utf16_count;
+                    memcpy( signature, context->result_signature_utf16,
+                            context->result_signature_utf16_count * sizeof(WCHAR) );
+                    data->signature = signature;
+                    data->signatureCount = context->result_signature_utf16_count * sizeof(WCHAR);
                 }
             }
             break;
@@ -769,10 +1078,12 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
             UINT32 xsts_len;
             LPSTR xsts_str;
             HRESULT dowork_hr;
-            LPCSTR url = context->utf16 ? NULL : context->url;
+            LPCSTR url = context->url;
             LPCSTR rp = "http://xboxlive.com";
             UINT64 token_uhs;
             time_t now;
+            BOOLEAN force_refresh = !!(context->options &
+                                        XUserGetTokenAndSignatureOptions_ForceRefresh);
 
             if (!user_impl || !user_impl->user_token)
             {
@@ -786,7 +1097,9 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
              * different XSTS audience). */
             rp = resolve_relying_party_for_url( url );
 
-            TRACE( "requesting token for url=%s, rp=%s\n", url ? url : "(utf16)", rp );
+            TRACE( "requesting token: method=%s, rp=%s, headers=%llu, body=%llu bytes\n",
+                   context->method, rp, (unsigned long long)context->count,
+                   (unsigned long long)context->size );
 
             /* Try SISU first for PlayFab/multiplayer (title-bound XSTS in a
              * single round-trip with our MSA AppId + device key — the path
@@ -812,7 +1125,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                  * with the matching uhs in impl->local_id.value. Hitting
                  * SISU from Wine would just TCP-RST against GnuTLS. */
                 now = time( NULL );
-                if (user_impl->xsts_token &&
+                if (!force_refresh && user_impl->xsts_token &&
                     user_impl->xsts_token_expiry > now + 30 &&
                     !strcmp( rp, "http://xboxlive.com" ))
                 {
@@ -828,7 +1141,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 /* Reuse the pre-minted multiplayer-RP SISU token for a server
                  * join. Without it the live SISU/XSTS call below RSTs under
                  * Wine and the join token comes back empty. */
-                if (FAILED( dowork_hr ) &&
+                if (!force_refresh && FAILED( dowork_hr ) &&
                     user_impl->mp_token && user_impl->mp_expiry > now + 30 &&
                     strcmp( user_impl->mp_rp, rp ) == 0)
                 {
@@ -841,10 +1154,27 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                         TRACE( "reusing preauth multiplayer SISU token for %s\n", rp );
                     }
                 }
+                /* Realms moved its API traffic to minecraft-services.net,
+                 * but still validates the pocket.realms.minecraft.net XSTS
+                 * audience.  Reuse the host-minted token because a live SISU
+                 * request from Wine is not reliable. */
+                if (!force_refresh && FAILED( dowork_hr ) &&
+                    user_impl->realms_token && user_impl->realms_expiry > now + 30 &&
+                    strcmp( user_impl->realms_rp, rp ) == 0)
+                {
+                    HSTRING dup = NULL;
+                    if (SUCCEEDED( WindowsDuplicateString( user_impl->realms_token, &dup ) ))
+                    {
+                        xsts_token = dup;
+                        token_uhs = user_impl->realms_uhs;
+                        dowork_hr = S_OK;
+                        TRACE( "reusing preauth Realms SISU token for %s\n", rp );
+                    }
+                }
                 /* Reuse the pre-minted licensing-RP SISU token for the in-game
                  * Marketplace (catalog + entitlement calls). Same rationale as
                  * mp_token: a live SISU call for this RP RSTs under Wine. */
-                if (FAILED( dowork_hr ) &&
+                if (!force_refresh && FAILED( dowork_hr ) &&
                     user_impl->lic_token && user_impl->lic_expiry > now + 30 &&
                     strcmp( user_impl->lic_rp, rp ) == 0)
                 {
@@ -861,7 +1191,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                  * the requested RP — SISU is rate-limited per AppId
                  * (HTTP 4xx after the first call) and the AuthorizationToken
                  * is valid for ~4 h. */
-                if (FAILED( dowork_hr ) &&
+                if (!force_refresh && FAILED( dowork_hr ) &&
                     user_impl->sisu_token && user_impl->sisu_expiry > now + 30 &&
                     strcmp( user_impl->sisu_rp, rp ) == 0)
                 {
@@ -975,41 +1305,89 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 (unsigned long long)token_uhs, (int)xsts_len, xsts_str );
             free( xsts_str );
 
-            TRACE( "token for %s: %.40s...\n", rp, context->result_token );
-
             /* Compute request signature if device auth is available */
             if (DeviceAuth_IsInitialized())
             {
-                LPCSTR method_str = context->utf16 ? "GET" : context->method;
-                /* Extract path from URL */
-                LPCSTR path = url ? strstr( url, "://" ) : NULL;
-                if (path) path = strchr( path + 3, '/' );
-                if (!path) path = "/";
-
-                if (SUCCEEDED( DeviceAuth_SignRequest( method_str, path,
-                    context->result_token, NULL, 0, &context->result_signature ) ))
+                dowork_hr = DeviceAuth_SignRequest(
+                    context->method, context->request_target, context->result_token,
+                    /* ExtraHeaders is endpoint-policy data, not the complete
+                     * caller header list.  The default Xbox Live policy is
+                     * empty; keep the normalized headers in the async context
+                     * until endpoint-policy discovery is implemented. */
+                    0, NULL, context->buffer, context->size,
+                    &context->result_signature );
+                if (FAILED( dowork_hr ))
                 {
-                    context->result_signature_len = strlen( context->result_signature );
-                    TRACE( "signature: %.20s...\n", context->result_signature );
+                    WARN( "request signing failed: 0x%08lx\n", dowork_hr );
+                    impl->lpVtbl->XAsyncComplete( impl, providerData->async,
+                                                  dowork_hr, 0 );
+                    break;
                 }
+                context->result_signature_len = strlen( context->result_signature );
             }
 
-            context->result_size = sizeof(XUserGetTokenAndSignatureData)
-                + context->result_token_len + 1
-                + (context->result_signature_len ? context->result_signature_len + 1 : 1);
+            if (!context->utf16)
+            {
+                SIZE_T strings_size = context->result_token_len + 1;
+                if (context->result_signature_len > ~(SIZE_T)0 - strings_size - 1 ||
+                    strings_size + context->result_signature_len + 1 >
+                        ~(SIZE_T)0 - sizeof(XUserGetTokenAndSignatureData))
+                {
+                    impl->lpVtbl->XAsyncComplete( impl, providerData->async,
+                        HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW ), 0 );
+                    break;
+                }
+                if (context->result_signature_len)
+                    strings_size += context->result_signature_len + 1;
+                context->result_size = sizeof(XUserGetTokenAndSignatureData) + strings_size;
+            }
+            else
+            {
+                SIZE_T char_count, strings_size;
+
+                dowork_hr = utf8_to_utf16( context->result_token,
+                    &context->result_token_utf16,
+                    &context->result_token_utf16_count );
+                if (SUCCEEDED( dowork_hr ) && context->result_signature_len)
+                    dowork_hr = utf8_to_utf16( context->result_signature,
+                        &context->result_signature_utf16,
+                        &context->result_signature_utf16_count );
+                if (FAILED( dowork_hr ))
+                {
+                    impl->lpVtbl->XAsyncComplete( impl, providerData->async,
+                                                  dowork_hr, 0 );
+                    break;
+                }
+                if (context->result_signature_utf16_count >
+                    ~(SIZE_T)0 - context->result_token_utf16_count)
+                {
+                    impl->lpVtbl->XAsyncComplete( impl, providerData->async,
+                        HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW ), 0 );
+                    break;
+                }
+                char_count = context->result_token_utf16_count +
+                             context->result_signature_utf16_count;
+                if (char_count > (~(SIZE_T)0 -
+                    sizeof(XUserGetTokenAndSignatureUtf16Data)) / sizeof(WCHAR))
+                {
+                    impl->lpVtbl->XAsyncComplete( impl, providerData->async,
+                        HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW ), 0 );
+                    break;
+                }
+                strings_size = char_count * sizeof(WCHAR);
+                context->result_size = sizeof(XUserGetTokenAndSignatureUtf16Data) +
+                                       strings_size;
+            }
+            if (context->diagnostic_sequence <= TOKEN_REQUEST_LOG_LIMIT)
+                TRACE( "native Xbox request auth #%ld ready: rp=%s, signed=%u.\n",
+                       context->diagnostic_sequence, rp,
+                       context->result_signature_len != 0 );
             impl->lpVtbl->XAsyncComplete( impl, providerData->async, S_OK, context->result_size );
             break;
         }
 
         case Cleanup:
-            if (context->result_token) free( context->result_token );
-            if (context->result_signature) free( context->result_signature );
-            if (context->count)
-            {
-                if (context->utf16) free( context->headers_utf16 );
-                else free( context->headers );
-            }
-            free( context );
+            free_token_and_signature_context( context );
             break;
 
         case Cancel:
@@ -1026,38 +1404,77 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, 
     IXThreadingImpl *impl;
     HRESULT hr;
 
-    TRACE( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
-           iface, user, options, method, url, (unsigned long long)count,
+    TRACE( "iface %p, user %p, options %d, method %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
+           iface, user, options, method, (unsigned long long)count,
            headers, (unsigned long long)size, buffer, asyncBlock );
 
     if (!user || !method || !url || !asyncBlock) return E_POINTER;
-    if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
+    if ((count && !headers) || (size && !buffer)) return E_POINTER;
+    if (!*method || !*url) return E_INVALIDARG;
+    if ((UINT32)options & ~(XUserGetTokenAndSignatureOptions_ForceRefresh |
+                            XUserGetTokenAndSignatureOptions_AllUsers))
+        return E_INVALIDARG;
     if (!(context = calloc( 1, sizeof( *context ) )))
-    {
-        impl->lpVtbl->Release( impl );
         return E_OUTOFMEMORY;
-    }
 
     context->options = options;
-    context->buffer = buffer;
-    context->method = method;
     context->count = count;
     context->utf16 = FALSE;
     context->size = size;
-    context->user = user;
-    context->url = url;
-    if (count && headers && !(context->headers = calloc( count, sizeof( *headers ) )))
+    if (FAILED( hr = duplicate_string( method, &context->method ) ) ||
+        FAILED( hr = duplicate_string( url, &context->url ) ) ||
+        FAILED( hr = request_target_from_url( context->url,
+                                               &context->request_target ) ))
+        goto failed;
+    for (LPSTR ptr = context->method; *ptr; ++ptr)
+        *ptr = toupper( (unsigned char)*ptr );
+    context->diagnostic_sequence = log_token_request(
+        context->method, context->url, context->options );
+
+    if (count && !(context->headers = calloc( count, sizeof(*context->headers) )))
     {
-        free( context );
-        impl->lpVtbl->Release( impl );
-        return E_OUTOFMEMORY;
+        hr = E_OUTOFMEMORY;
+        goto failed;
+    }
+    for (SIZE_T i = 0; i < count; i++)
+    {
+        LPSTR name, value;
+
+        if (!headers[i].name || !headers[i].value)
+        {
+            hr = E_POINTER;
+            goto failed;
+        }
+        if (FAILED( hr = duplicate_string( headers[i].name, &name ) ))
+            goto failed;
+        context->headers[i].name = name;
+        if (FAILED( hr = duplicate_string( headers[i].value, &value ) ))
+            goto failed;
+        context->headers[i].value = value;
+    }
+    if (size)
+    {
+        if (!(context->buffer = malloc( size )))
+        {
+            hr = E_OUTOFMEMORY;
+            goto failed;
+        }
+        memcpy( context->buffer, buffer, size );
     }
 
-    for (SIZE_T i = 0; i < count; i++)
-        context->headers[i] = headers[i];
+    context->user = user;
+    IXUserImpl_AddRef( &((struct x_user *)user)->IXUserImpl_iface );
+    if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
+                                   (void **)&impl ) ))
+        goto failed;
 
     hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureAsync, "XUserGetTokenAndSignatureAsync", XUserGetTokenAndSignatureProvider );
     impl->lpVtbl->Release( impl );
+    if (FAILED( hr )) goto failed;
+    return hr;
+
+failed:
+    free_token_and_signature_context( context );
     return hr;
 }
 
@@ -1093,38 +1510,77 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
     IXThreadingImpl *impl;
     HRESULT hr;
 
-    TRACE( "iface %p, user %p, options %d, method %hs, url %hs, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
-           iface, user, options, method, url, (unsigned long long)count,
+    TRACE( "iface %p, user %p, options %d, method %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
+           iface, user, options, debugstr_w( method ), (unsigned long long)count,
            headers, (unsigned long long)size, buffer, asyncBlock );
 
     if (!user || !method || !url || !asyncBlock) return E_POINTER;
-    if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
+    if ((count && !headers) || (size && !buffer)) return E_POINTER;
+    if (!*method || !*url) return E_INVALIDARG;
+    if ((UINT32)options & ~(XUserGetTokenAndSignatureOptions_ForceRefresh |
+                            XUserGetTokenAndSignatureOptions_AllUsers))
+        return E_INVALIDARG;
     if (!(context = calloc( 1, sizeof( *context ) )))
-    {
-        impl->lpVtbl->Release( impl );
         return E_OUTOFMEMORY;
-    }
 
-    context->method_utf16 = method;
     context->options = options;
-    context->buffer = buffer;
-    context->url_utf16 = url;
     context->count = count;
     context->utf16 = TRUE;
     context->size = size;
-    context->user = user;
-    if (count && headers && !(context->headers_utf16 = calloc( count, sizeof( *headers ) )))
+    if (FAILED( hr = utf16_to_utf8( method, &context->method ) ) ||
+        FAILED( hr = utf16_to_utf8( url, &context->url ) ) ||
+        FAILED( hr = request_target_from_url( context->url,
+                                               &context->request_target ) ))
+        goto failed;
+    for (LPSTR ptr = context->method; *ptr; ++ptr)
+        *ptr = toupper( (unsigned char)*ptr );
+    context->diagnostic_sequence = log_token_request(
+        context->method, context->url, context->options );
+
+    if (count && !(context->headers = calloc( count, sizeof(*context->headers) )))
     {
-        free( context );
-        impl->lpVtbl->Release( impl );
-        return E_OUTOFMEMORY;
+        hr = E_OUTOFMEMORY;
+        goto failed;
+    }
+    for (SIZE_T i = 0; i < count; i++)
+    {
+        LPSTR name, value;
+
+        if (!headers[i].name || !headers[i].value)
+        {
+            hr = E_POINTER;
+            goto failed;
+        }
+        if (FAILED( hr = utf16_to_utf8( headers[i].name, &name ) ))
+            goto failed;
+        context->headers[i].name = name;
+        if (FAILED( hr = utf16_to_utf8( headers[i].value, &value ) ))
+            goto failed;
+        context->headers[i].value = value;
+    }
+    if (size)
+    {
+        if (!(context->buffer = malloc( size )))
+        {
+            hr = E_OUTOFMEMORY;
+            goto failed;
+        }
+        memcpy( context->buffer, buffer, size );
     }
 
-    for (SIZE_T i = 0; i < count; i++)
-        context->headers_utf16[i] = headers[i];
+    context->user = user;
+    IXUserImpl_AddRef( &((struct x_user *)user)->IXUserImpl_iface );
+    if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
+                                   (void **)&impl ) ))
+        goto failed;
 
     hr = impl->lpVtbl->XAsyncBegin( impl, asyncBlock, context, x_user_XUserGetTokenAndSignatureUtf16Async, "XUserGetTokenAndSignatureUtf16Async", XUserGetTokenAndSignatureProvider );
     impl->lpVtbl->Release( impl );
+    if (FAILED( hr )) goto failed;
+    return hr;
+
+failed:
+    free_token_and_signature_context( context );
     return hr;
 }
 
@@ -1156,7 +1612,7 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl *i
 
 static HRESULT WINAPI x_user_XUserResolveIssueWithUiAsync( IXUserImpl *iface, XUserHandle user, LPCSTR url, XAsyncBlock *asyncBlock )
 {
-    FIXME( "iface %p, user %p, url %s, asyncBlock %p stub!\n", iface, user, url, asyncBlock );
+    FIXME( "iface %p, user %p, url %p, asyncBlock %p stub!\n", iface, user, url, asyncBlock );
     return E_NOTIMPL;
 }
 
@@ -1168,7 +1624,7 @@ static HRESULT WINAPI x_user_XUserResolveIssueWithUiResult( IXUserImpl *iface, X
 
 static HRESULT WINAPI x_user_XUserResolveIssueWithUiUtf16Async( IXUserImpl *iface, XUserHandle user, LPCWSTR url, XAsyncBlock *asyncBlock )
 {
-    FIXME( "iface %p, user %p, url %hs, asyncBlock %p stub!\n", iface, user, url, asyncBlock );
+    FIXME( "iface %p, user %p, url %p, asyncBlock %p stub!\n", iface, user, url, asyncBlock );
     return E_NOTIMPL;
 }
 
@@ -1439,8 +1895,10 @@ static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
         WindowsDeleteString( impl->oauth_token );
         WindowsDeleteString( impl->user_token );
         WindowsDeleteString( impl->xsts_token );
+        if (impl->xbl_privileges) WindowsDeleteString( impl->xbl_privileges );
         if (impl->sisu_token) WindowsDeleteString( impl->sisu_token );
         if (impl->mp_token) WindowsDeleteString( impl->mp_token );
+        if (impl->realms_token) WindowsDeleteString( impl->realms_token );
         if (impl->lic_token) WindowsDeleteString( impl->lic_token );
         free( impl );
     }
@@ -1450,19 +1908,38 @@ static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
 static HRESULT WINAPI x_user_gt_XUserGetGamertag( IXUserGamertag *iface, XUserHandle user, XUserGamertagComponent component, SIZE_T size, LPSTR gamertag, SIZE_T *used )
 {
     struct x_user *impl;
+    LPCSTR value;
     SIZE_T len;
 
     TRACE( "iface %p, user %p, component %d, size %llu, gamertag %p, used %p\n", iface, user, component, (unsigned long long)size, gamertag, used );
 
-    if (!user) return E_POINTER;
+    if (!user || !gamertag) return E_POINTER;
     impl = (struct x_user *)user;
-    len = strlen( impl->gamertag );
+    switch (component)
+    {
+        case XUserGamertagComponent_Classic:
+            value = impl->gamertag;
+            break;
+        case XUserGamertagComponent_Modern:
+            value = impl->modern_gamertag[0] ? impl->modern_gamertag :
+                                               impl->gamertag;
+            break;
+        case XUserGamertagComponent_ModerSuffix:
+            value = impl->modern_gamertag_suffix;
+            break;
+        case XUserGamertagComponent_UniqueModern:
+            value = impl->unique_modern_gamertag[0] ?
+                    impl->unique_modern_gamertag : impl->gamertag;
+            break;
+        default:
+            return E_INVALIDARG;
+    }
+    len = strlen( value );
 
     if (used) *used = len + 1;
-    if (!gamertag || size == 0) return S_OK;
     if (size < len + 1) return E_NOT_SUFFICIENT_BUFFER;
 
-    memcpy( gamertag, impl->gamertag, len + 1 );
+    memcpy( gamertag, value, len + 1 );
     return S_OK;
 }
 

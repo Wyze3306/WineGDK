@@ -46,6 +46,16 @@ struct x_user
     HSTRING user_token;
     HSTRING xsts_token;
     CHAR gamertag[128];
+    CHAR modern_gamertag[128];
+    CHAR modern_gamertag_suffix[32];
+    CHAR unique_modern_gamertag[160];
+
+    /* Canonical, space-separated privilege IDs from the XSTS ``prv`` claim.
+     * Presence is tracked independently because old launcher caches carry no
+     * claim and retain the permissive compatibility fallback, while an
+     * explicit empty claim grants no privileges. */
+    HSTRING xbl_privileges;
+    BOOLEAN xbl_privileges_present;
 
     /* Cached SISU AuthorizationToken (PlayFab/multiplayer audience).
      * SISU's /authorize is rate-limited per AppId — calling it per
@@ -64,6 +74,14 @@ struct x_user
     UINT64 mp_uhs;
     time_t mp_expiry;
     CHAR mp_rp[256];
+
+    /* Cached SISU token for Bedrock Realms.  Requests now use
+     * *.realms.minecraft-services.net, while the accepted XSTS audience
+     * remains https://pocket.realms.minecraft.net/. */
+    HSTRING realms_token;
+    UINT64 realms_uhs;
+    time_t realms_expiry;
+    CHAR realms_rp[256];
 
     /* Cached SISU token for the marketplace/licensing RP
      * (http://licensing.xboxlive.com), pre-minted by the launcher so the

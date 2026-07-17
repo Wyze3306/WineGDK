@@ -20,6 +20,7 @@
 
 #include <stdlib.h>
 #include <stdarg.h>
+#include <wchar.h>
 #define COBJMACROS
 #include <windef.h>
 #include <winbase.h>
@@ -27,6 +28,7 @@
 #include <roapi.h>
 #include <activation.h>
 #include <unknwn.h>
+#include <xgame.h>
 #include <xgameerr.h>
 
 #include "../provider.h"
@@ -40,18 +42,20 @@
 #include "windows.globalization.h"
 #define WIDL_using_Windows_System_Profile
 #include "windows.system.profile.h"
+#include "../GDKComponent/System/User/XUser.h"
 
 // April 2025 Release of GDK
-#define GDKC_VERSION 10001L
-#define GAMING_SERVICES_VERSION 3181L
+#define TEST_GDKC_VERSION 10001L
+#define TEST_GAMING_SERVICES_VERSION 3181L
 
 static HMODULE xgameruntime = NULL;
 
 typedef HRESULT (*InitializeApiImpl)( ULONG gdkVer, ULONG gsVer );
-typedef HRESULT (*QueryApiImpl)( const GUID *runtimeClassId, REFIID interfaceId, void **out );
+typedef HRESULT (*QueryApiImplProc)( const GUID *runtimeClassId,
+                                    REFIID interfaceId, void **out );
 
 static InitializeApiImpl InitializeApiImpl_fun = NULL;
-static QueryApiImpl QueryApiImpl_fun = NULL;
+static QueryApiImplProc QueryApiImpl_fun = NULL;
 
 static const SIZE_T XSystemConsoleIdBytes = 39;
 static const SIZE_T XSystemXboxLiveSandboxIdMaxBytes = 16;
@@ -65,6 +69,8 @@ static LONG async_cleanup_count;
 static LONG async_cleanup_before_result;
 static LONG async_completion_count;
 static LONG user_change_count;
+static BOOL test_game_config_created;
+static WCHAR test_game_config_path[MAX_PATH];
 
 static const GUID test_clsid_xuser_impl =
     {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
@@ -72,6 +78,71 @@ static const GUID test_iid_xuser_base =
     {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
 static const GUID test_iid_xuser_gamertag =
     {0xcef4fac0, 0x7676, 0x4a94, {0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74}};
+static const GUID test_clsid_xgame_impl =
+    {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+static const GUID test_iid_xgame_impl =
+    {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+static const GUID test_iid_xgame_impl2 =
+    {0x50849859, 0x0ad8, 0x4f81, {0x80, 0xe4, 0x5b, 0xc7, 0x86, 0x26, 0xf8, 0x52}};
+static const GUID test_iid_xgame_impl3 =
+    {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
+
+static void setup_test_game_config(void)
+{
+    static const char contents[] =
+        "<Game configVersion=\"1\">"
+        "<TitleId>35760C07</TitleId>"
+        "<MSAAppId>0000000040159362</MSAAppId>"
+        "<MSAFullTrust>true</MSAFullTrust>"
+        "</Game>";
+    WCHAR *backslash, *slash, *separator;
+    DWORD length, written;
+    HANDLE file;
+
+    length = GetModuleFileNameW( NULL, test_game_config_path,
+                                 ARRAY_SIZE(test_game_config_path) );
+    if (!length || length >= ARRAY_SIZE(test_game_config_path))
+    {
+        trace( "could not determine the test executable path.\n" );
+        return;
+    }
+
+    backslash = wcsrchr( test_game_config_path, '\\' );
+    slash = wcsrchr( test_game_config_path, '/' );
+    if (!backslash)
+        separator = slash;
+    else if (!slash)
+        separator = backslash;
+    else
+        separator = slash > backslash ? slash : backslash;
+    if (!separator || (SIZE_T)(separator - test_game_config_path) +
+        ARRAY_SIZE(L"MicrosoftGame.Config") > ARRAY_SIZE(test_game_config_path))
+    {
+        trace( "test executable path is too long for MicrosoftGame.Config.\n" );
+        return;
+    }
+    lstrcpyW( separator + 1, L"MicrosoftGame.Config" );
+
+    file = CreateFileW( test_game_config_path, GENERIC_WRITE, 0, NULL,
+                        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL );
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        trace( "leaving the existing MicrosoftGame.Config untouched, error %lu.\n",
+               GetLastError() );
+        return;
+    }
+    if (!WriteFile( file, contents, sizeof(contents) - 1, &written, NULL ) ||
+        written != (DWORD)sizeof(contents) - 1)
+    {
+        trace( "could not write the test MicrosoftGame.Config, error %lu.\n",
+               GetLastError() );
+        CloseHandle( file );
+        DeleteFileW( test_game_config_path );
+        return;
+    }
+    CloseHandle( file );
+    test_game_config_created = TRUE;
+}
 
 static void CALLBACK XAsyncCompletion_testCallback( XAsyncBlock *asyncBlock )
 {
@@ -175,10 +246,12 @@ static void test_GDKComponentInit(void)
     InitializeApiImpl_fun = (InitializeApiImpl)GetProcAddress( xgameruntime, "InitializeApiImpl" );
     ok( InitializeApiImpl_fun != NULL, "couldn't locate function InitializeApiImpl within %p! error code: %lu\n", xgameruntime, GetLastError() );
 
-    hr = InitializeApiImpl_fun( GDKC_VERSION, GAMING_SERVICES_VERSION );
+    hr = InitializeApiImpl_fun( TEST_GDKC_VERSION,
+                                TEST_GAMING_SERVICES_VERSION );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
 
-    QueryApiImpl_fun = (QueryApiImpl)GetProcAddress( xgameruntime, "QueryApiImpl" );
+    QueryApiImpl_fun = (QueryApiImplProc)GetProcAddress( xgameruntime,
+                                                        "QueryApiImpl" );
     ok( QueryApiImpl_fun != NULL, "couldn't locate function QueryApiImpl within %p! error code: %lu\n", xgameruntime, GetLastError() );
 }
 
@@ -218,11 +291,20 @@ static void test_XSystem(void)
     ok( strcmp( sandboxId, "RETAIL" ) == 0, "unexpected sandboxId. got %s.\n", debugstr_a( sandboxId ) );
     ok( sandboxIdUsed == XSystemXboxLiveSandboxIdBytes, "unexpected sandboxIdUsed. got %lld.\n", sandboxIdUsed );
 
+    /* XSAPI's AppConfig::Initialize intentionally omits this optional output. */
+    memset( sandboxId, 0, XSystemXboxLiveSandboxIdMaxBytes );
+    hr = IXSystemImpl_XSystemGetXboxLiveSandboxId( xsystem,
+            XSystemXboxLiveSandboxIdMaxBytes, sandboxId, NULL );
+    ok( hr == S_OK, "optional sandboxIdUsed returned %#lx.\n", hr );
+    ok( strcmp( sandboxId, "RETAIL" ) == 0,
+            "unexpected sandboxId without size output, got %s.\n",
+            debugstr_a( sandboxId ) );
+
     /**
      * xgameruntime.lib::XSystemGetAppSpecificDeviceId
      */
     hr = IXSystemImpl_XSystemGetAppSpecificDeviceId( xsystem, XSystemAppSpecificDeviceIdBytes, NULL, NULL );
-    todo_wine ok( hr == S_OK, "got error %#lx.\n", hr );
+    ok( hr == S_OK, "got error %#lx.\n", hr );
 
     /**
      * xgameruntime.lib::XSystemHandleTrack
@@ -254,10 +336,17 @@ static void test_XUserChangeRegistration(void)
     IXUserBase *user, *again;
     IXUserGamertag *gamertag;
     HRESULT hr;
+    UINT32 max_users = 0;
 
     hr = QueryApiImpl_fun( &test_clsid_xuser_impl, &test_iid_xuser_base, (void **)&user );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
     if (FAILED( hr )) return;
+
+    hr = IXUserBase_XUserGetMaxUsers( user, &max_users );
+    ok( hr == S_OK && max_users == 1,
+            "XUserGetMaxUsers returned %#lx, %u.\n", hr, max_users );
+    hr = IXUserBase_XUserGetMaxUsers( user, NULL );
+    ok( hr == E_POINTER, "NULL maxUsers returned %#lx.\n", hr );
 
     hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, NULL, &first );
     ok( hr == E_POINTER, "NULL callback returned %#lx.\n", hr );
@@ -304,6 +393,177 @@ static void test_XUserChangeRegistration(void)
     hr = QueryApiImpl_fun( &test_clsid_xuser_impl, &test_iid_xuser_base, (void **)&again );
     ok( hr == S_OK, "provider was not reusable after Release, hr %#lx.\n", hr );
     if (SUCCEEDED( hr )) IXUserBase_Release( again );
+}
+
+static void test_XUserGamertagComponents(void)
+{
+    struct x_user handle = {0};
+    IXUserGamertag *gamertag;
+    IXUserBase *user;
+    SIZE_T used;
+    CHAR value[160];
+    HRESULT hr;
+
+    lstrcpyA( handle.gamertag, "ClassicPlayer" );
+    lstrcpyA( handle.modern_gamertag, "ModernPlay" );
+    lstrcpyA( handle.modern_gamertag_suffix, "1234" );
+    lstrcpyA( handle.unique_modern_gamertag, "ModernPlay#1234" );
+
+    hr = QueryApiImpl_fun( &test_clsid_xuser_impl, &test_iid_xuser_base,
+                           (void **)&user );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    if (FAILED( hr )) return;
+    hr = IXUserBase_QueryInterface( user, &test_iid_xuser_gamertag,
+                                    (void **)&gamertag );
+    ok( hr == S_OK, "gamertag QueryInterface returned %#lx.\n", hr );
+    if (FAILED( hr ))
+    {
+        IXUserBase_Release( user );
+        return;
+    }
+
+    used = 0;
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            XUserGamertagComponent_Classic, sizeof(value), value, &used );
+    ok( hr == S_OK && !strcmp( value, "ClassicPlayer" ) && used == 14,
+            "classic returned %#lx, %s, used %llu.\n", hr,
+            debugstr_a( value ), (unsigned long long)used );
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            XUserGamertagComponent_Modern, sizeof(value), value, &used );
+    ok( hr == S_OK && !strcmp( value, "ModernPlay" ) && used == 11,
+            "modern returned %#lx, %s, used %llu.\n", hr,
+            debugstr_a( value ), (unsigned long long)used );
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            XUserGamertagComponent_UniqueModern, sizeof(value), value, &used );
+    ok( hr == S_OK && !strcmp( value, "ModernPlay#1234" ) && used == 16,
+            "unique modern returned %#lx, %s, used %llu.\n", hr,
+            debugstr_a( value ), (unsigned long long)used );
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            XUserGamertagComponent_Classic, 4, value, &used );
+    ok( hr == E_NOT_SUFFICIENT_BUFFER && used == 14,
+            "short classic buffer returned %#lx, used %llu.\n", hr,
+            (unsigned long long)used );
+
+    memset( value, 0xcc, sizeof(value) );
+    used = 0;
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            XUserGamertagComponent_ModerSuffix, 15, value, &used );
+    ok( hr == S_OK && !strcmp( value, "1234" ) && used == 5,
+            "modern suffix returned %#lx, %s, used %llu.\n", hr,
+            debugstr_a( value ), (unsigned long long)used );
+
+    memset( handle.modern_gamertag, 0, sizeof(handle.modern_gamertag) );
+    memset( handle.modern_gamertag_suffix, 0,
+            sizeof(handle.modern_gamertag_suffix) );
+    memset( handle.unique_modern_gamertag, 0,
+            sizeof(handle.unique_modern_gamertag) );
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            XUserGamertagComponent_ModerSuffix, 15, value, &used );
+    ok( hr == S_OK && !value[0] && used == 1,
+            "classic fallback suffix returned %#lx, %s, used %llu.\n", hr,
+            debugstr_a( value ), (unsigned long long)used );
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            XUserGamertagComponent_UniqueModern, sizeof(value), value, &used );
+    ok( hr == S_OK && !strcmp( value, "ClassicPlayer" ),
+            "unique fallback returned %#lx, %s.\n", hr, debugstr_a( value ) );
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            (XUserGamertagComponent)99, sizeof(value), value, &used );
+    ok( hr == E_INVALIDARG, "unknown component returned %#lx.\n", hr );
+    hr = IXUserGamertag_XUserGetGamertag( gamertag, (XUserHandle)&handle,
+            XUserGamertagComponent_Classic, sizeof(value), NULL, &used );
+    ok( hr == E_POINTER, "NULL gamertag returned %#lx.\n", hr );
+
+    IXUserGamertag_Release( gamertag );
+    IXUserBase_Release( user );
+}
+
+static void test_XUserPrivileges(void)
+{
+    struct x_user handle = {0};
+    XUserPrivilegeDenyReason reason;
+    IXUserBase *user;
+    BOOLEAN allowed;
+    HRESULT hr;
+
+    hr = QueryApiImpl_fun( &test_clsid_xuser_impl, &test_iid_xuser_base,
+                           (void **)&user );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    if (FAILED( hr )) return;
+
+    /* A user loaded from a legacy cache has no claim-presence marker and
+     * retains the old compatibility behaviour. */
+    allowed = FALSE;
+    reason = XUserPrivilegeDenyReason_Unknown;
+    hr = IXUserBase_XUserCheckPrivilege( user, (XUserHandle)&handle,
+        XUserPrivilegeOptions_None, XUserPrivilege_Multiplayer,
+        &allowed, &reason );
+    ok( hr == S_OK && allowed && reason == XUserPrivilegeDenyReason_None,
+        "legacy claim returned %#lx, allowed %u, reason %d.\n",
+        hr, allowed, reason );
+
+    /* Presence is authoritative even when the canonical string is empty. */
+    handle.xbl_privileges_present = TRUE;
+    allowed = TRUE;
+    reason = XUserPrivilegeDenyReason_None;
+    hr = IXUserBase_XUserCheckPrivilege( user, (XUserHandle)&handle,
+        XUserPrivilegeOptions_None, XUserPrivilege_Multiplayer,
+        &allowed, &reason );
+    ok( hr == S_OK && !allowed &&
+        reason == XUserPrivilegeDenyReason_Unknown,
+        "empty claim returned %#lx, allowed %u, reason %d.\n",
+        hr, allowed, reason );
+
+    hr = IXUserBase_XUserCheckPrivilege( user, (XUserHandle)&handle,
+        XUserPrivilegeOptions_None, XUserPrivilege_Multiplayer,
+        NULL, &reason );
+    ok( hr == E_POINTER, "NULL hasPrivilege returned %#lx.\n", hr );
+    hr = IXUserBase_XUserCheckPrivilege( user, (XUserHandle)&handle,
+        (XUserPrivilegeOptions)2, XUserPrivilege_Multiplayer,
+        &allowed, &reason );
+    ok( hr == E_INVALIDARG, "unknown options returned %#lx.\n", hr );
+
+    hr = WindowsCreateString( L"185 254", 7, &handle.xbl_privileges );
+    ok( hr == S_OK, "WindowsCreateString returned %#lx.\n", hr );
+    if (SUCCEEDED( hr ))
+    {
+        allowed = FALSE;
+        reason = XUserPrivilegeDenyReason_Unknown;
+        hr = IXUserBase_XUserCheckPrivilege( user, (XUserHandle)&handle,
+            XUserPrivilegeOptions_None, XUserPrivilege_Multiplayer,
+            &allowed, &reason );
+        ok( hr == S_OK && allowed &&
+            reason == XUserPrivilegeDenyReason_None,
+            "granted privilege returned %#lx, allowed %u, reason %d.\n",
+            hr, allowed, reason );
+
+        allowed = TRUE;
+        reason = XUserPrivilegeDenyReason_None;
+        hr = IXUserBase_XUserCheckPrivilege( user, (XUserHandle)&handle,
+            XUserPrivilegeOptions_None, XUserPrivilege_AddFriends,
+            &allowed, &reason );
+        ok( hr == S_OK && !allowed &&
+            reason == XUserPrivilegeDenyReason_Unknown,
+            "missing privilege returned %#lx, allowed %u, reason %d.\n",
+            hr, allowed, reason );
+        WindowsDeleteString( handle.xbl_privileges );
+        handle.xbl_privileges = NULL;
+    }
+
+    hr = WindowsCreateString( L"254 malformed", 13,
+                              &handle.xbl_privileges );
+    ok( hr == S_OK, "WindowsCreateString returned %#lx.\n", hr );
+    if (SUCCEEDED( hr ))
+    {
+        allowed = TRUE;
+        hr = IXUserBase_XUserCheckPrivilege( user, (XUserHandle)&handle,
+            XUserPrivilegeOptions_None, XUserPrivilege_Multiplayer,
+            &allowed, NULL );
+        ok( hr == S_OK && !allowed,
+            "partially malformed claim returned %#lx, allowed %u.\n",
+            hr, allowed );
+        WindowsDeleteString( handle.xbl_privileges );
+    }
+    IXUserBase_Release( user );
 }
 
 static void test_XSystemAnalytics(void)
@@ -377,6 +637,40 @@ static void test_XGameRuntimeFeature(void)
     ok( isAvailable, "got unexpected isAvailable %d.\n", isAvailable );
 
     IXGameRuntimeFeatureImpl_Release( xgame_runtime_feature );
+}
+
+static void test_XGame(void)
+{
+    IXGameImpl *xgame;
+    UINT32 title_id = 0;
+    HRESULT hr;
+
+    hr = QueryApiImpl_fun( &test_clsid_xgame_impl, &test_iid_xgame_impl,
+                           (void **)&xgame );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    if (FAILED( hr )) return;
+
+    check_interface( xgame, &IID_IUnknown, TRUE );
+    check_interface( xgame, &test_iid_xgame_impl, TRUE );
+    check_interface( xgame, &test_iid_xgame_impl2, TRUE );
+    check_interface( xgame, &test_iid_xgame_impl3, TRUE );
+
+    hr = IXGameImpl_XGameGetXboxTitleId( xgame, &title_id );
+    if (test_game_config_created)
+    {
+        ok( hr == S_OK, "XGameGetXboxTitleId returned %#lx.\n", hr );
+        ok( title_id == 0x35760c07, "unexpected hexadecimal TitleId %#x.\n",
+            title_id );
+    }
+    else
+    {
+        ok( hr == S_OK || hr == HRESULT_FROM_WIN32( ERROR_NOT_FOUND ),
+            "XGameGetXboxTitleId returned %#lx for an external config.\n", hr );
+    }
+
+    hr = IXGameImpl_XGameGetXboxTitleId( xgame, NULL );
+    ok( hr == E_POINTER, "NULL TitleId returned %#lx.\n", hr );
+    IXGameImpl_Release( xgame );
 }
 
 static void test_XThreading(void)
@@ -490,6 +784,7 @@ START_TEST(xgameruntime)
 {
     HRESULT hr;
 
+    setup_test_game_config();
     hr = RoInitialize(RO_INIT_MULTITHREADED);
     ok(hr == S_OK, "RoInitialize failed, hr %#lx\n", hr);
 
@@ -497,8 +792,15 @@ START_TEST(xgameruntime)
     test_XSystem();
     test_XSystemAnalytics();
     test_XGameRuntimeFeature();
+    test_XGame();
     test_XThreading();
     test_XUserChangeRegistration();
+    test_XUserGamertagComponents();
+    test_XUserPrivileges();
 
     RoUninitialize();
+    if (test_game_config_created)
+        ok( DeleteFileW( test_game_config_path ),
+            "could not remove the test MicrosoftGame.Config, error %lu.\n",
+            GetLastError() );
 }

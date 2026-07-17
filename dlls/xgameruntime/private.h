@@ -29,6 +29,7 @@
 #include <activation.h>
 
 #include <xgameerr.h>
+#include <xgame.h>
 
 #include <unknwn.h>
 #include "provider.h"
@@ -51,6 +52,7 @@
 #define GAMING_SERVICES_VERSION 6247L
 
 extern IXSystemImpl *x_system_impl;
+extern IXGameImpl *x_game_impl;
 extern IXSystemAnalyticsImpl *x_system_analytics_impl;
 extern IXThreadingImpl *x_threading_impl;
 extern IXGameRuntimeFeatureImpl *x_game_runtime_feature_impl;
@@ -64,7 +66,13 @@ typedef struct _INITIALIZE_OPTIONS
 
 // Deference is for other modules to communicate with eachother through the same binary.
 HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out );
-void WineGDKApplyOnlinePatches( BOOLEAN user_ready );
+HRESULT WineGDKLoadGameConfig( void );
+
+/* Identity read from MicrosoftGame.Config.  This is deliberately separate
+ * from the launcher's OAuth client id and refresh-token cache. */
+extern UINT32 winegdk_game_title_id;
+extern char winegdk_game_msa_app_id[17];
+extern BOOLEAN winegdk_game_msa_full_trust;
 
 // a85c3901-18ae-48c9-b066-d368f4523420
 DEFINE_GUID(IID_IXTaskQueue, 0xa85c3901, 0x18ae, 0x48c9, 0xb0, 0x66, 0xd3, 0x68, 0xf4, 0x52, 0x34, 0x20);

@@ -9,6 +9,7 @@ SOURCES = \
 	\
 	GDKComponent/System/XSystem.c \
 	GDKComponent/System/XThreading.c \
+	GDKComponent/System/XGame.c \
 	GDKComponent/System/Threading/XTaskQueue.c \
 	GDKComponent/System/Threading/XAsync.c \
 	GDKComponent/System/Threading/AtomicVector.c \
@@ -23,4 +24,3 @@ SOURCES = \
 	GDKComponent/System/User/DeviceAuth.c \
 	GDKComponent/System/XStore.c \
 	GDKComponent/System/XServiceBroker.c
-

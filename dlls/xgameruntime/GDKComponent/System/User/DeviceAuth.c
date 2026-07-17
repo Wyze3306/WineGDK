@@ -9,6 +9,7 @@
 
 #include "DeviceAuth.h"
 #include "Token.h"
+#include <ctype.h>
 
 /* Re-declare the GetJsonStringValue helper locally */
 static inline HRESULT GetJsonStringValueLocal( IJsonObject *object, LPCWSTR key, HSTRING *value )
@@ -162,20 +163,57 @@ HRESULT DeviceAuth_GetDeviceToken( HSTRING *token )
 }
 
 HRESULT DeviceAuth_SignRequest( LPCSTR method, LPCSTR url_path, LPCSTR auth_header,
-                                 LPCSTR body, SIZE_T body_len,
-                                 LPSTR *signature_b64 )
+                                SIZE_T header_count,
+                                const struct DeviceAuthRequestHeader *headers,
+                                const void *body, SIZE_T body_len,
+                                LPSTR *signature_b64 )
 {
-    BYTE hash_input[16384];
+    const BYTE *body_bytes = body;
+    BYTE *hash_input = NULL;
     BYTE hash[32];
     BYTE sig[64];
     BYTE header_blob[76];
     ULONG sig_len;
-    SIZE_T pos = 0;
+    SIZE_T method_len, path_len, auth_len, input_len, pos = 0;
     FILETIME ft;
     ULARGE_INTEGER timestamp;
     NTSTATUS status;
+    HRESULT hr = S_OK;
 
+    if (!signature_b64) return E_POINTER;
+    *signature_b64 = NULL;
     if (!g_device_key) return E_FAIL;
+    if (!method || !url_path) return E_INVALIDARG;
+    if (header_count && !headers) return E_POINTER;
+    if (body_len && !body) return E_POINTER;
+
+    method_len = strlen( method );
+    path_len = strlen( url_path );
+    auth_len = auth_header ? strlen( auth_header ) : 0;
+
+    /* version/NUL + timestamp/NUL + method/NUL + path/NUL + auth/NUL +
+     * each policy header value/NUL + opaque body/NUL.  BCryptHash accepts an
+     * ULONG byte count, so fail rather than truncating an oversized request. */
+    input_len = 4 + 1 + 8 + 1 + 1 + 1 + 1 + 1;
+#define ADD_SIGNED_SIZE(value) \
+    do { if ((value) > ~(SIZE_T)0 - input_len) return HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW ); \
+         input_len += (value); } while (0)
+    ADD_SIGNED_SIZE( method_len );
+    ADD_SIGNED_SIZE( path_len );
+    ADD_SIGNED_SIZE( auth_len );
+    for (SIZE_T i = 0; i < header_count; ++i)
+    {
+        SIZE_T value_len;
+        if (!headers[i].name || !headers[i].value) return E_POINTER;
+        value_len = strlen( headers[i].value );
+        ADD_SIGNED_SIZE( value_len );
+        ADD_SIGNED_SIZE( 1 );
+    }
+    ADD_SIGNED_SIZE( body_len );
+#undef ADD_SIGNED_SIZE
+    if (input_len > ~(ULONG)0)
+        return HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW );
+    if (!(hash_input = malloc( input_len ))) return E_OUTOFMEMORY;
 
     GetSystemTimeAsFileTime( &ft );
     timestamp.LowPart = ft.dwLowDateTime;
@@ -186,21 +224,27 @@ HRESULT DeviceAuth_SignRequest( LPCSTR method, LPCSTR url_path, LPCSTR auth_head
     hash_input[pos++] = 0;
     write_be64( hash_input + pos, timestamp.QuadPart ); pos += 8;
     hash_input[pos++] = 0;
-    if (method) { memcpy( hash_input + pos, method, strlen(method) ); pos += strlen(method); }
+    for (SIZE_T i = 0; i < method_len; ++i)
+        hash_input[pos++] = toupper( (unsigned char)method[i] );
     hash_input[pos++] = 0;
-    if (url_path) { memcpy( hash_input + pos, url_path, strlen(url_path) ); pos += strlen(url_path); }
+    memcpy( hash_input + pos, url_path, path_len ); pos += path_len;
     hash_input[pos++] = 0;
-    if (auth_header) { memcpy( hash_input + pos, auth_header, strlen(auth_header) ); pos += strlen(auth_header); }
+    if (auth_len) { memcpy( hash_input + pos, auth_header, auth_len ); pos += auth_len; }
     hash_input[pos++] = 0;
-    if (body && body_len > 0 && pos + body_len < sizeof(hash_input) - 1)
+    for (SIZE_T i = 0; i < header_count; ++i)
     {
-        memcpy( hash_input + pos, body, body_len );
-        pos += body_len;
+        SIZE_T value_len = strlen( headers[i].value );
+        memcpy( hash_input + pos, headers[i].value, value_len );
+        pos += value_len;
+        hash_input[pos++] = 0;
     }
+    if (body_len) { memcpy( hash_input + pos, body_bytes, body_len ); pos += body_len; }
     hash_input[pos++] = 0;
 
     /* SHA-256 hash */
-    status = BCryptHash( g_sha256_alg, NULL, 0, hash_input, pos, hash, 32 );
+    status = BCryptHash( g_sha256_alg, NULL, 0, hash_input, (ULONG)pos, hash, 32 );
+    free( hash_input );
+    hash_input = NULL;
     if (status)
     {
         WARN( "BCryptHash failed: 0x%08lx\n", status );
@@ -224,8 +268,11 @@ HRESULT DeviceAuth_SignRequest( LPCSTR method, LPCSTR url_path, LPCSTR auth_head
     if (!*signature_b64) return E_OUTOFMEMORY;
     base64_encode( header_blob, 76, *signature_b64, 128 );
 
-    TRACE( "signed request: method=%s path=%s sig=%.20s...\n", method, url_path, *signature_b64 );
-    return S_OK;
+    /* Never log the path/query, Authorization value, headers, body or the
+     * resulting signature: all can contain reusable credentials. */
+    TRACE( "signed request metadata: method=%s, header_count=%llu, body_len=%llu\n",
+           method, (unsigned long long)header_count, (unsigned long long)body_len );
+    return hr;
 }
 
 HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
@@ -317,8 +364,8 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
                                 /* Steal the device token straight from the JSON */
                                 WindowsDuplicateString( tok, &g_device_token );
                                 g_initialized = TRUE;
-                                ERR( "preauth: loaded device token (%u-byte ECC blob) for id=%s — skipping Wine HTTP\n",
-                                     raw_size, g_device_id );
+                                ERR( "preauth: loaded device token and %u-byte ECC blob — skipping Wine HTTP\n",
+                                     raw_size );
                             }
                             free( raw );
                             free( blob_mb );
@@ -333,7 +380,7 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
                 CloseHandle( fh );
                 if (g_initialized) return S_OK;
             }
-            else WARN( "preauth: WINEGDK_PREAUTH_DEVICE=%s but file unreadable\n", preauth_path );
+            else WARN( "preauth: configured device credential file is unreadable\n" );
         }
     }
 
@@ -372,7 +419,7 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
                     memcpy( g_pubkey_x, blob + sizeof(BCRYPT_ECCKEY_BLOB), 32 );
                     memcpy( g_pubkey_y, blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 32 );
                     loaded = TRUE;
-                    TRACE( "reusing persisted device id=%s\n", g_device_id );
+                    TRACE( "reusing persisted device identity\n" );
                 }
                 else
                 {
@@ -425,8 +472,8 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
                     RegSetValueExA( hKey, "PrivateKey", 0, REG_BINARY,
                                      priv_blob, priv_size );
                     RegCloseKey( hKey );
-                    TRACE( "persisted device id=%s + EC private key (%lu bytes)\n",
-                           g_device_id, priv_size );
+                    TRACE( "persisted device identity and EC private key (%lu bytes)\n",
+                           priv_size );
                 }
             }
         }
@@ -455,7 +502,8 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
 
     /* Sign the device auth request */
     hr = DeviceAuth_SignRequest( "POST", "/device/authenticate", "",
-                                  device_auth_body, strlen(device_auth_body), &sig_header );
+                                  0, NULL, device_auth_body, strlen(device_auth_body),
+                                  &sig_header );
     if (FAILED(hr))
     {
         WARN( "failed to sign device auth request: 0x%08lx\n", hr );
@@ -491,7 +539,7 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token )
         return hr;
     }
 
-    TRACE( "device auth response (%llu bytes): %.200s\n", (unsigned long long)response_size, response );
+    TRACE( "device auth response size=%llu\n", (unsigned long long)response_size );
 
     /* Parse response to get device token */
     {

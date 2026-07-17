@@ -16,10 +16,20 @@ HRESULT DeviceAuth_Initialize( LPCSTR msa_access_token );
 /* Get the device token (JWT string) */
 HRESULT DeviceAuth_GetDeviceToken( HSTRING *token );
 
-/* Compute XBL request signature for an HTTP request */
+struct DeviceAuthRequestHeader
+{
+    LPCSTR name;
+    LPCSTR value;
+};
+
+/* Compute an XBL proof-of-possession signature for the exact HTTP request.
+ * Header names identify the caller-owned values, while the proof policy signs
+ * those values, in caller order, each followed by a NUL byte. */
 HRESULT DeviceAuth_SignRequest( LPCSTR method, LPCSTR url_path, LPCSTR auth_header,
-                                 LPCSTR body, SIZE_T body_len,
-                                 LPSTR *signature_b64 );
+                                SIZE_T header_count,
+                                const struct DeviceAuthRequestHeader *headers,
+                                const void *body, SIZE_T body_len,
+                                LPSTR *signature_b64 );
 
 /* Get the ProofKey JWK as a JSON string */
 HRESULT DeviceAuth_GetProofKeyJson( LPSTR *json );
