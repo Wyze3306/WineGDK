@@ -1,7 +1,9 @@
 MODULE  = windows.storage.dll
-IMPORTS = shell32 combase
+IMPORTS = uuid shell32 ole32 combase
 
 SOURCES = \
 	classes.idl \
 	main.c \
-	streams.c
+	pickers.c \
+	streams.c \
+	vector.c

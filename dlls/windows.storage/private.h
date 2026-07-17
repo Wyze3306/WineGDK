@@ -26,6 +26,9 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winstring.h"
+#include "objbase.h"
+#include "shlobj.h"
+#include "shobjidl.h"
 
 #include "activation.h"
 
@@ -39,7 +42,15 @@
 #include "windows.storage.h"
 #include "windows.storage.streams.h"
 
+#define WIDL_using_Microsoft_UI
+#define WIDL_using_Microsoft_Windows_Storage_Pickers
+#include "microsoft.ui.h"
+#include "microsoft.windows.storage.pickers.h"
+
 extern IActivationFactory *random_access_stream_reference_factory;
+extern IActivationFactory *file_open_picker_factory;
+
+HRESULT hstring_vector_create( IVector_HSTRING **out );
 
 #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
     static inline impl_type *impl_from( iface_type *iface )                                        \

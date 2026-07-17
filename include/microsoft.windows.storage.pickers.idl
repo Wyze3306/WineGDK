@@ -1,0 +1,128 @@
+/*
+ * Copyright 2026 BedrockOnLinux contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ */
+
+#ifdef __WIDL__
+#pragma makedep header
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+import "microsoft.ui.idl";
+
+namespace Microsoft.Windows.Storage.Pickers
+{
+    typedef enum PickerLocationId PickerLocationId;
+    typedef enum PickerViewMode PickerViewMode;
+
+    interface IFileOpenPicker;
+    interface IFileOpenPickerFactory;
+    interface IPickFileResult;
+
+    runtimeclass FileOpenPicker;
+    runtimeclass PickFileResult;
+
+    [contractversion(1.8)]
+    apicontract StoragePickersContract
+    {};
+
+    declare
+    {
+        interface Windows.Foundation.Collections.IVectorView<Microsoft.Windows.Storage.Pickers.PickFileResult *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Microsoft.Windows.Storage.Pickers.PickFileResult *>;
+        interface Windows.Foundation.IAsyncOperation<Microsoft.Windows.Storage.Pickers.PickFileResult *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Foundation.Collections.IVectorView<Microsoft.Windows.Storage.Pickers.PickFileResult *> *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Microsoft.Windows.Storage.Pickers.PickFileResult *> *>;
+    }
+
+    [contract(Microsoft.Windows.Storage.Pickers.StoragePickersContract, 1.8)]
+    enum PickerViewMode
+    {
+        List = 0,
+        Thumbnail = 1,
+    };
+
+    [contract(Microsoft.Windows.Storage.Pickers.StoragePickersContract, 1.8)]
+    enum PickerLocationId
+    {
+        DocumentsLibrary = 0,
+        ComputerFolder = 1,
+        Desktop = 2,
+        Downloads = 3,
+        MusicLibrary = 5,
+        PicturesLibrary = 6,
+        VideosLibrary = 7,
+        Objects3D = 8,
+        Unspecified = 9,
+    };
+
+    [
+        contract(Microsoft.Windows.Storage.Pickers.StoragePickersContract, 1.8),
+        exclusiveto(Microsoft.Windows.Storage.Pickers.PickFileResult),
+        uuid(e6f2e3d6-7bb0-5d81-9e7d-6fd35a1f25ab)
+    ]
+    interface IPickFileResult : IInspectable
+    {
+        [propget] HRESULT Path([out, retval] HSTRING *value);
+    }
+
+    [
+        contract(Microsoft.Windows.Storage.Pickers.StoragePickersContract, 1.8),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass PickFileResult
+    {
+        [default] interface Microsoft.Windows.Storage.Pickers.IPickFileResult;
+    }
+
+    [
+        contract(Microsoft.Windows.Storage.Pickers.StoragePickersContract, 1.8),
+        exclusiveto(Microsoft.Windows.Storage.Pickers.FileOpenPicker),
+        uuid(9d00f175-c783-51bd-8c93-fb63695d3abc)
+    ]
+    interface IFileOpenPicker : IInspectable
+    {
+        [propget] HRESULT ViewMode([out, retval] Microsoft.Windows.Storage.Pickers.PickerViewMode *value);
+        [propput] HRESULT ViewMode([in] Microsoft.Windows.Storage.Pickers.PickerViewMode value);
+        [propget] HRESULT SuggestedStartLocation([out, retval] Microsoft.Windows.Storage.Pickers.PickerLocationId *value);
+        [propput] HRESULT SuggestedStartLocation([in] Microsoft.Windows.Storage.Pickers.PickerLocationId value);
+        [propget] HRESULT CommitButtonText([out, retval] HSTRING *value);
+        [propput] HRESULT CommitButtonText([in] HSTRING value);
+        [propget] HRESULT FileTypeFilter([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        HRESULT PickSingleFileAsync([out, retval] Windows.Foundation.IAsyncOperation<Microsoft.Windows.Storage.Pickers.PickFileResult *> **operation);
+        HRESULT PickMultipleFilesAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Microsoft.Windows.Storage.Pickers.PickFileResult *> *> **operation);
+    }
+
+    [
+        contract(Microsoft.Windows.Storage.Pickers.StoragePickersContract, 1.8),
+        exclusiveto(Microsoft.Windows.Storage.Pickers.FileOpenPicker),
+        uuid(315e86d7-d7a2-5d81-b379-7af78207b1af)
+    ]
+    interface IFileOpenPickerFactory : IInspectable
+    {
+        HRESULT CreateInstance([in] Microsoft.UI.WindowId window_id,
+                               [out, retval] Microsoft.Windows.Storage.Pickers.FileOpenPicker **value);
+    }
+
+    [
+        activatable(Microsoft.Windows.Storage.Pickers.IFileOpenPickerFactory,
+                    Microsoft.Windows.Storage.Pickers.StoragePickersContract, 1.8),
+        contract(Microsoft.Windows.Storage.Pickers.StoragePickersContract, 1.8),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass FileOpenPicker
+    {
+        [default] interface Microsoft.Windows.Storage.Pickers.IFileOpenPicker;
+    }
+}

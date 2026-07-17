@@ -457,6 +457,8 @@ SOURCES = \
 	medparam.idl \
 	memoryapi.h \
 	metahost.idl \
+	microsoft.ui.idl \
+	microsoft.windows.storage.pickers.idl \
 	mfapi.h \
 	mfd3d12.idl \
 	mferror.h \
