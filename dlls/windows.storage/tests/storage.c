@@ -93,6 +93,9 @@ static void test_FileOpenPicker(void)
     static const WCHAR class_name[] = L"Microsoft.Windows.Storage.Pickers.FileOpenPicker";
     static const IID async_iid = {0x98316bd9, 0x5a80, 0x5c8a, {0x8f, 0x99, 0x2e, 0xfb, 0xe1, 0xe7, 0x02, 0x33}};
     static const IID handler_iid = {0x4689da0a, 0xd31d, 0x5be4, {0x87, 0x22, 0xbf, 0xdb, 0x60, 0x89, 0x30, 0x26}};
+    static const IID vector_iid = {0x76506627, 0xd304, 0x5763, {0x86, 0xc2, 0xd7, 0xfd, 0x3f, 0x17, 0x15, 0x2b}};
+    static const IID multi_async_iid = {0xf8cde12a, 0x675a, 0x5291, {0xb0, 0x48, 0x58, 0x6c, 0x26, 0x25, 0xae, 0x3e}};
+    static const IID multi_handler_iid = {0xf1a085fd, 0xb82d, 0x5f07, {0x81, 0xf6, 0x28, 0xab, 0xef, 0xd1, 0xc8, 0x4c}};
     IFileOpenPickerFactory *picker_factory = (void *)0xdeadbeef;
     IFileOpenPicker *picker = (void *)0xdeadbeef;
     IActivationFactory *activation_factory;
@@ -112,6 +115,12 @@ static void test_FileOpenPicker(void)
     ok( IsEqualGUID( &IID_IAsyncOperation_PickFileResult, &async_iid ), "unexpected async operation IID.\n" );
     ok( IsEqualGUID( &IID_IAsyncOperationCompletedHandler_PickFileResult, &handler_iid ),
         "unexpected completion handler IID.\n" );
+    ok( IsEqualGUID( &IID_IVectorView_PickFileResult, &vector_iid ),
+        "unexpected result vector IID.\n" );
+    ok( IsEqualGUID( &IID_IAsyncOperation_IVectorView_PickFileResult, &multi_async_iid ),
+        "unexpected multi-file async operation IID.\n" );
+    ok( IsEqualGUID( &IID_IAsyncOperationCompletedHandler_IVectorView_PickFileResult,
+                     &multi_handler_iid ), "unexpected multi-file completion handler IID.\n" );
 
     hr = WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, &name );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
@@ -153,6 +162,11 @@ static void test_FileOpenPicker(void)
     check_interface( picker, &IID_IUnknown, FALSE );
     check_interface( picker, &IID_IInspectable, FALSE );
     check_interface( picker, &IID_IAgileObject, FALSE );
+
+    hr = IFileOpenPicker_PickSingleFileAsync( picker, NULL );
+    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
+    hr = IFileOpenPicker_PickMultipleFilesAsync( picker, NULL );
+    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
 
     hr = IFileOpenPicker_get_ViewMode( picker, &view_mode );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
