@@ -27,6 +27,7 @@
 #include "winbase.h"
 #include "winstring.h"
 #include "objbase.h"
+#include "commdlg.h"
 #include "shlobj.h"
 #include "shobjidl.h"
 

@@ -36,6 +36,7 @@
 #include "windows.storage.h"
 
 extern IActivationFactory *application_data_factory;
+extern IActivationFactory *storage_file_factory;
 
 #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
     static inline impl_type *impl_from( iface_type *iface )                                        \

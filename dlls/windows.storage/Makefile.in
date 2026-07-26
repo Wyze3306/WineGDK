@@ -1,5 +1,5 @@
 MODULE  = windows.storage.dll
-IMPORTS = uuid shell32 ole32 combase
+IMPORTS = uuid shell32 ole32 comdlg32 combase
 
 SOURCES = \
 	classes.idl \

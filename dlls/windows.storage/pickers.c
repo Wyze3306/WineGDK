@@ -36,7 +36,6 @@ struct file_picker_operation
     IAsyncInfo IAsyncInfo_iface;
     LONG ref;
     CRITICAL_SECTION cs;
-    HANDLE thread;
     BOOL handler_set;
     BOOL cancel_requested;
     AsyncStatus status;
@@ -405,7 +404,6 @@ static ULONG operation_release( struct file_picker_operation *operation )
 
     if (!ref)
     {
-        if (operation->thread) CloseHandle( operation->thread );
         if (operation->handler) IAsyncOperationCompletedHandler_PickFileResult_Release( operation->handler );
         if (operation->result) IPickFileResult_Release( operation->result );
         WindowsDeleteString( operation->commit_button_text );
@@ -1056,49 +1054,60 @@ static void set_default_folder( IFileDialog *dialog, PickerLocationId location )
 
 static HRESULT show_file_dialog( struct file_picker_operation *operation, IPickFileResult **result )
 {
+    static const WCHAR supported_files[] = L"Supported files";
     struct dialog_filters filters;
-    IFileOpenDialog *dialog = NULL;
-    IFileDialog *file_dialog = NULL;
-    IShellItem *item = NULL;
-    FILEOPENDIALOGOPTIONS options;
-    const WCHAR *commit;
-    WCHAR *path = NULL;
-    UINT32 commit_length;
+    const KNOWNFOLDERID *folder_id;
+    OPENFILENAMEW dialog = {0};
+    const WCHAR *description, *pattern;
+    WCHAR *filter = NULL, *cursor, *initial_dir = NULL, *path = NULL;
+    SIZE_T description_length, filter_length, pattern_length;
+    DWORD error;
     HRESULT hr;
 
+    if (!result) return E_POINTER;
     *result = NULL;
     if (FAILED(hr = dialog_filters_create( operation->filter_count, operation->filters, &filters )))
         return hr;
-    if (FAILED(hr = CoCreateInstance( &CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
-                                     &IID_IFileOpenDialog, (void **)&dialog ))) goto done;
-    if (FAILED(hr = IFileOpenDialog_QueryInterface( dialog, &IID_IFileDialog, (void **)&file_dialog ))) goto done;
 
-    if (FAILED(hr = IFileDialog_SetFileTypes( file_dialog, filters.count, filters.specs ))) goto done;
-    if (FAILED(hr = IFileDialog_SetFileTypeIndex( file_dialog, filters.count ))) goto done;
-    if (FAILED(hr = IFileDialog_GetOptions( file_dialog, &options ))) goto done;
-    if (FAILED(hr = IFileDialog_SetOptions( file_dialog, options | FOS_FORCEFILESYSTEM |
-                                           FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST ))) goto done;
-
-    commit = WindowsGetStringRawBuffer( operation->commit_button_text, &commit_length );
-    if (commit_length && FAILED(hr = IFileDialog_SetOkButtonLabel( file_dialog, commit ))) goto done;
-    set_default_folder( file_dialog, operation->location );
-
-    hr = IFileDialog_Show( file_dialog, operation->hwnd );
-    if (FAILED(hr))
+    pattern = filters.combined ? filters.combined : filters.specs[0].pszSpec;
+    description = !wcscmp( pattern, L"*" ) ? filters.specs[0].pszName : supported_files;
+    description_length = wcslen( description );
+    pattern_length = wcslen( pattern );
+    filter_length = description_length + pattern_length + 3;
+    if (!(filter = calloc( filter_length, sizeof(*filter) )) ||
+        !(path = calloc( 32768, sizeof(*path) )))
     {
-        /* WinAppSDK treats closing or rejecting the dialog as a successful null result. */
-        hr = S_OK;
+        hr = E_OUTOFMEMORY;
         goto done;
     }
-    if (FAILED(hr = IFileOpenDialog_GetResult( dialog, &item ))) goto done;
-    if (FAILED(hr = IShellItem_GetDisplayName( item, SIGDN_FILESYSPATH, &path ))) goto done;
-    hr = pick_file_result_create( path, result );
+    cursor = filter;
+    memcpy( cursor, description, description_length * sizeof(*cursor) );
+    cursor += description_length + 1;
+    memcpy( cursor, pattern, pattern_length * sizeof(*cursor) );
+
+    folder_id = known_folder_from_location( operation->location );
+    if (folder_id) SHGetKnownFolderPath( folder_id, 0, NULL, &initial_dir );
+
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = operation->hwnd;
+    dialog.lpstrFilter = filter;
+    dialog.nFilterIndex = 1;
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = 32768;
+    dialog.lpstrInitialDir = initial_dir;
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (GetOpenFileNameW( &dialog ))
+        hr = pick_file_result_create( path, result );
+    else if ((error = CommDlgExtendedError()))
+        hr = HRESULT_FROM_WIN32( error );
+    else
+        hr = S_OK;
 
 done:
-    CoTaskMemFree( path );
-    if (item) IShellItem_Release( item );
-    if (file_dialog) IFileDialog_Release( file_dialog );
-    if (dialog) IFileOpenDialog_Release( dialog );
+    CoTaskMemFree( initial_dir );
+    free( path );
+    free( filter );
     dialog_filters_destroy( &filters );
     return hr;
 }
@@ -1182,15 +1191,6 @@ done:
     return hr;
 }
 
-static BOOL operation_is_canceled( struct file_picker_operation *operation )
-{
-    BOOL canceled;
-    EnterCriticalSection( &operation->cs );
-    canceled = operation->cancel_requested;
-    LeaveCriticalSection( &operation->cs );
-    return canceled;
-}
-
 static void operation_complete( struct file_picker_operation *operation, HRESULT hr, IPickFileResult *result )
 {
     IAsyncOperationCompletedHandler_PickFileResult *handler = NULL;
@@ -1229,28 +1229,11 @@ static void operation_complete( struct file_picker_operation *operation, HRESULT
     }
 }
 
-static DWORD WINAPI file_picker_worker( void *param )
-{
-    struct file_picker_operation *operation = param;
-    IPickFileResult *result = NULL;
-    HRESULT hr;
-
-    if (operation_is_canceled( operation ))
-        hr = E_ABORT;
-    else if (SUCCEEDED(hr = CoInitializeEx( NULL, COINIT_APARTMENTTHREADED )))
-    {
-        hr = show_file_dialog( operation, &result );
-        CoUninitialize();
-    }
-    operation_complete( operation, hr, result );
-    operation_release( operation );
-    return 0;
-}
-
 static HRESULT file_picker_operation_create( struct file_open_picker *picker,
                                              IAsyncOperation_PickFileResult **out )
 {
     struct file_picker_operation *operation;
+    IPickFileResult *result = NULL;
     UINT32 i;
     HRESULT hr;
 
@@ -1278,13 +1261,8 @@ static HRESULT file_picker_operation_create( struct file_open_picker *picker,
     for (i = 0; i < operation->filter_count; ++i)
         if (FAILED(hr = IVector_HSTRING_GetAt( picker->filters, i, &operation->filters[i] ))) goto failed;
 
-    operation_add_ref( operation );
-    if (!(operation->thread = CreateThread( NULL, 0, file_picker_worker, operation, 0, NULL )))
-    {
-        hr = HRESULT_FROM_WIN32( GetLastError() );
-        operation_release( operation );
-        goto failed;
-    }
+    hr = show_file_dialog( operation, &result );
+    operation_complete( operation, hr, result );
 
     *out = &operation->IAsyncOperation_PickFileResult_iface;
     return S_OK;
@@ -1346,16 +1324,18 @@ static DWORD WINAPI multi_file_picker_worker( void *param )
 {
     struct multi_file_picker_operation *operation = param;
     IVectorView_PickFileResult *result = NULL;
+    BOOL com_initialized = FALSE;
     HRESULT hr;
 
     if (multi_operation_is_canceled( operation ))
         hr = E_ABORT;
     else if (SUCCEEDED(hr = CoInitializeEx( NULL, COINIT_APARTMENTTHREADED )))
     {
+        com_initialized = TRUE;
         hr = show_multi_file_dialog( operation, &result );
-        CoUninitialize();
     }
     multi_operation_complete( operation, hr, result );
+    if (com_initialized) CoUninitialize();
     multi_operation_release( operation );
     return 0;
 }
