@@ -116,6 +116,7 @@ struct async_state
     XAsyncBlock providerAsyncBlock;
     XAsyncBlock* userAsyncBlock;
     XTaskQueueHandle queue;
+    BOOLEAN queueIsNative;
     CRITICAL_SECTION cs;
     CONDITION_VARIABLE cv;
     BOOLEAN waitSatisfied;

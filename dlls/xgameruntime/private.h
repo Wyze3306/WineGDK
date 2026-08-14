@@ -68,6 +68,11 @@ typedef struct _INITIALIZE_OPTIONS
 HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out );
 HRESULT WineGDKLoadGameConfig( void );
 
+/* QueryApiImpl hands CLSID_XThreadingImpl to the native GDK sidecar, so every
+ * task queue the title owns is a native handle.  Components that keep their own
+ * XAsync state need the same implementation back to drive those queues. */
+IXThreadingImpl *WineGDKGetNativeThreading( void );
+
 /* Identity read from MicrosoftGame.Config.  This is deliberately separate
  * from the launcher's OAuth client id and refresh-token cache. */
 extern UINT32 winegdk_game_title_id;
