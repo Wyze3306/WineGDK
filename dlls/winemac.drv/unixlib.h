@@ -54,9 +54,19 @@ struct app_icon_entry
 {
     UINT32 width;
     UINT32 height;
-    UINT32 size;
     UINT32 icon;
-    UINT64 png;
+};
+
+struct regqueryvalueexa_params
+{
+    struct dispatch_callback_params dispatch;
+    UINT32 hkey;
+    UINT64 name;
+    UINT64 reserved;
+    UINT64 type;
+    UINT64 data;
+    UINT64 count;
+    UINT32 result;
 };
 
 /* macdrv_app_quit_request params */

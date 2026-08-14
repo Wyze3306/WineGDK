@@ -25,7 +25,6 @@
 #include <stdarg.h>
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winnt.h"
 #include "ntgdi_private.h"
@@ -169,7 +168,9 @@ static const char *usercall_names[NtUserCallCount] =
 #undef USER32_CALLBACK_ENTRY
 };
 
-static NTSTATUS init( void *args )
+static pthread_key_t user_thread_info_key;
+
+NTSTATUS __wine_unix_lib_init(void)
 {
 #ifdef _WIN64
     if (NtCurrentTeb()->WowTebOffset)
@@ -182,10 +183,34 @@ static NTSTATUS init( void *args )
 #endif
     KeAddSystemServiceTable( syscalls, NULL, ARRAY_SIZE(syscalls), arguments, 1 );
     ntdll_add_syscall_debug_info( 1, syscall_names, usercall_names );
+    pthread_key_create( &user_thread_info_key, NULL );
     return STATUS_SUCCESS;
 }
 
-const unixlib_entry_t __wine_unix_call_funcs[] =
+struct user_thread_info *get_user_thread_info(void)
 {
-    init,
-};
+    struct user_thread_info *info = pthread_getspecific( user_thread_info_key );
+
+    if (!info)
+    {
+        TEB *teb = NtCurrentTeb();
+
+        info = calloc( 1, sizeof(*info) );
+        pthread_setspecific( user_thread_info_key, info );
+        list_init( &info->known_pointers );
+
+        if (teb)
+        {
+#ifndef _WIN64
+            if (teb->GdiBatchCount)
+            {
+                TEB64 *teb64 = (TEB64 *)(UINT_PTR)teb->GdiBatchCount;
+                info->client_info = (struct ntuser_thread_info *)teb64->Win32ClientInfo;
+            }
+            else
+#endif
+            info->client_info = (struct ntuser_thread_info *)teb->Win32ClientInfo;
+        }
+    }
+    return info;
+}

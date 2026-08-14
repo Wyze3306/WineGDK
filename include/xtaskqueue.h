@@ -19,43 +19,77 @@
 #ifndef __WINE_XTASKQUEUE_H
 #define __WINE_XTASKQUEUE_H
 
-#include <stdint.h>
-#include <winerror.h>
-#include <windef.h>
+#ifdef __cplusplus
+extern "C" {
 
-typedef struct XTaskQueueObject* XTaskQueueHandle;
-
-typedef struct XTaskQueuePortObject* XTaskQueuePortHandle;
-
-typedef enum XTaskQueueDispatchMode
+enum class XTaskQueueDispatchMode : UINT32
 {
     Manual,
     ThreadPool,
     SerializedThreadPool,
-    Immediate
+    Immediate,
+};
+
+enum class XTaskQueuePort : UINT32
+{
+    Work,
+    Completion,
+};
+
+#elif defined(__WINESRC__)
+
+typedef enum XTaskQueueDispatchMode
+{
+    XTaskQueueDispatchMode_Manual,
+    XTaskQueueDispatchMode_ThreadPool,
+    XTaskQueueDispatchMode_SerializedThreadPool,
+    XTaskQueueDispatchMode_Immediate,
 } XTaskQueueDispatchMode;
 
 typedef enum XTaskQueuePort
 {
-    Work,
-    Completion
+    XTaskQueuePort_Work,
+    XTaskQueuePort_Completion,
 } XTaskQueuePort;
 
-typedef enum XTaskQueuePortStatus
-{
-    PortStatus_Active,
-    PortStatus_Canceled,
-    PortStatus_Terminating,
-    PortStatus_Terminated
-} XTaskQueuePortStatus;
+#endif
 
-typedef struct XTaskQueueRegistrationToken
-{
-    uint64_t token;
-} XTaskQueueRegistrationToken;
+typedef struct XTaskQueueObject *XTaskQueueHandle;
+typedef struct XTaskQueuePortObject *XTaskQueuePortHandle;
 
-typedef void CALLBACK XTaskQueueCallback(_In_opt_ void* context, _In_ BOOL canceled);
-typedef void CALLBACK XTaskQueueMonitorCallback(_In_opt_ void* context, _In_ XTaskQueueHandle queue, _In_ XTaskQueuePort port);
-typedef void CALLBACK XTaskQueueTerminatedCallback(_In_opt_ void* context);
+typedef struct XTaskQueueRegistrationToken XTaskQueueRegistrationToken;
+
+typedef void __stdcall XTaskQueueCallback( void *context, BOOLEAN canceled );
+typedef void __stdcall XTaskQueueMonitorCallback( void *context, XTaskQueueHandle queue, XTaskQueuePort port );
+typedef void __stdcall XTaskQueueTerminatedCallback( void *context );
+
+struct XTaskQueueRegistrationToken
+{
+    UINT64 token;
+};
+
+void __stdcall XTaskQueueCloseHandle( XTaskQueueHandle queue );
+HRESULT __stdcall XTaskQueueCreate( XTaskQueueDispatchMode workDispatchMode, XTaskQueueDispatchMode completionDispatchMode, XTaskQueueHandle *queue );
+HRESULT __stdcall XTaskQueueCreateComposite( XTaskQueuePortHandle workPort, XTaskQueuePortHandle completionPort, XTaskQueueHandle *queue );
+HRESULT __stdcall XTaskQueueGetPort( XTaskQueueHandle queue, XTaskQueuePort port, XTaskQueuePortHandle *portHandle );
+HRESULT __stdcall XTaskQueueDuplicateHandle( XTaskQueueHandle queueHandle, XTaskQueueHandle *duplicatedHandle );
+BOOLEAN __stdcall XTaskQueueDispatch( XTaskQueueHandle queue, XTaskQueuePort port, UINT32 timeoutInMs );
+void __stdcall XTaskQueueCloseHandle( XTaskQueueHandle queue );
+HRESULT __stdcall XTaskQueueTerminate( XTaskQueueHandle queue, BOOLEAN wait, void *callbackContext, XTaskQueueTerminatedCallback *callback );
+HRESULT __stdcall XTaskQueueSubmitCallback( XTaskQueueHandle queue, XTaskQueuePort port, void *callbackContext, XTaskQueueCallback *callback );
+HRESULT __stdcall XTaskQueueSubmitDelayedCallback( XTaskQueueHandle queue, XTaskQueuePort port, UINT32 delayMs, void *callbackContext, XTaskQueueCallback *callback );
+HRESULT __stdcall XTaskQueueRegisterWaiter( XTaskQueueHandle queue, XTaskQueuePort port, HANDLE waitHandle, void *callbackContext, XTaskQueueCallback *callback, XTaskQueueRegistrationToken *token );
+void __stdcall XTaskQueueUnregisterWaiter( XTaskQueueHandle queue, XTaskQueueRegistrationToken token );
+HRESULT __stdcall XTaskQueueRegisterMonitor( XTaskQueueHandle queue, void *callbackContext, XTaskQueueMonitorCallback *callback, XTaskQueueRegistrationToken *token );
+void __stdcall XTaskQueueUnregisterMonitor( XTaskQueueHandle queue, XTaskQueueRegistrationToken token );
+BOOLEAN __stdcall XTaskQueueGetCurrentProcessTaskQueue( XTaskQueueHandle *queue );
+void __stdcall XTaskQueueSetCurrentProcessTaskQueue( XTaskQueueHandle queue );
+HRESULT __stdcall XThreadSetTimeSensitive( BOOLEAN isTimeSensitiveThread );
+void __stdcall XThreadAssertNotTimeSensitive();
+BOOLEAN __stdcall XThreadIsTimeSensitive();
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

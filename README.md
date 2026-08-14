@@ -1,6 +1,6 @@
 # NOTES FOR PEOPLE TRYING TO RUN MINECRAFT'S GDK BUILD
 
-Microsoft Services have not been added yet. This is because `XUser` hasn't been implemented in `xgameruntime.dll` yet.
+Microsoft Services is WIP.
 
 As of [3414250](https://github.com/Weather-OS/WineGDK/commit/341425050f4f9b968b807dbd61942dabca8f6af1), Online functionality has been implemented. To get it working, resort to [GDK-Proton](https://github.com/Weather-OS/GDK-Proton)
 
@@ -13,6 +13,11 @@ derived from other parts of the wine project, CC0 (A.K.A "Public Domain") (i.e x
 You're allowed to derive, redistribute and reimplement my code at will,  
 without any attributions.
 **THIS ONLY APPLIES TO THE CODE I HAVE WRITTEN, NOT THE REST OF WINE'S PROJECT!**
+
+**ADDITIONAL NOTES**: 
+- Code authored by "Olivia Ryan" is not covered by this clause.
+- [Xodus](<https://github.com/xodus-gaming/xodus>) interopability is not upstream safe. Please refrain from pushing changes that include any part of this feature upstream.
+  - This includes all code that run within the `xodus` wine debug channel.
 
 ## INTRODUCTION
 
@@ -62,7 +67,7 @@ To compile and run Wine, you must have one of the following:
 - FreeBSD 12.4 or later
 - Solaris x86 9 or later
 - NetBSD-current
-- macOS 10.12 or later
+- macOS 10.15 or later
 
 As Wine requires kernel-level thread support to run, only the operating
 systems mentioned above are supported.  Other operating systems which
@@ -82,10 +87,7 @@ support kernel threads may be supported in the future.
   turned on in your kernel.
 
 **macOS info**:
-  You need Xcode/Xcode Command Line Tools or Apple cctools.  The
-  minimum requirements for compiling Wine are clang 3.8 with the
-  MacOSX10.13.sdk and mingw-w64 v12 for 32-bit wine.  The
-  MacOSX10.14.sdk and later can build 64-bit wine.
+  You need Xcode/Xcode Command Line Tools or Apple cctools.
 
 **Supported file systems**:
   Wine should run on most file systems. A few compatibility problems

@@ -17,7 +17,6 @@
  */
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "mfsrcsnk_private.h"
 
 #include "wine/list.h"
@@ -1260,7 +1259,6 @@ static ULONG WINAPI media_source_Release(IMFMediaSource *iface)
         free(source->streams);
 
         IMFMediaEventQueue_Release(source->queue);
-        IMFByteStream_Release(source->stream);
         free(source->url);
 
         source->cs.DebugInfo->Spare[0] = 0;
@@ -1464,6 +1462,7 @@ static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
     IMFMediaEventQueue_QueueEventParamVar(source->queue, MEError, &GUID_NULL, MF_E_SHUTDOWN, NULL);
     IMFMediaEventQueue_Shutdown(source->queue);
     IMFByteStream_Close(source->stream);
+    IMFByteStream_Release(source->stream);
 
     while (source->stream_count--)
     {
@@ -1729,7 +1728,9 @@ static NTSTATUS CDECL media_source_seek_cb( struct winedmo_stream *stream, UINT6
     struct media_source *source = CONTAINING_RECORD(stream, struct media_source, winedmo_stream);
     TRACE("stream %p, pos %p\n", stream, pos);
 
-    if (FAILED(IMFByteStream_Seek(source->stream, msoBegin, *pos, 0, pos)))
+    if (FAILED(IMFByteStream_SetCurrentPosition(source->stream, *pos)))
+        return STATUS_UNSUCCESSFUL;
+    if (FAILED(IMFByteStream_GetCurrentPosition(source->stream, pos)))
         return STATUS_UNSUCCESSFUL;
     return STATUS_SUCCESS;
 }
@@ -1824,7 +1825,7 @@ static WCHAR *get_byte_stream_url(IMFByteStream *stream, const WCHAR *url)
         if (FAILED(hr = IMFAttributes_GetString(attributes, &MF_BYTESTREAM_ORIGIN_NAME,
                 buffer, ARRAY_SIZE(buffer), &size)))
             WARN("Failed to get MF_BYTESTREAM_ORIGIN_NAME got size %#x, hr %#lx\n", size, hr);
-        else
+        else if (*buffer) /* an empty origin name does not override the url */
             url = buffer;
         IMFAttributes_Release(attributes);
     }

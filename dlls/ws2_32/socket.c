@@ -1353,7 +1353,7 @@ int WINAPI closesocket( SOCKET s )
         return -1;
     }
 
-    if (!socket_list_remove( s ))
+    if (!socket_list_remove( s ) && !is_valid_socket( s ))
     {
         SetLastError( WSAENOTSOCK );
         return -1;
@@ -3022,6 +3022,7 @@ int WINAPI select( int count, fd_set *read_ptr, fd_set *write_ptr,
 
     status = NtDeviceIoControlFile( (HANDLE)poll_socket, sync_event, NULL, NULL, &io,
                                     IOCTL_AFD_POLL, params, params_size, params, params_size );
+    if (status == STATUS_NOT_SUPPORTED) status = STATUS_INVALID_HANDLE;
     if (status == STATUS_PENDING)
     {
         if (wait_event_alertable( sync_event ) == WAIT_FAILED)

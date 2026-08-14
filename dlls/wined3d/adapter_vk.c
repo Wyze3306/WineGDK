@@ -221,7 +221,6 @@ static void wined3d_disable_vulkan_features(struct wined3d_physical_device_info 
     dynamic_state3->extendedDynamicState3LineRasterizationMode = VK_FALSE;
     dynamic_state3->extendedDynamicState3LineStippleEnable = VK_FALSE;
     dynamic_state3->extendedDynamicState3LogicOpEnable = VK_FALSE;
-    dynamic_state3->extendedDynamicState3PolygonMode = VK_FALSE;
     dynamic_state3->extendedDynamicState3ProvokingVertexMode = VK_FALSE;
     dynamic_state3->extendedDynamicState3RasterizationStream = VK_FALSE;
     dynamic_state3->extendedDynamicState3RepresentativeFragmentTestEnable = VK_FALSE;
@@ -1933,7 +1932,7 @@ static const struct
 vulkan_instance_extensions[] =
 {
     {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, VK_API_VERSION_1_1, FALSE},
-    {VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,                  VK_API_VERSION_1_1, FALSE},
+    {VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME,      VK_API_VERSION_1_1, FALSE},
     {VK_KHR_SURFACE_EXTENSION_NAME,                          ~0u,                TRUE},
     {VK_KHR_WIN32_SURFACE_EXTENSION_NAME,                    ~0u,                TRUE},
 };
@@ -2383,6 +2382,7 @@ static void wined3d_adapter_vk_init_d3d_info(struct wined3d_adapter_vk *adapter_
             && dynamic_state3->extendedDynamicState3ColorWriteMask;
     /* Rasterizer state needs EDS2, for rasterizer discard, and EDS1, for cull mode and front face. */
     vk_info->dynamic_rasterizer_state = dynamic_state3->extendedDynamicState3DepthClampEnable
+            && dynamic_state3->extendedDynamicState3PolygonMode
             && vk_info->dynamic_state2
             && adapter_vk->vk_info.supported[WINED3D_VK_EXT_EXTENDED_DYNAMIC_STATE];
 }

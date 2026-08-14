@@ -73,6 +73,20 @@ HRESULT WINAPI ConnectServerWmi(BSTR strNetworkResource, BSTR strUser, BSTR strP
     return hr;
 }
 
+HRESULT WINAPI CreateInstanceEnumWmi(BSTR strFilter, long lFlags, IWbemContext *pCtx,
+    IEnumWbemClassObject **ppEnum, DWORD authLevel, DWORD impLevel, IWbemServices *pCurrentNamespace,
+    BSTR strUser, BSTR strPassword, BSTR strAuthority)
+{
+    TRACE("%s %lx %p %p %p\n", debugstr_w(strFilter), lFlags, pCtx, ppEnum, pCurrentNamespace);
+
+    if (!ppEnum)
+        return E_POINTER;
+
+    *ppEnum = NULL;
+
+    return IWbemServices_CreateInstanceEnum(pCurrentNamespace, strFilter, lFlags, pCtx, ppEnum);
+}
+
 HRESULT WINAPI ExecQueryWmi(BSTR strQueryLanguage, BSTR strQuery, long lFlags, IWbemContext *pCtx,
     IEnumWbemClassObject **ppEnum, DWORD authLevel, DWORD impLevel, IWbemServices *pCurrentNamespace,
     BSTR strUser, BSTR strPassword, BSTR strAuthority)
@@ -87,6 +101,14 @@ HRESULT WINAPI ExecQueryWmi(BSTR strQueryLanguage, BSTR strQuery, long lFlags, I
     return IWbemServices_ExecQuery(pCurrentNamespace, strQueryLanguage, strQuery, lFlags, pCtx, ppEnum);
 }
 
+HRESULT WINAPI Get(int vFunc, IWbemClassObject *ptr, LPCWSTR wszName, LONG lFlags, VARIANT *pVal,
+    CIMTYPE *pvtType, LONG *plFlavor)
+{
+    TRACE("%i %p %s %lx %p %p %p\n", vFunc, ptr, debugstr_w(wszName), lFlags, pVal, pvtType, plFlavor);
+
+    return IWbemClassObject_Get(ptr, wszName, lFlags, pVal, pvtType, plFlavor);
+}
+
 HRESULT WINAPI GetCurrentApartmentType(int vFunc, IComThreadingInfo *ptr, APTTYPE *aptType)
 {
     TRACE("%i %p %p\n", vFunc, ptr, aptType);
@@ -97,4 +119,77 @@ HRESULT WINAPI Initialize(BOOLEAN bAllowIManagementObjectQI)
 {
     TRACE("%i\n", bAllowIManagementObjectQI);
     return S_OK;
+}
+
+HRESULT WINAPI GetNames(int vFunc, IWbemClassObject *ptr, LPCWSTR wszQualifierName, LONG lFlags,
+    VARIANT *pQualifierVal, SAFEARRAY **pNames)
+{
+    TRACE("%i %p %s %lx %p %p\n", vFunc, ptr, debugstr_w(wszQualifierName), lFlags, pQualifierVal, pNames);
+
+    return IWbemClassObject_GetNames(ptr, wszQualifierName, lFlags, pQualifierVal, pNames);
+}
+
+HRESULT WINAPI BeginMethodEnumeration(int vFunc, IWbemClassObject *ptr, LONG lEnumFlags)
+{
+    TRACE("%i %p %lx\n", vFunc, ptr, lEnumFlags);
+
+    return IWbemClassObject_BeginMethodEnumeration(ptr, lEnumFlags);
+}
+
+HRESULT WINAPI NextMethod(int vFunc, IWbemClassObject *ptr, LONG lFlags, BSTR *pstrName,
+    IWbemClassObject **ppInSignature, IWbemClassObject **ppOutSignature)
+{
+    TRACE("%i %p, %lx, %p, %p, %p\n", vFunc, ptr, lFlags, pstrName, ppInSignature, ppOutSignature);
+
+    return IWbemClassObject_NextMethod(ptr, lFlags, pstrName, ppInSignature, ppOutSignature);
+}
+
+HRESULT WINAPI EndMethodEnumeration(int vFunc, IWbemClassObject *ptr)
+{
+    TRACE("%i %p\n", vFunc, ptr);
+
+    return IWbemClassObject_EndMethodEnumeration(ptr);
+}
+
+HRESULT WINAPI GetMethod(int vFunc, IWbemClassObject *ptr, LPCWSTR wszName, LONG lFlags,
+    IWbemClassObject **ppInSignature, IWbemClassObject **ppOutSignature)
+{
+	TRACE("%i %p %s %lx %p %p\n", vFunc, ptr, debugstr_w(wszName), lFlags, ppInSignature, ppOutSignature);
+
+	return IWbemClassObject_GetMethod(ptr, wszName, lFlags, ppInSignature, ppOutSignature);
+}
+
+HRESULT WINAPI GetMethodQualifierSet(int vFunc, IWbemClassObject *ptr, LPCWSTR wszMethod, IWbemQualifierSet **ppQualSet)
+{
+    TRACE("%i %p %s %p\n", vFunc, ptr, debugstr_w(wszMethod), ppQualSet);
+
+    return IWbemClassObject_GetMethodQualifierSet(ptr, wszMethod, ppQualSet);
+}
+
+HRESULT WINAPI QualifierSet_Get(int vFunc, IWbemQualifierSet* ptr, LPCWSTR wszName, LONG lFlags, VARIANT *pVal, LONG *plFlavor)
+{
+    TRACE("%i %p %s %lx %p %p\n", vFunc, ptr, debugstr_w(wszName), lFlags, pVal, plFlavor);
+
+    return IWbemQualifierSet_Get(ptr, wszName, lFlags, pVal, plFlavor);
+}
+
+HRESULT WINAPI GetPropertyQualifierSet(int vFunc, IWbemClassObject *ptr, LPCWSTR wszProperty, IWbemQualifierSet **ppQualSet)
+{
+    TRACE("%i %p %s %p\n", vFunc, ptr, debugstr_w(wszProperty), ppQualSet);
+
+    return IWbemClassObject_GetPropertyQualifierSet(ptr, wszProperty, ppQualSet);
+}
+
+IErrorInfo* WINAPI wminet_utils_GetErrorInfo(void)
+{
+    IErrorInfo *error_info = NULL;
+    HRESULT hr;
+
+    hr = GetErrorInfo(0, &error_info);
+    TRACE("returning %p, hr %#lx\n", error_info, hr);
+
+    if (FAILED(hr))
+        return NULL;
+
+    return error_info;
 }

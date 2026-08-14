@@ -1143,7 +1143,8 @@ static HRESULT WINAPI ddraw7_SetDisplayMode(IDirectDraw7 *iface, DWORD width, DW
             DDSURFACEDESC2 *surface_desc = &ddraw->primary->surface_desc;
 
             if (FAILED(hr = wined3d_swapchain_resize_buffers(ddraw->wined3d_swapchain, 0,
-                    surface_desc->dwWidth, surface_desc->dwHeight, mode.format_id, WINED3D_MULTISAMPLE_NONE, 0)))
+                    surface_desc->dwWidth, surface_desc->dwHeight, mode.format_id,
+                    WINED3D_MULTISAMPLE_NONE, 0, 0)))
                 ERR("Failed to resize buffers, hr %#lx.\n", hr);
             else
                 ddrawformat_from_wined3dformat(&ddraw->primary->surface_desc.ddpfPixelFormat, mode.format_id);
@@ -1594,9 +1595,8 @@ static HRESULT WINAPI ddraw7_GetCaps(IDirectDraw7 *iface, DDCAPS *DriverCaps, DD
         if (TRACE_ON(ddraw))
         {
             TRACE("Driver Caps :\n");
-            DDRAW_dump_DDCAPS(DriverCaps);
+            DDRAW_dump_DDCAPS(&caps);
         }
-
     }
     if(HELCaps)
     {
@@ -1604,7 +1604,7 @@ static HRESULT WINAPI ddraw7_GetCaps(IDirectDraw7 *iface, DDCAPS *DriverCaps, DD
         if (TRACE_ON(ddraw))
         {
             TRACE("HEL Caps :\n");
-            DDRAW_dump_DDCAPS(HELCaps);
+            DDRAW_dump_DDCAPS(&caps);
         }
     }
 

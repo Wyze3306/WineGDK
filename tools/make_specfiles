@@ -130,6 +130,7 @@ my @dll_groups =
   "bcrypt",
   "ncrypt",
   "cng.sys",
+  "ksecdd.sys",
  ],
  [
   "ntoskrnl.exe",
@@ -146,6 +147,11 @@ my @dll_groups =
  [
   "shell32",
   "windows.storage",
+ ],
+ [
+  "icu",
+  "icuin",
+  "icuuc",
  ],
 );
 

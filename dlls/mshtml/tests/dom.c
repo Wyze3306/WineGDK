@@ -2096,6 +2096,32 @@ static void _test_textarea_type(unsigned line, IUnknown *unk)
     SysFreeString(type);
 }
 
+#define test_textarea_disabled(t,v) _test_textarea_disabled(__LINE__,t,v)
+static void _test_textarea_disabled(unsigned line, IUnknown *unk, VARIANT_BOOL ex)
+{
+    IHTMLTextAreaElement *textarea = _get_textarea_iface(line, unk);
+    VARIANT_BOOL b = 0x100;
+    HRESULT hres;
+
+    hres = IHTMLTextAreaElement_get_disabled(textarea, &b);
+    IHTMLTextAreaElement_Release(textarea);
+    ok_(__FILE__,line)(hres == S_OK, "get_disabled failed: %08lx\n", hres);
+    ok_(__FILE__,line)(b == ex, "disabled = %x, expected %x\n", b, ex);
+}
+
+#define test_textarea_put_disabled(t,v) _test_textarea_put_disabled(__LINE__,t,v)
+static void _test_textarea_put_disabled(unsigned line, IUnknown *unk, VARIANT_BOOL b)
+{
+    IHTMLTextAreaElement *textarea = _get_textarea_iface(line, unk);
+    HRESULT hres;
+
+    hres = IHTMLTextAreaElement_put_disabled(textarea, b);
+    IHTMLTextAreaElement_Release(textarea);
+    ok_(__FILE__,line)(hres == S_OK, "put_disabled failed: %08lx\n", hres);
+
+    _test_textarea_disabled(line, unk, b);
+}
+
 #define get_textarea_form(t) _get_textarea_form(__LINE__,t)
 static IHTMLFormElement *_get_textarea_form(unsigned line, IUnknown *unk)
 {
@@ -11040,6 +11066,7 @@ static void test_attr(IHTMLDocument2 *doc, IHTMLElement *elem)
     test_attr_specified(attr, VARIANT_FALSE);
     test_attr_expando(attr, VARIANT_FALSE);
     test_attr_node(attr, doc);
+    IHTMLDOMAttribute_Release(attr);
 
     for(i = 0; i < ARRAY_SIZE(elem_attr_props); i++) {
         BOOL has_attr = elem_has_attr((IUnknown*)elem, elem_attr_props[i]);
@@ -11379,6 +11406,9 @@ static void test_textarea_element(IHTMLDocument2 *doc, IHTMLElement *parent)
     test_textarea_put_readonly((IUnknown*)elem, VARIANT_TRUE);
     test_textarea_put_readonly((IUnknown*)elem, VARIANT_FALSE);
     test_textarea_type((IUnknown*)elem);
+    test_textarea_disabled((IUnknown*)elem, VARIANT_FALSE);
+    test_textarea_put_disabled((IUnknown*)elem, VARIANT_TRUE);
+    test_textarea_put_disabled((IUnknown*)elem, VARIANT_FALSE);
 
     form = get_textarea_form((IUnknown*)elem);
     ok(!form, "form = %p\n", form);
@@ -11735,9 +11765,9 @@ static void test_method_vs_getter(IHTMLDocument2 *doc)
 {
     DISPPARAMS dp = { 0 };
     IDispatchEx *dispex;
+    VARIANT v, arg;
     DISPID dispid;
     HRESULT hres;
-    VARIANT v;
     BSTR bstr;
 
     hres = IHTMLDocument2_QueryInterface(doc, &IID_IDispatchEx, (void**)&dispex);
@@ -11785,6 +11815,15 @@ static void test_method_vs_getter(IHTMLDocument2 *doc)
     }
     VariantClear(&v);
 
+    dp.cArgs = 1;
+    dp.rgvarg = &arg;
+    V_VT(&arg) = VT_I4;
+    V_I4(&arg) = 42;
+    hres = IDispatchEx_InvokeEx(dispex, dispid, LOCALE_NEUTRAL, DISPATCH_METHOD | DISPATCH_PROPERTYGET, &dp, &v, NULL, NULL);
+    ok(hres == S_OK, "InvokeEx failed: %08lx\n", hres);
+    ok(V_VT(&v) == VT_EMPTY, "V_VT = %d\n", V_VT(&v));
+
+    dp.cArgs = 0;
     hres = IDispatchEx_InvokeEx(dispex, dispid, LOCALE_NEUTRAL, DISPATCH_PROPERTYGET, &dp, &v, NULL, NULL);
     ok(hres == S_OK, "InvokeEx failed: %08lx\n", hres);
     ok(V_VT(&v) == VT_DISPATCH, "V_VT = %d\n", V_VT(&v));
@@ -13553,6 +13592,7 @@ static void test_attribute_node_across_modes(void)
     IDispatchEx *dispex, *dispex_ie9;
     IHTMLDocument2 *doc, *doc_ie9;
     IHTMLElement *elem, *elem_ie9;
+    IOleDocumentView *doc_view;
     IPersistStreamInit *init;
     DISPPARAMS dp = { 0 };
     IHTMLDocument6 *doc6;
@@ -13590,6 +13630,8 @@ static void test_attribute_node_across_modes(void)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    doc_view = view;
+    view = NULL;
 
     notif_doc = doc_ie9 = create_document();
     if(!doc_ie9) {
@@ -13789,6 +13831,8 @@ end:
 
     set_client_site(doc_ie9, FALSE);
     IHTMLDocument2_Release(doc_ie9);
+
+    view = doc_view;
     set_client_site(doc, FALSE);
     IHTMLDocument2_Release(doc);
 }

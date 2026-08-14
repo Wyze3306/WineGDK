@@ -369,12 +369,12 @@ static DWORD MemStore_release(WINECRYPT_CERTSTORE *cert_store, DWORD flags)
     WINE_MEMSTORE *store = (WINE_MEMSTORE*)cert_store;
     LONG ref;
 
-    if(flags & ~CERT_CLOSE_STORE_CHECK_FLAG)
+    if(flags & ~(CERT_CLOSE_STORE_CHECK_FLAG | CERT_CLOSE_STORE_FORCE_FLAG))
         FIXME("Unimplemented flags %lx\n", flags);
 
     ref = InterlockedDecrement(&store->hdr.ref);
     TRACE("(%p) ref=%ld\n", store, ref);
-    if(ref)
+    if(ref && !(flags & CERT_CLOSE_STORE_FORCE_FLAG))
         return (flags & CERT_CLOSE_STORE_CHECK_FLAG) ? CRYPT_E_PENDING_CLOSE : ERROR_SUCCESS;
 
     free_contexts(&store->certs);
@@ -948,7 +948,7 @@ HCERTSTORE WINAPI CertOpenSystemStoreA(HCRYPTPROV_LEGACY hProv,
         return 0;
     }
     return CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, hProv,
-     CERT_SYSTEM_STORE_CURRENT_USER, szSubSystemProtocol);
+     CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_NO_CRYPT_RELEASE_FLAG, szSubSystemProtocol);
 }
 
 HCERTSTORE WINAPI CertOpenSystemStoreW(HCRYPTPROV_LEGACY hProv,
@@ -960,7 +960,7 @@ HCERTSTORE WINAPI CertOpenSystemStoreW(HCRYPTPROV_LEGACY hProv,
         return 0;
     }
     return CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, hProv,
-     CERT_SYSTEM_STORE_CURRENT_USER, szSubSystemProtocol);
+     CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_NO_CRYPT_RELEASE_FLAG, szSubSystemProtocol);
 }
 
 PCCERT_CONTEXT WINAPI CertEnumCertificatesInStore(HCERTSTORE hCertStore, PCCERT_CONTEXT pPrev)

@@ -119,6 +119,7 @@ static void test_irp_struct(IRP *irp, DEVICE_OBJECT *device)
        "IRP thread is not the current thread\n");
 
     ok(IoGetRequestorProcess(irp) == IoGetCurrentProcess(), "processes didn't match\n");
+    ok(IoGetRequestorProcessId(irp) == (ULONG_PTR)PsGetCurrentProcessId(), "process id didn't match\n");
 
     irp = IoAllocateIrp(1, FALSE);
     ok(irp->AllocationFlags == IRP_ALLOCATED_FIXED_SIZE, "Got unexpected irp->AllocationFlags %#x.\n",
@@ -1855,17 +1856,27 @@ static void test_completion(void)
 static void test_IoAttachDeviceToDeviceStack(void)
 {
     DEVICE_OBJECT *dev1, *dev2, *dev3, *ret;
+    DEVOBJ_EXTENSION *ext1, *ext2, *ext3;
     NTSTATUS status;
 
     status = IoCreateDevice(driver_obj, 0, NULL, FILE_DEVICE_UNKNOWN,
             FILE_DEVICE_SECURE_OPEN, FALSE, &dev1);
     ok(status == STATUS_SUCCESS, "IoCreateDevice failed\n");
+    ok(!!dev1->DeviceObjectExtension, "Got NULL DeviceObjectExtension.\n");
+    ext1 = dev1->DeviceObjectExtension;
     status = IoCreateDevice(driver_obj, 0, NULL, FILE_DEVICE_UNKNOWN,
             FILE_DEVICE_SECURE_OPEN, FALSE, &dev2);
     ok(status == STATUS_SUCCESS, "IoCreateDevice failed\n");
+    ok(!!dev2->DeviceObjectExtension, "Got NULL DeviceObjectExtension.\n");
+    ext2 = dev2->DeviceObjectExtension;
     status = IoCreateDevice(driver_obj, 0, NULL, FILE_DEVICE_UNKNOWN,
             FILE_DEVICE_SECURE_OPEN, FALSE, &dev3);
     ok(status == STATUS_SUCCESS, "IoCreateDevice failed\n");
+    ok(!!dev3->DeviceObjectExtension, "Got NULL DeviceObjectExtension.\n");
+    ext3 = dev3->DeviceObjectExtension;
+    ok(!ext1->AttachedTo, "Unexpected AttachedTo %p.\n", ext1->AttachedTo);
+    ok(!ext2->AttachedTo, "Unexpected AttachedTo %p.\n", ext2->AttachedTo);
+    ok(!ext3->AttachedTo, "Unexpected AttachedTo %p.\n", ext3->AttachedTo);
 
     /* TODO: initialize devices properly */
     dev1->Flags &= ~DO_DEVICE_INITIALIZING;
@@ -1875,7 +1886,9 @@ static void test_IoAttachDeviceToDeviceStack(void)
     ok(ret == dev1, "IoAttachDeviceToDeviceStack returned %p, expected %p\n", ret, dev1);
     ok(dev1->AttachedDevice == dev2, "dev1->AttachedDevice = %p, expected %p\n",
             dev1->AttachedDevice, dev2);
+    ok(!ext1->AttachedTo, "Unexpected AttachedTo %p.\n", ext1->AttachedTo);
     ok(!dev2->AttachedDevice, "dev2->AttachedDevice = %p\n", dev2->AttachedDevice);
+    ok(ext2->AttachedTo == dev1, "Unexpected AttachedTo %p.\n", ext2->AttachedTo);
     ok(dev1->StackSize == 1, "dev1->StackSize = %d\n", dev1->StackSize);
     ok(dev2->StackSize == 2, "dev2->StackSize = %d\n", dev2->StackSize);
 
@@ -1883,9 +1896,12 @@ static void test_IoAttachDeviceToDeviceStack(void)
     ok(ret == dev2, "IoAttachDeviceToDeviceStack returned %p, expected %p\n", ret, dev2);
     ok(dev1->AttachedDevice == dev2, "dev1->AttachedDevice = %p, expected %p\n",
             dev1->AttachedDevice, dev2);
+    ok(!ext1->AttachedTo, "Unexpected AttachedTo %p.\n", ext1->AttachedTo);
     ok(dev2->AttachedDevice == dev3, "dev2->AttachedDevice = %p, expected %p\n",
             dev2->AttachedDevice, dev3);
+    ok(ext2->AttachedTo == dev1, "Unexpected AttachedTo %p.\n", ext2->AttachedTo);
     ok(!dev3->AttachedDevice, "dev3->AttachedDevice = %p\n", dev3->AttachedDevice);
+    ok(ext3->AttachedTo == dev2, "Unexpected AttachedTo %p.\n", ext3->AttachedTo);
     ok(dev1->StackSize == 1, "dev1->StackSize = %d\n", dev1->StackSize);
     ok(dev2->StackSize == 2, "dev2->StackSize = %d\n", dev2->StackSize);
     ok(dev3->StackSize == 3, "dev3->StackSize = %d\n", dev3->StackSize);
@@ -1893,9 +1909,11 @@ static void test_IoAttachDeviceToDeviceStack(void)
     IoDetachDevice(dev1);
     ok(!dev1->AttachedDevice, "dev1->AttachedDevice = %p\n", dev1->AttachedDevice);
     ok(dev2->AttachedDevice == dev3, "dev2->AttachedDevice = %p\n", dev2->AttachedDevice);
+    ok(!ext2->AttachedTo, "Unexpected AttachedTo %p.\n", ext2->AttachedTo);
 
     IoDetachDevice(dev2);
     ok(!dev2->AttachedDevice, "dev2->AttachedDevice = %p\n", dev2->AttachedDevice);
+    ok(!ext3->AttachedTo, "Unexpected AttachedTo %p.\n", ext3->AttachedTo);
     ok(dev1->StackSize == 1, "dev1->StackSize = %d\n", dev1->StackSize);
     ok(dev2->StackSize == 2, "dev2->StackSize = %d\n", dev2->StackSize);
     ok(dev3->StackSize == 3, "dev3->StackSize = %d\n", dev3->StackSize);
@@ -1979,6 +1997,105 @@ static void test_object_name(void)
     ok(ret_size == sizeof(*name), "got size %lu\n", ret_size);
     ok(!name->Name.Length, "got length %u\n", name->Name.Length);
     ok(!name->Name.MaximumLength, "got maximum length %u\n", name->Name.MaximumLength);
+}
+
+static void test_dir_kernel_object(void)
+{
+    OBJECT_ATTRIBUTES attr = { sizeof(attr) };
+    UNICODE_STRING pathU;
+    IO_STATUS_BLOCK io;
+    FILE_OBJECT *file_obj;
+    HANDLE dir_handle, handle;
+    NTSTATUS status;
+
+    RtlInitUnicodeString(&pathU, L"\\??\\C:\\windows");
+    InitializeObjectAttributes(&attr, &pathU, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    status = ZwOpenFile(&dir_handle, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attr, &io,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    ok(!status, "ZwOpenFile failed: %#lx\n", status);
+    if (status)
+        return;
+
+    status = ObReferenceObjectByHandle(dir_handle, 0, *pIoFileObjectType, KernelMode,
+                                       (void **)&file_obj, NULL);
+    ok(!status, "ObReferenceObjectByHandle failed: %#lx\n", status);
+    if (!status)
+    {
+        status = ObOpenObjectByPointer(file_obj, OBJ_KERNEL_HANDLE, NULL, 0,
+                                       *pIoFileObjectType, KernelMode, &handle);
+        ok(!status, "ObOpenObjectByPointer failed: %#lx\n", status);
+        if (!status)
+            ZwClose(handle);
+        ObDereferenceObject(file_obj);
+    }
+
+    ZwClose(dir_handle);
+}
+
+static void test_fsrtl_get_file_size(void)
+{
+    static const char data[] = "hello, world!";
+    OBJECT_ATTRIBUTES attr = { sizeof(attr) };
+    UNICODE_STRING pathU;
+    IO_STATUS_BLOCK io;
+    LARGE_INTEGER file_size, offset;
+    HANDLE file_handle, dir_handle;
+    FILE_OBJECT *file_obj, *dir_obj;
+    NTSTATUS status;
+
+    /* test regular file */
+    RtlInitUnicodeString(&pathU, L"\\??\\C:\\windows\\winetest_ntoskrnl_fsrtl.tmp");
+    InitializeObjectAttributes(&attr, &pathU, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    status = ZwCreateFile(&file_handle, DELETE | FILE_WRITE_DATA | SYNCHRONIZE, &attr, &io, NULL,
+                          FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          FILE_CREATE, FILE_DELETE_ON_CLOSE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    ok(!status, "ZwCreateFile failed: %#lx\n", status);
+    if (status)
+        return;
+
+    offset.QuadPart = 0;
+    status = ZwWriteFile(file_handle, NULL, NULL, NULL, &io, (void *)data, sizeof(data), &offset, NULL);
+    ok(!status, "ZwWriteFile failed: %#lx\n", status);
+
+    status = ObReferenceObjectByHandle(file_handle, 0, *pIoFileObjectType, KernelMode,
+                                       (void **)&file_obj, NULL);
+    ok(!status, "ObReferenceObjectByHandle failed: %#lx\n", status);
+    if (!status)
+    {
+        file_size.QuadPart = 0;
+        status = FsRtlGetFileSize(file_obj, &file_size);
+        ok(!status, "FsRtlGetFileSize failed: %#lx\n", status);
+        ok(file_size.QuadPart == sizeof(data), "expected %Iu, got %I64d\n",
+           sizeof(data), file_size.QuadPart);
+        ObDereferenceObject(file_obj);
+    }
+
+    ZwClose(file_handle);
+
+    /* test directory returns STATUS_FILE_IS_A_DIRECTORY */
+    RtlInitUnicodeString(&pathU, L"\\??\\C:\\windows");
+    InitializeObjectAttributes(&attr, &pathU, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    status = ZwOpenFile(&dir_handle, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attr, &io,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    ok(!status, "ZwOpenFile failed: %#lx\n", status);
+    if (status)
+        return;
+
+    status = ObReferenceObjectByHandle(dir_handle, 0, *pIoFileObjectType, KernelMode,
+                                       (void **)&dir_obj, NULL);
+    ok(!status, "ObReferenceObjectByHandle failed: %#lx\n", status);
+    if (!status)
+    {
+        file_size.QuadPart = 0;
+        status = FsRtlGetFileSize(dir_obj, &file_size);
+        ok(status == STATUS_FILE_IS_A_DIRECTORY,
+           "expected STATUS_FILE_IS_A_DIRECTORY, got %#lx\n", status);
+        ObDereferenceObject(dir_obj);
+    }
+
+    ZwClose(dir_handle);
 }
 
 static PIO_WORKITEM work_item;
@@ -2523,6 +2640,8 @@ static NTSTATUS main_test(DEVICE_OBJECT *device, IRP *irp, IO_STACK_LOCATION *st
     test_lookup_thread();
     test_IoAttachDeviceToDeviceStack();
     test_object_name();
+    test_dir_kernel_object();
+    test_fsrtl_get_file_size();
 #if defined(__i386__) || defined(__x86_64__)
     test_executable_pool();
 #endif

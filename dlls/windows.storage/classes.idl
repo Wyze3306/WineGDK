@@ -30,8 +30,15 @@ import "windows.system.idl";
 import "windows.storage.idl";
 import "microsoft.windows.storage.pickers.idl";
 
-namespace Windows.Storage.Streams {
+namespace Windows.Storage.Streams 
+{
     runtimeclass RandomAccessStreamReference;
+    runtimeclass InMemoryRandomAccessStream;
+}
+
+namespace Windows.Storage
+{
+    runtimeclass StorageFolder;
 }
 
 namespace Microsoft.Windows.Storage.Pickers

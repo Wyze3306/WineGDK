@@ -1843,7 +1843,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
 
         memcpy(&parameters, layer_parameters, sizeof(*layer_parameters));
         parameters.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
-        d2d_command_list_push_layer(context->target.command_list, context, &parameters, layer);
+        d2d_command_list_push_layer(context->target.command_list, context, &parameters);
     }
 }
 
@@ -1866,7 +1866,7 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_Flush(ID2D1DeviceContext6 *i
     if (context->ops && context->ops->device_context_present)
         context->ops->device_context_present(context->outer_unknown);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_SaveDrawingState(ID2D1DeviceContext6 *iface,
@@ -2801,7 +2801,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
     FIXME("iface %p, layer_parameters %p, layer %p stub!\n", iface, layer_parameters, layer);
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
-        d2d_command_list_push_layer(context->target.command_list, context, layer_parameters, layer);
+        d2d_command_list_push_layer(context->target.command_list, context, layer_parameters);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_device_context_InvalidateEffectInputRectangle(ID2D1DeviceContext6 *iface,
@@ -3037,9 +3037,19 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateTransformedImageSource
 static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateSpriteBatch(ID2D1DeviceContext6 *iface,
         ID2D1SpriteBatch **sprite_batch)
 {
-    FIXME("iface %p, sprite_batch %p stub!\n", iface, sprite_batch);
+    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    struct d2d_sprite_batch *object;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, sprite_batch %p.\n", iface, sprite_batch);
+
+    if (!sprite_batch)
+        return E_INVALIDARG;
+
+    if (SUCCEEDED(hr = d2d_sprite_batch_create(context->factory, &object)))
+        *sprite_batch = &object->ID2D1SpriteBatch_iface;
+
+    return hr;
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_DrawSpriteBatch(ID2D1DeviceContext6 *iface,
