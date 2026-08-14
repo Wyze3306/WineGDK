@@ -19,32 +19,20 @@
 #ifndef __WINE_XASYNC_H
 #define __WINE_XASYNC_H
 
-#include <xtaskqueue.h>
+#include "xtaskqueue.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+struct XAsyncBlock;
 
-typedef struct XAsyncBlock XAsyncBlock;
+typedef void CALLBACK XAsyncCompletionRoutine(_Inout_ struct XAsyncBlock* asyncBlock);
 
-typedef void    __stdcall XAsyncCompletionRoutine( XAsyncBlock *asyncBlock );
-typedef HRESULT __stdcall XAsyncWork( XAsyncBlock *asyncBlock );
+typedef HRESULT CALLBACK XAsyncWork(_Inout_ struct XAsyncBlock* asyncBlock);
 
-struct XAsyncBlock
+typedef struct XAsyncBlock
 {
     XTaskQueueHandle queue;
-    void *context;
-    XAsyncCompletionRoutine *callback;
-    void *internal[4];
-};
-
-HRESULT __stdcall XAsyncGetStatus( XAsyncBlock *asyncBlock, BOOLEAN wait );
-HRESULT __stdcall XAsyncGetResultSize( XAsyncBlock *asyncBlock, SIZE_T *bufferSize );
-void __stdcall XAsyncCancel( XAsyncBlock *asyncBlock );
-HRESULT __stdcall XAsyncRun( XAsyncBlock *asyncBlock, XAsyncWork *work );
-
-#ifdef __cplusplus
-}
-#endif
+    void* context;
+    XAsyncCompletionRoutine* callback;
+    unsigned char internal[sizeof(void*) * 4];
+} XAsyncBlock;
 
 #endif
