@@ -35,7 +35,8 @@ struct token
 HRESULT RefreshOAuth( LPCSTR client_id, LPCSTR refresh_token, time_t *new_expiry, HSTRING *new_refresh_token, HSTRING *new_oauth_token );
 HRESULT RequestUserToken( HSTRING oauth_token, HSTRING *token, XUserLocalId *localId );
 HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUserAgeGroup *age_group, LPSTR gamertag, SIZE_T gamertag_size );
-HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_party, HSTRING *token );
+HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_party,
+                                         HSTRING *token, UINT64 *uhs );
 /* SISU single-call auth: takes the MSA OAuth token + the previously-issued
  * device token and asks sisu.xboxlive.com/authorize for an XSTS token
  * **bound to the Minecraft title** (via client_id 0000000048183522 which

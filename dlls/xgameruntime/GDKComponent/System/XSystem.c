@@ -34,8 +34,20 @@ static HRESULT WINAPI x_system_QueryInterface( IXSystemImpl *iface, REFIID iid, 
 
     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
 
+    if (!out) return E_POINTER;
+    *out = NULL;
+
+    /* One object, five interface revisions, one flattened vtable: answer them
+     * all. A title that asks for a revision this list forgets is handed
+     * E_NOINTERFACE and a null pointer, and Minecraft Preview does not check
+     * either -- it calls straight through the null, faulting at 0x68 while the
+     * loading screen is still up (issue #154). */
     if (IsEqualGUID( iid, &IID_IUnknown ) ||
-        IsEqualGUID( iid, &IID_IXSystemImpl ))
+        IsEqualGUID( iid, &IID_IXSystemImpl1 ) ||
+        IsEqualGUID( iid, &IID_IXSystemImpl2 ) ||
+        IsEqualGUID( iid, &IID_IXSystemImpl3 ) ||
+        IsEqualGUID( iid, &IID_IXSystemImpl ) ||
+        IsEqualGUID( iid, &IID_IXSystemImpl5 ))
     {
         *out = &impl->IXSystemImpl_iface;
         impl->IXSystemImpl_iface.lpVtbl->AddRef( *out );
@@ -43,7 +55,6 @@ static HRESULT WINAPI x_system_QueryInterface( IXSystemImpl *iface, REFIID iid, 
     }
 
     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
-    *out = NULL;
     return E_NOINTERFACE;
 }
 

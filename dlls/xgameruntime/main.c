@@ -408,6 +408,15 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
         if (store) { *out = store; return S_OK; }
     }
 
+    /* {bbfbdcc7} XGameEvent: what XGameEventWrite() queries, and the only
+     * road from the title to the achievements service. */
+    if ( runtimeClassId->Data1 == 0xbbfbdcc7 )
+    {
+        extern void *x_game_event_get(void);
+        void *events = x_game_event_get();
+        if (events) { *out = events; return S_OK; }
+    }
+
     /* {af406016} composite service broker */
     if ( runtimeClassId->Data1 == 0xaf406016 )
     {

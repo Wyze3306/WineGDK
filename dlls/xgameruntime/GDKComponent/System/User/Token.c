@@ -781,19 +781,53 @@ HRESULT RequestXstsToken( HSTRING user_token, HSTRING *token, UINT64 *xuid, XUse
     return hr;
 }
 
-HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_party, HSTRING *token )
+static HRESULT ParseDecimalUint64( LPCSTR text, UINT32 length, UINT64 *value )
+{
+    UINT64 parsed = 0;
+    UINT32 i;
+
+    if (!text || !value) return E_POINTER;
+    *value = 0;
+    if (!length) return E_FAIL;
+
+    for (i = 0; i < length; ++i)
+    {
+        UINT32 digit;
+
+        if (text[i] < '0' || text[i] > '9') return E_FAIL;
+        digit = text[i] - '0';
+        if (parsed > (~(UINT64)0 - digit) / 10) return E_FAIL;
+        parsed = parsed * 10 + digit;
+    }
+    if (!parsed) return E_FAIL;
+
+    *value = parsed;
+    return S_OK;
+}
+
+HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_party,
+                                         HSTRING *token, UINT64 *uhs )
 {
     LPCWSTR accept[] = {L"application/json", NULL};
+    IJsonObject *display_claims;
     UINT32 token_str_len;
     IJsonObject *object;
+    UINT32 uhs_str_len;
     LPSTR token_str;
+    IJsonArray *xui;
+    LPSTR uhs_str;
     LPSTR buffer;
     SIZE_T size;
+    HSTRING uhs_string;
     HRESULT hr;
     LPSTR data;
     SIZE_T data_len;
 
     TRACE( "requesting XSTS token for RP: %s\n", relying_party );
+
+    if (!token || !uhs) return E_POINTER;
+    *token = NULL;
+    *uhs = 0;
 
     if (FAILED( hr = HSTRINGToMultiByte( user_token, &token_str, &token_str_len ) ))
         return hr;
@@ -839,9 +873,42 @@ HRESULT RequestXstsTokenForRelyingParty( HSTRING user_token, LPCSTR relying_part
     free( buffer );
     if (FAILED( hr )) return hr;
 
-    hr = GetJsonStringValue( object, L"Token", token );
-    IJsonObject_Release( object );
+    if (FAILED( hr = GetJsonStringValue( object, L"Token", token ) ))
+    {
+        IJsonObject_Release( object );
+        return hr;
+    }
 
+    hr = GetJsonObjectValue( object, L"DisplayClaims", &display_claims );
+    IJsonObject_Release( object );
+    if (FAILED( hr )) goto failed;
+
+    hr = GetJsonArrayValue( display_claims, L"xui", &xui );
+    IJsonObject_Release( display_claims );
+    if (FAILED( hr )) goto failed;
+
+    hr = IJsonArray_GetObjectAt( xui, 0, &object );
+    IJsonArray_Release( xui );
+    if (FAILED( hr )) goto failed;
+
+    hr = GetJsonStringValue( object, L"uhs", &uhs_string );
+    IJsonObject_Release( object );
+    if (FAILED( hr )) goto failed;
+
+    hr = HSTRINGToMultiByte( uhs_string, &uhs_str, &uhs_str_len );
+    WindowsDeleteString( uhs_string );
+    if (FAILED( hr )) goto failed;
+
+    hr = ParseDecimalUint64( uhs_str, uhs_str_len, uhs );
+    free( uhs_str );
+    if (FAILED( hr )) goto failed;
+
+    return S_OK;
+
+failed:
+    WindowsDeleteString( *token );
+    *token = NULL;
+    *uhs = 0;
     return hr;
 }
 

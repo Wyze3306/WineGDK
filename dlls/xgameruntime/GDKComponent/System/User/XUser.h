@@ -50,6 +50,14 @@ struct x_user
     CHAR modern_gamertag_suffix[32];
     CHAR unique_modern_gamertag[160];
 
+    /* User-only XSTS token for the Windows Achievements service.  The
+     * launcher mints it without the Android SISU AppId and retains the
+     * matching user hash separately from the title-bound profile token. */
+    HSTRING achievements_token;
+    UINT64 achievements_uhs;
+    time_t achievements_expiry;
+    SRWLOCK achievements_lock;
+
     /* Canonical, space-separated privilege IDs from the XSTS ``prv`` claim.
      * Presence is tracked independently because old launcher caches carry no
      * claim and retain the permissive compatibility fallback, while an

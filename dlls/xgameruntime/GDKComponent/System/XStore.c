@@ -1,6 +1,6 @@
 /*
  * XStore composite stub for {0dd112ac-7c24-448c-b92b-3960fb5bd30c}
- * No Microsoft Store service backs it; queries report a store error.
+ * The game-license query is answered; the product catalog reports a store error.
  */
 
 #include "../../private.h"
@@ -35,32 +35,158 @@ static HRESULT WINAPI store_CreateContext( void *iface, void *user, void **conte
  *
  * There is no Microsoft Store service behind this composite: it exists so the
  * title finds an XStore object at all, and the reconstructed vtable is the only
- * description we have of its slots.  Both queries used to answer asynchronously
- * with fabricated success - a hard-coded license and, for the product catalog,
- * a zeroed buffer, which reaches the caller as S_OK plus a null query handle.
+ * description we have of its slots.
  *
- * Neither is safe.  A signed-in title reads that as "the store answered", marks
- * its offer repository loaded and then walks containers the enumeration was
- * supposed to fill, faulting on the first null one (bug #171).  The async form
- * is worse still: the block those calls receive carries a task queue handle
- * that belongs to neither this DLL's XTaskQueue nor the native GDK threading
- * sidecar, so the completion cannot be dispatched where the title expects it
- * and XAsyncBegin writes its bookkeeping into a block we cannot account for.
+ * The game-license query is not optional even so.  Minecraft asks for the
+ * license of the title itself, in WinGameCoreStore::_initializeLicenseAsync,
+ * before the rest of its store comes up, and a store error there is not the
+ * neutral answer it looks like: the title reads it as a transient fault, never
+ * finishes store startup and asks again, so the query repeats for as long as
+ * the session lasts and every screen waiting on the store reports an error.
  *
- * Answer with a store error instead.  It needs no queue, touches nothing the
- * title owns, and puts store code on a path it already has to handle. */
+ * The copy the launcher installed came from the Microsoft Store under the
+ * player's own account, so the license being asked after is one this title
+ * already holds.  Answer it the way the service would - a full, active,
+ * non-trial license with no expiry - on the caller's own async block and task
+ * queue, through the threading implementation QueryApiImpl hands out.  That is
+ * the route XUser's async calls already take.
+ *
+ * The associated-products query has no answer available: its result is an
+ * opaque product-query handle nothing here can produce.  Completing it with a
+ * zeroed one is exactly what an earlier stub did, and a signed-in title read
+ * that as a store that answered, marked its offer repository loaded and walked
+ * containers the enumeration never filled (issue #171).  It keeps reporting a
+ * store error, which store code already has to handle. */
+
+/* The buffer the title hands to XStoreQueryGameLicenseResult is 104 bytes:
+ * Minecraft copies exactly that much out of it - six 16-byte moves and a
+ * trailing qword - into its per-SKU license cache.  A SKU store id reads
+ * <StoreId>/<sku>, seventeen characters, which fixes skuStoreId at 18 bytes
+ * and leaves 64 for trialUniqueId.  The stub that used to fabricate a license
+ * assumed 64 for both, declared a 144-byte result and so overran the caller's
+ * frame by 40 bytes. */
+#define STORE_SKU_ID_SIZE          18
+#define STORE_TRIAL_UNIQUE_ID_SIZE 64
+
+struct store_game_license
+{
+    char skuStoreId[STORE_SKU_ID_SIZE];
+    BOOLEAN isActive;
+    BOOLEAN isTrialOwnedByThisUser;
+    BOOLEAN isDiscLicense;
+    BOOLEAN isTrial;
+    UINT32 trialTimeRemainingInSeconds;
+    char trialUniqueId[STORE_TRIAL_UNIQUE_ID_SIZE];
+    INT64 expirationDate;
+};
+
+C_ASSERT( sizeof(struct store_game_license) == 104 );
+C_ASSERT( FIELD_OFFSET(struct store_game_license, isActive) == 18 );
+C_ASSERT( FIELD_OFFSET(struct store_game_license, trialTimeRemainingInSeconds) == 24 );
+C_ASSERT( FIELD_OFFSET(struct store_game_license, trialUniqueId) == 28 );
+C_ASSERT( FIELD_OFFSET(struct store_game_license, expirationDate) == 96 );
+C_ASSERT( sizeof(winegdk_game_store_id) == STORE_SKU_ID_SIZE );
+
+static void store_fill_game_license( struct store_game_license *license )
+{
+    memset( license, 0, sizeof(*license) );
+
+    /* The identity MicrosoftGame.Config declares for this title, when it
+     * declares one; an absent store id leaves the field empty rather than
+     * naming a SKU that is not ours. */
+    if (SUCCEEDED( WineGDKLoadGameConfig() ))
+        memcpy( license->skuStoreId, winegdk_game_store_id,
+                sizeof(license->skuStoreId) );
+
+    license->isActive = TRUE;
+}
+
+static HRESULT CALLBACK store_license_provider( XAsyncOp operation,
+        const XAsyncProviderData *providerData )
+{
+    IXThreadingImpl *impl;
+    HRESULT result = S_OK;
+
+    TRACE( "operation %d, providerData %p\n", operation, providerData );
+
+    if (!providerData) return E_POINTER;
+    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
+                              (void **)&impl ) ))
+        return E_FAIL;
+
+    switch (operation)
+    {
+        case Begin:
+            result = IXThreadingImpl_XAsyncSchedule( impl, providerData->async, 0 );
+            break;
+
+        case DoWork:
+            IXThreadingImpl_XAsyncComplete( impl, providerData->async, S_OK,
+                                            sizeof(struct store_game_license) );
+            break;
+
+        case GetResult:
+            if (providerData->bufferSize < sizeof(struct store_game_license))
+                result = E_NOT_SUFFICIENT_BUFFER;
+            else store_fill_game_license( providerData->buffer );
+            break;
+
+        case Cleanup:
+        case Cancel:
+            break;
+    }
+
+    IXThreadingImpl_Release( impl );
+    return result;
+}
 
 static HRESULT WINAPI store_QueryGameLicenseAsync( void *iface, void *context, void *asyncBlock )
 {
+    IXThreadingImpl *impl;
+    HRESULT hr;
+
     TRACE( "iface %p, context %p, asyncBlock %p\n", iface, context, asyncBlock );
-    WARN( "no store service available, failing the game-license query\n" );
-    return E_GAMESTORE_NETWORK_ERROR;
+
+    if (!asyncBlock) return E_POINTER;
+    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
+                              (void **)&impl ) ))
+    {
+        WARN( "no threading implementation, failing the game-license query\n" );
+        return E_GAMESTORE_NETWORK_ERROR;
+    }
+
+    hr = IXThreadingImpl_XAsyncBegin( impl, asyncBlock, NULL,
+            store_QueryGameLicenseAsync, "XStoreQueryGameLicenseAsync",
+            store_license_provider );
+    IXThreadingImpl_Release( impl );
+    /* Every task queue the title owns is one the native implementation made,
+     * so this is the implementation that can dispatch the completion.  Say so
+     * out loud if it ever refuses one: the title reads the failure as a store
+     * outage and asks again for the rest of the session. */
+    if (FAILED( hr ))
+        WARN( "could not begin the game-license query, hr %#lx\n", hr );
+    else TRACE( "XAsyncBegin returned 0x%08lx\n", hr );
+    return hr;
 }
 
 static HRESULT WINAPI store_QueryGameLicenseResult( void *iface, void *asyncBlock, void *license )
 {
+    IXThreadingImpl *impl;
+    HRESULT hr;
+
     TRACE( "iface %p, asyncBlock %p, license %p\n", iface, asyncBlock, license );
-    return E_GAMESTORE_NETWORK_ERROR;
+
+    if (!asyncBlock || !license) return E_POINTER;
+    if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
+                              (void **)&impl ) ))
+        return E_GAMESTORE_NETWORK_ERROR;
+
+    hr = IXThreadingImpl_XAsyncGetResult( impl, asyncBlock,
+            store_QueryGameLicenseAsync, sizeof(struct store_game_license),
+            license, NULL );
+    IXThreadingImpl_Release( impl );
+    TRACE( "XAsyncGetResult returned 0x%08lx\n", hr );
+    return hr;
 }
 
 /* XStoreQueryAssociatedProductsAsync(this, storeContext, productKinds, maxItems, asyncBlock) */

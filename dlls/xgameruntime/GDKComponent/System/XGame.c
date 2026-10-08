@@ -31,6 +31,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
 UINT32 winegdk_game_title_id;
 char winegdk_game_msa_app_id[17];
+char winegdk_game_store_id[18];
 BOOLEAN winegdk_game_msa_full_trust;
 
 static INIT_ONCE game_config_once = INIT_ONCE_STATIC_INIT;
@@ -310,6 +311,7 @@ static BOOL text_equals( const char *text, SIZE_T length, const char *expected )
 static HRESULT parse_game_config( const char *contents )
 {
     char msa_app_id[17] = {0};
+    char store_id[18] = {0};
     const char *root, *root_open_end, *root_end, *value;
     UINT32 title_id = 0;
     BOOLEAN full_trust = FALSE;
@@ -337,6 +339,21 @@ static HRESULT parse_game_config( const char *contents )
         goto malformed;
     if (!!has_title != !!has_msa) goto malformed;
 
+    /* The Store identity is informational: XStore answers the title's own
+     * game-license query with it.  A missing or oversized one leaves the field
+     * empty instead of failing the identity the sign-in path depends on. */
+    found = get_element_text( root_open_end + 1, root_end, "<StoreId",
+                              "</StoreId>", &value, &length );
+    if (found < 0) goto malformed;
+    if (found && length < sizeof(store_id))
+    {
+        memcpy( store_id, value, length );
+        store_id[length] = 0;
+    }
+    else if (found)
+        WARN( "ignoring a StoreId of %llu characters.\n",
+              (unsigned long long)length );
+
     found = get_element_text( root_open_end + 1, root_end, "<MSAFullTrust",
                               "</MSAFullTrust>", &value, &length );
     if (found < 0) goto malformed;
@@ -353,6 +370,7 @@ static HRESULT parse_game_config( const char *contents )
     winegdk_game_title_id = title_id;
     memcpy( winegdk_game_msa_app_id, msa_app_id,
             sizeof(winegdk_game_msa_app_id) );
+    memcpy( winegdk_game_store_id, store_id, sizeof(winegdk_game_store_id) );
     winegdk_game_msa_full_trust = full_trust;
     return S_OK;
 

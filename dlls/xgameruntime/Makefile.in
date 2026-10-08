@@ -23,4 +23,5 @@ SOURCES = \
 	GDKComponent/System/User/XUser.c \
 	GDKComponent/System/User/DeviceAuth.c \
 	GDKComponent/System/XStore.c \
+	GDKComponent/System/XGameEvent.c \
 	GDKComponent/System/XServiceBroker.c
