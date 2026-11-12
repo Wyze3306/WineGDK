@@ -116,6 +116,50 @@ static time_t HSTRINGToEpoch( HSTRING value )
     return (time_t)seconds;
 }
 
+static BOOLEAN HSTRINGToUint64Strict( HSTRING value, UINT64 *result )
+{
+    const WCHAR *text;
+    UINT64 parsed = 0;
+    UINT32 length, i;
+
+    if (!value || !result) return FALSE;
+    *result = 0;
+    text = WindowsGetStringRawBuffer( value, &length );
+    if (!text || !length) return FALSE;
+
+    for (i = 0; i < length; ++i)
+    {
+        UINT32 digit;
+
+        if (text[i] < L'0' || text[i] > L'9') return FALSE;
+        digit = text[i] - L'0';
+        if (parsed > (~(UINT64)0 - digit) / 10) return FALSE;
+        parsed = parsed * 10 + digit;
+    }
+    if (!parsed) return FALSE;
+
+    *result = parsed;
+    return TRUE;
+}
+
+static BOOLEAN DuplicateCachedAchievementsToken( struct x_user *user,
+                                                  time_t now, HSTRING *token,
+                                                  UINT64 *uhs )
+{
+    HSTRING duplicate = NULL;
+
+    if (!user || !token || !uhs || now <= 0 ||
+        !user->achievements_token || !user->achievements_uhs ||
+        user->achievements_expiry <= now + 30 ||
+        FAILED( WindowsDuplicateString( user->achievements_token,
+                                        &duplicate ) ))
+        return FALSE;
+
+    *token = duplicate;
+    *uhs = user->achievements_uhs;
+    return TRUE;
+}
+
 static const struct IXUserImplVtbl x_user_vtbl;
 static const struct IXUserGamertagVtbl x_user_gt_vtbl;
 
@@ -184,6 +228,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
     impl->IXUserImpl_iface.lpVtbl = &x_user_vtbl;
     impl->IXUserGamertag_iface.lpVtbl = &x_user_gt_vtbl;
     impl->ref = 1;
+    InitializeSRWLock( &impl->achievements_lock );
 
     hr = RefreshOAuth( client_id, buffer, &impl->oauth_token_expiry, &impl->refresh_token, &impl->oauth_token );
     free( buffer );
@@ -230,7 +275,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                     IJsonObject *root = NULL;
                     if (SUCCEEDED( ParseJsonObject( buf, sz, &root ) ) && root)
                     {
-                        HSTRING utok = NULL, xtok = NULL, stok = NULL;
+                        HSTRING utok = NULL, xtok = NULL, stok = NULL, atok = NULL;
                         HSTRING gtg = NULL, mgt = NULL, mgs = NULL, umg = NULL;
                         HSTRING xuid_s = NULL, agg_s = NULL;
                         HSTRING privileges_s = NULL;
@@ -238,14 +283,17 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         HSTRING mptok = NULL, mp_uhs_s = NULL, mp_rp_s = NULL;
                         HSTRING realmstok = NULL, realms_uhs_s = NULL, realms_rp_s = NULL;
                         HSTRING lictok = NULL, lic_uhs_s = NULL, lic_rp_s = NULL;
+                        HSTRING achievements_uhs_s = NULL;
                         HSTRING user_expiry_s = NULL, xbl_expiry_s = NULL;
                         HSTRING sisu_expiry_s = NULL, mp_expiry_s = NULL;
                         HSTRING realms_expiry_s = NULL, lic_expiry_s = NULL;
+                        HSTRING achievements_expiry_s = NULL;
                         BOOLEAN privileges_present = FALSE;
                         HRESULT privileges_hr;
                         (void)GetJsonStringValue( root, L"user_token", &utok );
                         (void)GetJsonStringValue( root, L"xbl_token", &xtok );
                         (void)GetJsonStringValue( root, L"sisu_token", &stok );
+                        (void)GetJsonStringValue( root, L"achievements_token", &atok );
                         (void)GetJsonStringValue( root, L"xbl_gamertag", &gtg );
                         (void)GetJsonStringValue( root, L"xbl_modern_gamertag", &mgt );
                         (void)GetJsonStringValue( root, L"xbl_modern_gamertag_suffix", &mgs );
@@ -267,12 +315,15 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         (void)GetJsonStringValue( root, L"lic_token", &lictok );
                         (void)GetJsonStringValue( root, L"lic_uhs", &lic_uhs_s );
                         (void)GetJsonStringValue( root, L"lic_rp", &lic_rp_s );
+                        (void)GetJsonStringValue( root, L"achievements_uhs", &achievements_uhs_s );
                         (void)GetJsonStringValue( root, L"user_token_expiry_epoch", &user_expiry_s );
                         (void)GetJsonStringValue( root, L"xbl_token_expiry_epoch", &xbl_expiry_s );
                         (void)GetJsonStringValue( root, L"sisu_expiry_epoch", &sisu_expiry_s );
                         (void)GetJsonStringValue( root, L"mp_expiry_epoch", &mp_expiry_s );
                         (void)GetJsonStringValue( root, L"realms_expiry_epoch", &realms_expiry_s );
                         (void)GetJsonStringValue( root, L"lic_expiry_epoch", &lic_expiry_s );
+                        (void)GetJsonStringValue( root, L"achievements_expiry_epoch",
+                                                 &achievements_expiry_s );
                         if (utok && xtok && xuid_s)
                         {
                             LPSTR mb = NULL; UINT32 ml = 0;
@@ -324,6 +375,26 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                             if (uhs_s && SUCCEEDED( HSTRINGToMultiByte( uhs_s, &mb, &ml ) ) && mb)
                             { impl->local_id.value = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
                             else impl->local_id.value = impl->xuid;
+                            if (atok && WindowsGetStringLen( atok ) &&
+                                achievements_uhs_s)
+                            {
+                                UINT64 achievements_uhs;
+                                time_t achievements_expiry =
+                                    HSTRINGToEpoch( achievements_expiry_s );
+
+                                if (achievements_expiry &&
+                                    HSTRINGToUint64Strict(
+                                        achievements_uhs_s,
+                                        &achievements_uhs ) &&
+                                    SUCCEEDED( WindowsDuplicateString(
+                                        atok,
+                                        &impl->achievements_token ) ))
+                                {
+                                    impl->achievements_uhs = achievements_uhs;
+                                    impl->achievements_expiry =
+                                        achievements_expiry;
+                                }
+                            }
                             /* SISU cache for the PlayFab RP */
                             if (stok && sisu_uhs_s && sisu_rp_s)
                             {
@@ -370,6 +441,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         if (utok) WindowsDeleteString( utok );
                         if (xtok) WindowsDeleteString( xtok );
                         if (stok) WindowsDeleteString( stok );
+                        if (atok) WindowsDeleteString( atok );
                         if (gtg) WindowsDeleteString( gtg );
                         if (mgt) WindowsDeleteString( mgt );
                         if (mgs) WindowsDeleteString( mgs );
@@ -389,12 +461,16 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
                         if (lictok) WindowsDeleteString( lictok );
                         if (lic_uhs_s) WindowsDeleteString( lic_uhs_s );
                         if (lic_rp_s) WindowsDeleteString( lic_rp_s );
+                        if (achievements_uhs_s)
+                            WindowsDeleteString( achievements_uhs_s );
                         if (user_expiry_s) WindowsDeleteString( user_expiry_s );
                         if (xbl_expiry_s) WindowsDeleteString( xbl_expiry_s );
                         if (sisu_expiry_s) WindowsDeleteString( sisu_expiry_s );
                         if (mp_expiry_s) WindowsDeleteString( mp_expiry_s );
                         if (realms_expiry_s) WindowsDeleteString( realms_expiry_s );
                         if (lic_expiry_s) WindowsDeleteString( lic_expiry_s );
+                        if (achievements_expiry_s)
+                            WindowsDeleteString( achievements_expiry_s );
                         IJsonObject_Release( root );
                     }
                 }
@@ -489,6 +565,7 @@ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
         WindowsDeleteString( impl->oauth_token );
         WindowsDeleteString( impl->user_token );
         WindowsDeleteString( impl->xsts_token );
+        if (impl->achievements_token) WindowsDeleteString( impl->achievements_token );
         if (impl->xbl_privileges) WindowsDeleteString( impl->xbl_privileges );
         if (impl->sisu_token) WindowsDeleteString( impl->sisu_token );
         if (impl->mp_token) WindowsDeleteString( impl->mp_token );
@@ -1082,6 +1159,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
             LPCSTR rp = "http://xboxlive.com";
             UINT64 token_uhs;
             time_t now;
+            BOOLEAN achievements_request;
             BOOLEAN force_refresh = !!(context->options &
                                         XUserGetTokenAndSignatureOptions_ForceRefresh);
 
@@ -1096,6 +1174,8 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
              * Marketplace, PlayFab and external-server joins each need a
              * different XSTS audience). */
             rp = resolve_relying_party_for_url( url );
+            achievements_request =
+                url_host_matches( url, "achievements.xboxlive.com", FALSE );
 
             TRACE( "requesting token: method=%s, rp=%s, headers=%llu, body=%llu bytes\n",
                    context->method, rp, (unsigned long long)context->count,
@@ -1116,7 +1196,70 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
             token_uhs = user_impl->local_id.value;
             xsts_token = NULL;
 
-            if (DeviceAuth_IsInitialized() && user_impl->oauth_token)
+            if (achievements_request)
+            {
+                if (!force_refresh)
+                {
+                    AcquireSRWLockShared(
+                        &user_impl->achievements_lock );
+                    if (DuplicateCachedAchievementsToken(
+                            user_impl, time( NULL ), &xsts_token,
+                            &token_uhs ))
+                        dowork_hr = S_OK;
+                    ReleaseSRWLockShared(
+                        &user_impl->achievements_lock );
+                }
+                if (FAILED( dowork_hr ))
+                {
+                    HSTRING cached_token = NULL;
+
+                    AcquireSRWLockExclusive(
+                        &user_impl->achievements_lock );
+                    if (!force_refresh &&
+                        DuplicateCachedAchievementsToken(
+                            user_impl, time( NULL ), &xsts_token,
+                            &token_uhs ))
+                        dowork_hr = S_OK;
+                    else
+                    {
+                        dowork_hr = RequestXstsTokenForRelyingParty(
+                            user_impl->user_token, rp, &xsts_token,
+                            &token_uhs );
+                        if (SUCCEEDED( dowork_hr ))
+                        {
+                            dowork_hr = WindowsDuplicateString(
+                                xsts_token, &cached_token );
+                            if (SUCCEEDED( dowork_hr ))
+                            {
+                                HSTRING previous_token =
+                                    user_impl->achievements_token;
+
+                                user_impl->achievements_token =
+                                    cached_token;
+                                user_impl->achievements_uhs = token_uhs;
+                                now = time( NULL );
+                                /* The response remains opaque here; three
+                                 * hours is conservative for an XSTS token. */
+                                user_impl->achievements_expiry =
+                                    now > 0 ? now + 3 * 3600 : 0;
+                                if (previous_token)
+                                    WindowsDeleteString(
+                                        previous_token );
+                            }
+                            else
+                            {
+                                WindowsDeleteString( xsts_token );
+                                xsts_token = NULL;
+                            }
+                        }
+                    }
+                    ReleaseSRWLockExclusive(
+                        &user_impl->achievements_lock );
+                }
+                if (SUCCEEDED( dowork_hr ))
+                    TRACE( "using user-only XSTS for Xbox Achievements.\n" );
+            }
+            else if (DeviceAuth_IsInitialized() && user_impl->oauth_token)
             {
                 /* Preauth: when MC asks for the http://xboxlive.com RP
                  * (Friends/Social), serve the xbl_token the launcher
@@ -1272,8 +1415,9 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
                 }
             }
 
-            if (FAILED( dowork_hr ))
-                dowork_hr = RequestXstsTokenForRelyingParty( user_impl->user_token, rp, &xsts_token );
+            if (!achievements_request && FAILED( dowork_hr ))
+                dowork_hr = RequestXstsTokenForRelyingParty(
+                    user_impl->user_token, rp, &xsts_token, &token_uhs );
             if (FAILED( dowork_hr ))
             {
                 WARN( "XSTS token request for RP %s failed: 0x%08lx\n", rp, dowork_hr );
@@ -1895,6 +2039,7 @@ static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
         WindowsDeleteString( impl->oauth_token );
         WindowsDeleteString( impl->user_token );
         WindowsDeleteString( impl->xsts_token );
+        if (impl->achievements_token) WindowsDeleteString( impl->achievements_token );
         if (impl->xbl_privileges) WindowsDeleteString( impl->xbl_privileges );
         if (impl->sisu_token) WindowsDeleteString( impl->sisu_token );
         if (impl->mp_token) WindowsDeleteString( impl->mp_token );
