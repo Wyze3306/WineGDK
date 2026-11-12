@@ -2929,20 +2929,34 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
 {
     static RTL_DYNAMIC_TIME_ZONE_INFORMATION cached_tzi;
     static int current_year = -1, current_bias = 65535;
+    static time_t last_check = -1;
     struct tm *tm;
     char tz_name[16];
-    time_t year_start, year_end, tmp, dlt = 0, std = 0;
+    time_t now, year_start, year_end, tmp, dlt = 0, std = 0;
     int is_dst, bias;
 
     mutex_lock( &timezone_mutex );
 
-    year_start = time(NULL);
+    /* mktime() and localtime() each stat the zone file, and callers such as
+     * GetTimeZoneInformation() can come several times per frame: check for a
+     * new year or zone at most once a second, as SystemTimeOfDayInformation
+     * does for its bias. */
+    now = time(NULL);
+    if (now == last_check)
+    {
+        *tzi = cached_tzi;
+        mutex_unlock( &timezone_mutex );
+        return;
+    }
+
+    year_start = now;
     tm = gmtime(&year_start);
     bias = (LONG)(mktime(tm) - year_start) / 60;
 
     tm = localtime(&year_start);
     if (current_year == tm->tm_year && current_bias == bias)
     {
+        last_check = now;
         *tzi = cached_tzi;
         mutex_unlock( &timezone_mutex );
         return;
@@ -3037,6 +3051,7 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
 
     find_reg_tz_info(tzi, tz_name, current_year + 1900);
     cached_tzi = *tzi;
+    last_check = now;
     mutex_unlock( &timezone_mutex );
 }
 
