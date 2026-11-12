@@ -1009,37 +1009,71 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
 
 #elif defined(linux)
 
+/* The fields used below come in the first kilobyte of the file, well before
+ * the per-CPU lists that make its size vary. */
+#define PROC_STATUS_READ_SIZE 4096
+
+static LONG proc_self_status_fd = -1;
+
+static ULONG64 status_kib( const char *line, size_t len )
+{
+    return (ULONG64)strtoull( line + len, NULL, 10 ) * 1024;
+}
+
 void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
 {
-    FILE *f;
-    char line[256], path[26];
-    unsigned long value;
+    char buffer[PROC_STATUS_READ_SIZE], path[26], *line, *next;
+    ssize_t size = 0, ret;
+    int fd;
 
     if (unix_pid == -1)
-        strcpy( path, "/proc/self/status" );
-    else
-        snprintf( path, sizeof(path), "/proc/%u/status", unix_pid);
-    f = fopen( path, "r" );
-    if (!f) return;
-
-    while (fgets(line, sizeof(line), f))
     {
-        if (sscanf(line, "VmPeak: %lu", &value))
-            pvmi->PeakVirtualSize = (ULONG64)value * 1024;
-        else if (sscanf(line, "VmSize: %lu", &value))
-            pvmi->VirtualSize = (ULONG64)value * 1024;
-        else if (sscanf(line, "VmHWM: %lu", &value))
-            pvmi->PeakWorkingSetSize = (ULONG64)value * 1024;
-        else if (sscanf(line, "VmRSS: %lu", &value))
-            pvmi->WorkingSetSize = (ULONG64)value * 1024;
-        else if (sscanf(line, "RssAnon: %lu", &value))
-            pvmi->PagefileUsage += (ULONG64)value * 1024;
-        else if (sscanf(line, "VmSwap: %lu", &value))
-            pvmi->PagefileUsage += (ULONG64)value * 1024;
+        /* Games ask for their own counters every frame (GetProcessMemoryInfo),
+         * so keep the file open: rereading it from the start regenerates it,
+         * and costs one pread() instead of an open, reads and a close. */
+        if ((fd = proc_self_status_fd) == -1)
+        {
+            if ((fd = open( "/proc/self/status", O_RDONLY | O_CLOEXEC )) == -1) return;
+            if (InterlockedCompareExchange( &proc_self_status_fd, fd, -1 ) != -1)
+            {
+                close( fd );
+                fd = proc_self_status_fd;
+            }
+        }
+        while ((size = pread( fd, buffer, sizeof(buffer) - 1, 0 )) == -1 && errno == EINTR);
+        if (size <= 0) return;
+    }
+    else
+    {
+        snprintf( path, sizeof(path), "/proc/%u/status", unix_pid );
+        if ((fd = open( path, O_RDONLY | O_CLOEXEC )) == -1) return;
+        while (size < sizeof(buffer) - 1)
+        {
+            if ((ret = read( fd, buffer + size, sizeof(buffer) - 1 - size )) > 0) size += ret;
+            else if (!ret || errno != EINTR) break;
+        }
+        close( fd );
+        if (size <= 0) return;
+    }
+    buffer[size] = 0;
+
+    for (line = buffer; line && *line; line = next)
+    {
+        if ((next = strchr( line, '\n' ))) *next++ = 0;
+        if (!strncmp( line, "VmPeak:", 7 ))
+            pvmi->PeakVirtualSize = status_kib( line, 7 );
+        else if (!strncmp( line, "VmSize:", 7 ))
+            pvmi->VirtualSize = status_kib( line, 7 );
+        else if (!strncmp( line, "VmHWM:", 6 ))
+            pvmi->PeakWorkingSetSize = status_kib( line, 6 );
+        else if (!strncmp( line, "VmRSS:", 6 ))
+            pvmi->WorkingSetSize = status_kib( line, 6 );
+        else if (!strncmp( line, "RssAnon:", 8 ))
+            pvmi->PagefileUsage += status_kib( line, 8 );
+        else if (!strncmp( line, "VmSwap:", 7 ))
+            pvmi->PagefileUsage += status_kib( line, 7 );
     }
     pvmi->PeakPagefileUsage = pvmi->PagefileUsage;
-
-    fclose(f);
 }
 
 #elif defined(HAVE_LIBPROCSTAT)
