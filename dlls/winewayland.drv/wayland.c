@@ -32,6 +32,18 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
+/* wl_seat version 8 makes the compositor send wl_pointer.axis_value120, and
+ * the pointer listener only has a slot for that event when wayland-client is
+ * 1.21 or newer. Built against older headers, binding version 8 regardless
+ * hands the first turn of the mouse wheel to a NULL handler, and libwayland
+ * aborts the process on it. Version 7 still delivers the wheel, through
+ * wl_pointer.axis_discrete. */
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
+#define WAYLAND_SEAT_VERSION 8
+#else
+#define WAYLAND_SEAT_VERSION 7
+#endif
+
 struct wayland process_wayland =
 {
     .seat.mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -141,7 +153,8 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         }
         pthread_mutex_lock(&seat->mutex);
         seat->wl_seat = wl_registry_bind(registry, id, &wl_seat_interface,
-                                         version < 8 ? version : 8);
+                                         version < WAYLAND_SEAT_VERSION ?
+                                         version : WAYLAND_SEAT_VERSION);
         seat->global_id = id;
         wl_seat_add_listener(seat->wl_seat, &seat_listener, NULL);
         pthread_mutex_unlock(&seat->mutex);
