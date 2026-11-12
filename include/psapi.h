@@ -45,6 +45,21 @@ typedef struct _PROCESS_MEMORY_COUNTERS {
 } PROCESS_MEMORY_COUNTERS;
 typedef PROCESS_MEMORY_COUNTERS *PPROCESS_MEMORY_COUNTERS;
 
+typedef struct _PROCESS_MEMORY_COUNTERS_EX {
+  DWORD  cb;
+  DWORD  PageFaultCount;
+  SIZE_T PeakWorkingSetSize;
+  SIZE_T WorkingSetSize;
+  SIZE_T QuotaPeakPagedPoolUsage;
+  SIZE_T QuotaPagedPoolUsage;
+  SIZE_T QuotaPeakNonPagedPoolUsage;
+  SIZE_T QuotaNonPagedPoolUsage;
+  SIZE_T PagefileUsage;
+  SIZE_T PeakPagefileUsage;
+  SIZE_T PrivateUsage;
+} PROCESS_MEMORY_COUNTERS_EX;
+typedef PROCESS_MEMORY_COUNTERS_EX *PPROCESS_MEMORY_COUNTERS_EX;
+
 typedef union _PSAPI_WORKING_SET_EX_BLOCK {
     ULONG_PTR Flags;
     struct {

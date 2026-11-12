@@ -1715,7 +1715,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetProcessImageFileNameW( HANDLE process, WCHAR *
 BOOL WINAPI DECLSPEC_HOTPATCH GetProcessMemoryInfo( HANDLE process, PROCESS_MEMORY_COUNTERS *pmc,
                                                     DWORD count )
 {
-    VM_COUNTERS vmc;
+    VM_COUNTERS_EX vmc;
 
     if (count < sizeof(PROCESS_MEMORY_COUNTERS))
     {
@@ -1726,7 +1726,12 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetProcessMemoryInfo( HANDLE process, PROCESS_MEMO
     if (!set_ntstatus( NtQueryInformationProcess( process, ProcessVmCounters, &vmc, sizeof(vmc), NULL )))
         return FALSE;
 
-    pmc->cb = sizeof(PROCESS_MEMORY_COUNTERS);
+    if (count >= sizeof(PROCESS_MEMORY_COUNTERS_EX))
+    {
+        ((PROCESS_MEMORY_COUNTERS_EX *)pmc)->PrivateUsage = vmc.PrivateUsage;
+        pmc->cb = sizeof(PROCESS_MEMORY_COUNTERS_EX);
+    }
+    else pmc->cb = sizeof(PROCESS_MEMORY_COUNTERS);
     pmc->PageFaultCount = vmc.PageFaultCount;
     pmc->PeakWorkingSetSize = vmc.PeakWorkingSetSize;
     pmc->WorkingSetSize = vmc.WorkingSetSize;
