@@ -25,10 +25,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
 static BOOLEAN WINAPI GDKCIgnoreVersionMismatch( void )
 {
+    DWORD valueSize = sizeof(DWORD);
+    DWORD value = 0;
     LSTATUS result;
-    DWORD valueSize;
-    INT32 value;
 
+    /* RegGetValueW returns a Win32 error code, which FAILED() never sees as
+     * a failure, and it needs the size of the buffer it may write. */
     result = RegGetValueW( HKEY_LOCAL_MACHINE,
                            L"Software\\Microsoft\\GamingServices",
                            L"IgnoreVersionMismatch",
@@ -36,12 +38,8 @@ static BOOLEAN WINAPI GDKCIgnoreVersionMismatch( void )
                            NULL,
                            &value,
                            &valueSize );
-    
-    if ( FAILED( result ) ) return FALSE;
-    if ( value == 0 )
-        return FALSE;
-    else
-        return TRUE;
+
+    return result == ERROR_SUCCESS && value != 0;
 }
 
 HRESULT WINAPI GDKC_InitAPI( 
@@ -54,16 +52,17 @@ HRESULT WINAPI GDKC_InitAPI(
 
     TRACE("gdkVer %ld, gsVer %ld, mode %d, options %p\n", gdkVer, gsVer, mode, options);
 
-    if ( !GDKCIgnoreVersionMismatch() && ( gdkVer >= GDKC_VERSION && gsVer > GAMING_SERVICES_VERSION ) )
+    /* A title built against a newer Gaming Services still runs on this one:
+     * a call this runtime does not implement fails on its own, as every
+     * other unimplemented call does. Refusing the title here instead quits
+     * it before its window opens, with nothing on screen to say why, and
+     * there is no Gaming Services update to install. */
+    if ( gdkVer >= GDKC_VERSION && gsVer > GAMING_SERVICES_VERSION
+         && !GDKCIgnoreVersionMismatch() )
     {
-        ERR("GDKComponent version mismatch with the requested parameters!\n");
-        ERR("Target GDK Version: %ld, Current Version: %ld\n", gdkVer, GDKC_VERSION );
-        ERR("Target Gaming Services Version: %ld, Current Version: %ld\n", gsVer, GAMING_SERVICES_VERSION );
-
-        // Uncomment once MS Store Services has been implemented within Wine.
-        // ShellExecuteW( NULL, NULL, L"ms-windows-store://pdp?productId=9MWPM2CQNLHN", NULL, NULL, 1 );
-
-        return E_GAMERUNTIME_VERSION_MISMATCH;
+        WARN("title targets GDK %ld and Gaming Services %ld; this runtime is GDK %ld and "
+             "Gaming Services %ld, continuing\n",
+             gdkVer, gsVer, GDKC_VERSION, GAMING_SERVICES_VERSION );
     }
 
     /* INITIALIZE_OPTIONS is an opaque ABI-owned structure here.  Do not
