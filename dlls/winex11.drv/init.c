@@ -317,20 +317,12 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     UINT dpi = NtUserGetDpiForWindow( hwnd ); /* use window DPI here, DPI scaling is handled through offscreen presentation */
     HWND origin = hwnd, toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
     XWindowChanges changes = surface->changes;
-    struct x11drv_win_data *data;
     int mask = 0;
     RECT rect;
 
     if (NtUserGetPresentRect( hwnd, &rect, dpi )) OffsetRect( &rect, -rect.left, -rect.top );
     else if (!NtUserGetClientRect( hwnd, &rect, dpi )) return;
     else NtUserMapWindowPoints( origin, toplevel, (POINT *)&rect, 2, dpi );
-
-    if ((data = get_win_data( toplevel )))
-    {
-        OffsetRect( &rect, data->rects.client.left - data->rects.visible.left,
-                    data->rects.client.top - data->rects.visible.top );
-        release_win_data( data );
-    }
 
     changes.x = rect.left;
     changes.y = rect.top;
