@@ -34,6 +34,44 @@ static inline struct async_state *impl_from_IAsyncState( IAsyncState *iface )
     return CONTAINING_RECORD( iface, struct async_state, IAsyncState_iface );
 }
 
+/* The queue an async state runs on is either one of ours or one the native GDK
+ * threading sidecar owns; the two implementations cannot dispatch each other's
+ * handles, so every queue operation has to pick the matching one. */
+static HRESULT SubmitStateCallback( struct async_state *stateImpl, XTaskQueuePort port,
+        UINT32 delayInMs, PVOID context, XTaskQueueCallback *callback )
+{
+    IXThreadingImpl *native;
+
+    if ( !stateImpl->queueIsNative )
+        return XTaskQueueSubmitDelayedCallback( stateImpl->queue, port, delayInMs,
+                context, callback );
+
+    if (!(native = WineGDKGetNativeThreading()))
+    {
+        ERR( "native threading implementation is gone, cannot dispatch queue %p\n",
+             stateImpl->queue );
+        return E_UNEXPECTED;
+    }
+    return IXThreadingImpl_XTaskQueueSubmitDelayedCallback( native, stateImpl->queue,
+            port, delayInMs, context, callback );
+}
+
+static void CloseStateQueue( struct async_state *stateImpl )
+{
+    IXThreadingImpl *native;
+
+    if ( !stateImpl->queue ) return;
+
+    if ( stateImpl->queueIsNative )
+    {
+        if ((native = WineGDKGetNativeThreading()))
+            IXThreadingImpl_XTaskQueueCloseHandle( native, stateImpl->queue );
+    }
+    else XTaskQueueCloseHandle( stateImpl->queue );
+
+    stateImpl->queue = NULL;
+}
+
 static HRESULT WINAPI selfProviderOperation( XAsyncOp op, const XAsyncProviderData* data )
 {
     XAsyncWork* work;
@@ -99,7 +137,7 @@ static ULONG WINAPI async_state_Release( IAsyncState *iface )
 
         if ( cleanup != CleanupLocation_CleanedUp && impl->providerCallback )
             impl->providerCallback( Cleanup, &impl->providerData );
-        XTaskQueueCloseHandle( impl->queue );
+        CloseStateQueue( impl );
         DeleteCriticalSection( &impl->cs );
         impl->signature = 0;
         free( impl );
@@ -408,8 +446,26 @@ static HRESULT AllocStateNoCompletion( XAsyncBlock* asyncBlock, AsyncBlockIntern
         }
         else
         {
-            WARN( "asyncBlock queue %p is not a Wine XTaskQueue, using process queue\n", queue );
-            queue = NULL;
+            /* QueryApiImpl routes CLSID_XThreadingImpl to the native GDK
+             * sidecar, so the queue the title passed in is a native handle.
+             * Keep the completion on it.  Titles give async calls the queue
+             * whose completion port they dispatch themselves (Minecraft
+             * drains it from the game thread), so running the callback on a
+             * thread-pool queue of ours instead would execute it concurrently
+             * with the game loop and tear the state it touches. */
+            IXThreadingImpl *native = WineGDKGetNativeThreading();
+            HRESULT qhr = native ? IXThreadingImpl_XTaskQueueDuplicateHandle(
+                    native, queue, &stateImpl->queue ) : E_NOINTERFACE;
+
+            if ( SUCCEEDED( qhr ) && stateImpl->queue )
+                stateImpl->queueIsNative = TRUE;
+            else
+            {
+                WARN( "asyncBlock queue %p belongs to neither task queue implementation "
+                      "(native duplicate 0x%08lx), using process queue\n", queue, qhr );
+                stateImpl->queue = NULL;
+                queue = NULL;
+            }
         }
     }
 
@@ -570,7 +626,7 @@ static HRESULT SignalCompletion( IAsyncState *state )
     if ( stateImpl->providerData.async->callback != NULL )
     {
         state->lpVtbl->AddRef( state );
-        hr = XTaskQueueSubmitDelayedCallback( stateImpl->queue, Completion, 0, (PVOID)state, CompletionCallback );
+        hr = SubmitStateCallback( stateImpl, Completion, 0, (PVOID)state, CompletionCallback );
 
         if ( FAILED( hr ) )
         {
@@ -999,8 +1055,9 @@ HRESULT XAsyncSchedule( XAsyncBlock* asyncBlock, UINT32 delayInMs )
 
     ReleaseInternalGuard( impl );
 
-    TRACE( "submitting to queue %p, Work port, delay %d\n", stateImpl->queue, delayInMs );
-    hr = XTaskQueueSubmitDelayedCallback( stateImpl->queue, Work, delayInMs, (PVOID)state, WorkerCallback );
+    TRACE( "submitting to %s queue %p, Work port, delay %d\n",
+           stateImpl->queueIsNative ? "native" : "Wine", stateImpl->queue, delayInMs );
+    hr = SubmitStateCallback( stateImpl, Work, delayInMs, (PVOID)state, WorkerCallback );
     TRACE( "XTaskQueueSubmitDelayedCallback returned 0x%08lx\n", hr );
 
     if ( FAILED( hr ) )

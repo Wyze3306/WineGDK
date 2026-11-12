@@ -30,6 +30,8 @@ static INIT_ONCE xgameruntime_threading_init_once = INIT_ONCE_STATIC_INIT;
 static HRESULT xgameruntime_threading_init_result = E_NOTIMPL;
 static SRWLOCK native_process_task_queue_lock = SRWLOCK_INIT;
 static LONG native_process_task_queue_ready;
+static INIT_ONCE native_threading_impl_once = INIT_ONCE_STATIC_INIT;
+static IXThreadingImpl *native_threading_impl;
 
 HRESULT WINAPI DllCanUnloadNow(void)
 {
@@ -114,6 +116,40 @@ static void ensure_native_process_task_queue( IXThreadingImpl *threading )
         threading->lpVtbl->XTaskQueueCloseHandle( threading, process_queue );
 done:
     ReleaseSRWLockExclusive( &native_process_task_queue_lock );
+}
+
+static BOOL CALLBACK acquire_native_threading_once( INIT_ONCE *once,
+        void *parameter, void **context )
+{
+    IXThreadingImpl *threading = NULL;
+    QueryApiImpl_ext query_api;
+
+    UNREFERENCED_PARAMETER( once );
+    UNREFERENCED_PARAMETER( parameter );
+    UNREFERENCED_PARAMETER( context );
+
+    if (!xgameruntime_threading) return TRUE;
+
+    query_api = (QueryApiImpl_ext)GetProcAddress( xgameruntime_threading,
+            "QueryApiImpl" );
+    if (query_api && SUCCEEDED( query_api( &CLSID_XThreadingImpl,
+            &IID_IXThreadingImpl, (void **)&threading ) ))
+    {
+        /* Held for the lifetime of the process: task queues created by the
+         * title outlive individual async operations, and this reference is
+         * what lets us hand their completions back to the right dispatcher. */
+        native_threading_impl = threading;
+        TRACE( "cached native threading implementation %p\n", threading );
+    }
+    return TRUE;
+}
+
+IXThreadingImpl *WineGDKGetNativeThreading( void )
+{
+    if (!InitOnceExecuteOnce( &native_threading_impl_once,
+            acquire_native_threading_once, NULL, NULL ))
+        return NULL;
+    return native_threading_impl;
 }
 
 static BOOL CALLBACK initialize_native_threading_once( INIT_ONCE *once,
