@@ -1092,7 +1092,7 @@ static NTSTATUS open_mapped_dll_file( const UNICODE_STRING *nt_name, HANDLE *map
         HANDLE handle;
         LARGE_INTEGER size;
         size_t len;
-        int fd = 0;
+        int fd = 0, opened = -1;
         const char *p;
 
         end = strchr( entry, '|' );
@@ -1102,22 +1102,47 @@ static NTSTATUS open_mapped_dll_file( const UNICODE_STRING *nt_name, HANDLE *map
         sep = strchr( entry, ':' );
         if (!sep || sep >= end) continue;
 
-        for (p = entry; p < sep; p++)
+        /* An entry names either an inherited descriptor or, when it starts
+         * with '/', a file to open. A descriptor cannot cross a container
+         * boundary -- its number means nothing on the other side -- so the
+         * launcher hands over a path when the game runs inside one. */
+        if (*entry != '/')
         {
-            if (*p < '0' || *p > '9')
+            for (p = entry; p < sep; p++)
             {
-                fd = -1;
-                break;
+                if (*p < '0' || *p > '9')
+                {
+                    fd = -1;
+                    break;
+                }
+                fd = fd * 10 + (*p - '0');
             }
-            fd = fd * 10 + (*p - '0');
+            if (fd < 0) continue;
         }
-        if (fd < 0 || sep == entry || sep + 1 == end) continue;
+        if (sep == entry || sep + 1 == end) continue;
         len = end - sep - 1;
         if (len != len_needed || strncmp( sep + 1, utf8_name, len )) continue;
 
         free( utf8_name );
-        if ((status = wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )))
-            return status;
+        if (*entry == '/')
+        {
+            char *path = malloc( sep - entry + 1 );
+
+            if (!path) return STATUS_NO_MEMORY;
+            memcpy( path, entry, sep - entry );
+            path[sep - entry] = 0;
+            opened = open( path, O_RDONLY );
+            /* Drop the name as soon as it is open: from here the image is
+             * reachable only through this descriptor, exactly as an anonymous
+             * mapping would be, and nothing survives the process. */
+            if (opened != -1) unlink( path );
+            free( path );
+            if (opened == -1) return STATUS_NO_SUCH_FILE;
+            fd = opened;
+        }
+        status = wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle );
+        if (opened != -1) close( opened );
+        if (status) return status;
 
         size.QuadPart = 0;
         status = NtCreateSection( mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
