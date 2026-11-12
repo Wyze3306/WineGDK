@@ -5,5 +5,6 @@ SOURCES = \
 	classes.idl \
 	main.c \
 	pickers.c \
+	savepicker.c \
 	streams.c \
 	vector.c

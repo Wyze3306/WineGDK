@@ -29,6 +29,7 @@ import "windowscontracts.idl";
 import "windows.system.idl";
 import "windows.storage.idl";
 import "microsoft.windows.storage.pickers.idl";
+import "windows.storage.pickers.idl";
 
 namespace Windows.Storage.Streams {
     runtimeclass RandomAccessStreamReference;
@@ -37,4 +38,9 @@ namespace Windows.Storage.Streams {
 namespace Microsoft.Windows.Storage.Pickers
 {
     runtimeclass FileOpenPicker;
+}
+
+namespace Windows.Storage.Pickers
+{
+    runtimeclass FileSavePicker;
 }

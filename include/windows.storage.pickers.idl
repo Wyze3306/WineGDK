@@ -1,0 +1,90 @@
+/*
+ * Copyright 2026 BedrockOnLinux contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ */
+
+#ifdef __WIDL__
+#pragma makedep header
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+import "windows.storage.idl";
+
+namespace Windows.Storage.Pickers
+{
+    typedef enum PickerLocationId PickerLocationId;
+
+    interface IFileSavePicker;
+
+    runtimeclass FileSavePicker;
+
+    declare
+    {
+        /* Declared here again so that widl can compute its signature for the
+         * maps below; its definition stays guarded by windows.foundation.h. */
+        interface Windows.Foundation.Collections.IVector<HSTRING>;
+        interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *>;
+        interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *> *>;
+        interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *> *>;
+        interface Windows.Foundation.Collections.IMapView<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *>;
+        interface Windows.Foundation.Collections.IMap<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *>;
+    }
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum PickerLocationId
+    {
+        DocumentsLibrary = 0,
+        ComputerFolder = 1,
+        Desktop = 2,
+        Downloads = 3,
+        HomeGroup = 4,
+        MusicLibrary = 5,
+        PicturesLibrary = 6,
+        VideosLibrary = 7,
+        Objects3D = 8,
+        Unspecified = 9,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Storage.Pickers.FileSavePicker),
+        uuid(3286ffcb-617f-4cc5-af6a-b3fdf29ad145)
+    ]
+    interface IFileSavePicker : IInspectable
+    {
+        [propget] HRESULT SettingsIdentifier([out, retval] HSTRING *value);
+        [propput] HRESULT SettingsIdentifier([in] HSTRING value);
+        [propget] HRESULT SuggestedStartLocation([out, retval] Windows.Storage.Pickers.PickerLocationId *value);
+        [propput] HRESULT SuggestedStartLocation([in] Windows.Storage.Pickers.PickerLocationId value);
+        [propget] HRESULT CommitButtonText([out, retval] HSTRING *value);
+        [propput] HRESULT CommitButtonText([in] HSTRING value);
+        [propget] HRESULT FileTypeChoices([out, retval] Windows.Foundation.Collections.IMap<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *> **value);
+        [propget] HRESULT DefaultFileExtension([out, retval] HSTRING *value);
+        [propput] HRESULT DefaultFileExtension([in] HSTRING value);
+        [propget] HRESULT SuggestedSaveFile([out, retval] Windows.Storage.StorageFile **value);
+        [propput] HRESULT SuggestedSaveFile([in] Windows.Storage.StorageFile *value);
+        [propget] HRESULT SuggestedFileName([out, retval] HSTRING *value);
+        [propput] HRESULT SuggestedFileName([in] HSTRING value);
+        HRESULT PickSaveFileAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation);
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass FileSavePicker
+    {
+        [default] interface Windows.Storage.Pickers.IFileSavePicker;
+    }
+}

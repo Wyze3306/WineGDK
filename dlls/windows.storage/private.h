@@ -43,13 +43,23 @@
 #include "windows.storage.h"
 #include "windows.storage.streams.h"
 
+/* Windows.Storage.Pickers and Microsoft.Windows.Storage.Pickers both define a
+ * PickerLocationId, and C enumerators carry no namespace, so no file can see
+ * both: savepicker.c defines WINDOWS_STORAGE_UWP_PICKERS for the former. */
+#ifdef WINDOWS_STORAGE_UWP_PICKERS
+#define WIDL_using_Windows_Storage_Pickers
+#include "windows.storage.pickers.h"
+#else
 #define WIDL_using_Microsoft_UI
 #define WIDL_using_Microsoft_Windows_Storage_Pickers
 #include "microsoft.ui.h"
 #include "microsoft.windows.storage.pickers.h"
+#endif
 
 extern IActivationFactory *random_access_stream_reference_factory;
 extern IActivationFactory *file_open_picker_factory;
+extern IActivationFactory *file_save_picker_factory;
+extern const WCHAR *const file_save_picker_class_name;
 
 HRESULT hstring_vector_create( IVector_HSTRING **out );
 
